@@ -72,6 +72,7 @@ See ``forward_thread.py`` for the capture contract each closure must satisfy.
 from __future__ import annotations
 
 import contextlib
+import copy
 import enum
 import os
 from collections import deque
