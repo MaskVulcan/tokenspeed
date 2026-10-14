@@ -175,9 +175,9 @@ def _with_prefill_sample_offsets(
     last = cache_lengths.index_select(0, pool_rows) + input_lengths[
         : pool_rows.shape[0]
     ].to(cache_lengths.dtype)
-    offsets = cache_lengths.index_copy(
-        0, pool_rows, (last - 1).clamp_min(0).to(cache_lengths.dtype)
-    )
+    # Sampling offsets must never alias or modify the live commit frontier.
+    offsets = cache_lengths.clone()
+    offsets.index_copy_(0, pool_rows, (last - 1).clamp_min(0).to(cache_lengths.dtype))
     return replace(sampling_info, valid_cache_lengths=offsets)
 
 
