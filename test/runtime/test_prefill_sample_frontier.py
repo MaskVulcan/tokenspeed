@@ -33,6 +33,13 @@ from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     [
         "cpu",
         pytest.param(
+            "cuda:0",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(),
+                reason="requires CUDA",
+            ),
+        ),
+        pytest.param(
             "npu:0",
             marks=pytest.mark.skipif(
                 torch._C._get_privateuse1_backend_name() != "npu",

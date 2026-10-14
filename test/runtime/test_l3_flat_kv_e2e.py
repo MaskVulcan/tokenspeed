@@ -40,6 +40,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from test.runtime.test_host_executor import _synthetic_arena
+
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
@@ -153,12 +158,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         class SyntheticPool:
             def __init__(self):
                 self.load_tracker = None
-                self.arena = SimpleNamespace(
-                    cache_group_specs=tuple(
-                        SimpleNamespace(group_id=group.group_id)
-                        for group in layout.groups
-                    ),
-                )
+                self.arena = _synthetic_arena(layout)
 
             def cache_transfer_layout(self):
                 return layout
@@ -270,7 +270,6 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         load_index = executor._start_loading(  # pylint: disable=protected-access
             [9],
             [(0, 2, 2), (0, 5, 5), (1, 4, 4)],
-            success=True,
             prerequisite_stream=torch.cuda.current_stream(),
         )
         self.assertIsNotNone(load_index)

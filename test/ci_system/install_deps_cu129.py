@@ -153,6 +153,7 @@ def main() -> None:
     os.environ.update(
         CUDA_HOME=str(cuda_home),
         FLASHINFER_NVCC=str(cuda_home / "bin" / "nvcc"),
+        TRITON_PTXAS_PATH=str(cuda_home / "bin" / "ptxas"),
         TOKENSPEED_KERNEL_BACKEND="cuda",
         TOKENSPEED_KERNEL_CUDA_VARIANT="cu129",
         FLASHINFER_CUDA_ARCH_LIST="9.0a",

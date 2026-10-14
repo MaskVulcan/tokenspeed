@@ -1333,20 +1333,19 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             if draft_layout is not None
             else None
         )
-        with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
-            executor = self.executor_module.HostCacheExecutor(
-                pool,
-                host_memory_check=lambda planned_bytes: None,
-                draft_pool=draft_pool,
-                l2_tier=True,
-                host_ratio=1.0,
-                host_size_gb=0,
-                snapshot_pool=NO_POOL,
-                slot_state_exporters=None,
-                io_backend=io_backend,
-                attn_tp_rank=0,
-                kvp_rank=0,
-            )
+        executor = self.executor_module.HostCacheExecutor(
+            pool,
+            host_memory_check=lambda planned_bytes: None,
+            draft_pool=draft_pool,
+            l2_tier=True,
+            host_ratio=1.0,
+            host_size_gb=0,
+            snapshot_pool=NO_POOL,
+            slot_state_exporters=None,
+            io_backend=io_backend,
+            attn_tp_rank=0,
+            kvp_rank=0,
+        )
         self.addCleanup(executor.shutdown)
         return executor, pool, draft_pool
 

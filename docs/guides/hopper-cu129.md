@@ -19,6 +19,7 @@ over CUDA 13 packages from a previous installation:
 uv venv .venv-cu129 --python 3.11 --seed
 source .venv-cu129/bin/activate
 export CUDA_HOME=/usr/local/cuda
+export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
 CUDA_VARIANT=cu129 bash test/ci_system/install_deps.sh
 ```
 
@@ -30,6 +31,12 @@ in-tree kernel build. The host supplies its C++ compiler, OpenSSL development
 files, and required runtime libraries. The recipe does not run apt or sudo.
 Each pip call uses the active Python interpreter and inherits proxy
 environment variables.
+
+Keep `TRITON_PTXAS_PATH` set when serving or running GPU tests, including after
+reactivating the venv. TokenSpeed Triton and FLA use this selection for JIT
+kernels. Their bundled assembler may target a newer CUDA version than the
+host driver; setting `CUDA_HOME` alone does not select Triton's assembler.
+The installation helper sets this path for its own subprocesses too.
 
 The helper rejects installed CUDA 13 runtime packages and Torch wheels marked
 cu13 before changing packages. It reports the conflicting distributions and
