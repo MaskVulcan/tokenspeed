@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.moe._triton.common import (
     _validate_launch,
     _validate_topk,
 )
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 
 def _validate_bf16_moe(
@@ -97,8 +98,9 @@ def _validate_bf16_moe(
     return topk_weights, topk_ids, activation
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _stage1_kernel(
+    x_ptr,
     x_desc,
     w13_desc,
     inter_ptr,
@@ -113,7 +115,7 @@ def _stage1_kernel(
     situ_linear_beta,
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
+    TMA_GATHER: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -145,7 +147,19 @@ def _stage1_kernel(
             up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
             for k_offset in range(0, hidden_size, BLOCK_K):
-                x = x_desc.gather(token_ids, k_offset)
+                if TMA_GATHER:
+                    x = x_desc.gather(token_ids, k_offset)
+                else:
+                    # Hopper supports TMA weight loads, but TMA row gather
+                    # requires Blackwell. Invalid expert-tile rows read zero.
+                    x = tl.load(
+                        x_ptr
+                        + token_ids[:, None] * hidden_size
+                        + k_offset
+                        + tl.arange(0, BLOCK_K)[None, :],
+                        mask=row_mask[:, None],
+                        other=0,
+                    )
                 gate = w13_desc.load([expert_id, n_offset, k_offset]).reshape(
                     (BLOCK_N, BLOCK_K)
                 )
@@ -170,12 +184,12 @@ def _stage1_kernel(
                 + tl.arange(0, BLOCK_N)[None, :]
             )
             tl.store(inter_ptr + inter_offsets, activated, mask=row_mask[:, None])
-            tile_idx += NUM_PROGRAMS
+            tile_idx += tl.num_programs(0)
 
         problem_start += problem_tiles
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _stage2_kernel(
     inter_ptr,
     w2_desc,
@@ -187,7 +201,6 @@ def _stage2_kernel(
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
     top_k: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -239,7 +252,7 @@ def _stage2_kernel(
                 + tl.arange(0, BLOCK_N)[None, :]
             )
             tl.store(route_output_ptr + output_offsets, acc, mask=row_mask[:, None])
-            tile_idx += NUM_PROGRAMS
+            tile_idx += tl.num_programs(0)
 
         problem_start += problem_tiles
 
@@ -281,6 +294,7 @@ def _triton_bf16_moe_impl(
     w2_desc = TensorDescriptor.from_tensor(w2, [1, stage2_block_n, block_k])
 
     _stage1_kernel[(stage1_programs,)](
+        x,
         x_desc,
         w13_desc,
         intermediate,
@@ -295,7 +309,10 @@ def _triton_bf16_moe_impl(
         situ_linear_beta=(1.0 if situ_linear_beta is None else situ_linear_beta),
         ACTIVATION=activation,
         HAS_LINEAR_BETA=situ_linear_beta is not None,
-        NUM_PROGRAMS=stage1_programs,
+        TMA_GATHER=(
+            current_platform().is_nvidia
+            and current_platform().arch_version >= ArchVersion(10, 0)
+        ),
         BLOCK_M=block_m,
         BLOCK_N=stage1_block_n,
         BLOCK_K=block_k,
@@ -313,7 +330,6 @@ def _triton_bf16_moe_impl(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         top_k=top_k,
-        NUM_PROGRAMS=stage2_programs,
         BLOCK_M=block_m,
         BLOCK_N=stage2_block_n,
         BLOCK_K=block_k,

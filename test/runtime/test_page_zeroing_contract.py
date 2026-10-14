@@ -2,12 +2,13 @@
 
 ``ModelExecutor.zero_cache_pages`` runs the scheduler's page-reuse list through
 the target pool and any stateful draft pool. Only pools that alias recurrent
-state and KV bytes need this; pure-attention pools do not, so the page list is
-safely ignored for them instead of crashing the engine at startup.
+state and KV bytes need clearing. Every GPU pool still returns a page-reuse
+fence so external RDMA writes cannot race a previous owner's GPU work.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import types
@@ -93,6 +94,118 @@ class ZeroCachePagesContractTest(unittest.TestCase):
         # No zero_pages and not flagged as state-aliasing -> skip, no raise.
         pool = types.SimpleNamespace(requires_page_zeroing=False)
         self.assertIsNone(self._call(pool, [1, 2, 3]))
+
+    def test_gpu_page_reuse_returns_a_fence_without_sanitization(self):
+        from tokenspeed.runtime.execution.model_executor import ModelExecutor
+
+        trace = []
+        event = types.SimpleNamespace(
+            record=lambda stream: trace.append(("record", stream))
+        )
+        fake = self._fake(
+            types.SimpleNamespace(requires_page_zeroing=False), None, trace
+        )
+        fake.device = "cuda"
+        fake.device_module = types.SimpleNamespace(Event=lambda: event)
+        result = ModelExecutor.zero_cache_pages(fake, [4, 5])
+        self.assertIs(result, event)
+        self.assertEqual(
+            trace, [("wait", "execution-stream"), ("record", fake.default_stream)]
+        )
+
+    def test_pure_attention_fence_waits_for_prior_gpu_writes(self):
+        import torch
+
+        from tokenspeed.runtime.execution.model_executor import ModelExecutor
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        execution = torch.cuda.Stream()
+        default = torch.cuda.Stream()
+        prior_done = torch.cuda.Event()
+        value = torch.zeros(1, dtype=torch.int32, device="cuda")
+        value.record_stream(execution)
+        torch.cuda.synchronize()
+        fake = self._fake(types.SimpleNamespace(requires_page_zeroing=False), None, [])
+        fake.device = "cuda"
+        fake.device_module = torch.cuda
+        fake.default_stream = default
+        fake.execution_stream = execution
+        with torch.cuda.stream(execution):
+            torch.cuda._sleep(100_000_000)
+            value.fill_(7)
+            prior_done.record()
+        fence = ModelExecutor.zero_cache_pages(fake, [4])
+        self.assertIsNotNone(
+            fence, "RDMA must wait even when this pool needs no zeroing"
+        )
+        fence.synchronize()
+        self.assertTrue(prior_done.query())
+        self.assertEqual(value.item(), 7)
+
+    def test_native_rdma_respects_pure_attention_page_reuse(self):
+        import torch
+
+        from tokenspeed.runtime.execution.model_executor import ModelExecutor
+        from tokenspeed.runtime.pd.base.mooncake_engine import MooncakeTransferEngine
+
+        raw = os.environ.get("MOONCAKE_GPU_TEST_CONFIG")
+        if not raw:
+            self.skipTest("set MOONCAKE_GPU_TEST_CONFIG for native RDMA validation")
+        config = json.loads(raw)
+        self.assertEqual(config["protocol"], "rdma")
+        self.assertTrue(torch.cuda.is_available())
+        sender = MooncakeTransferEngine(
+            config["local_hostname"], gpu_id=0, ib_device=config["device_name"]
+        )
+        receiver = MooncakeTransferEngine(
+            config["local_hostname"], gpu_id=0, ib_device=config["device_name"]
+        )
+        source = torch.full((1 << 20,), 29, dtype=torch.uint8, pin_memory=True)
+        destination = torch.zeros_like(source, device="cuda")
+        execution = torch.cuda.Stream()
+        default = torch.cuda.Stream()
+        destination.record_stream(execution)
+        fake = self._fake(types.SimpleNamespace(requires_page_zeroing=False), None, [])
+        fake.device = "cuda"
+        fake.device_module = torch.cuda
+        fake.default_stream = default
+        fake.execution_stream = execution
+        torch.cuda.synchronize()
+        self.assertEqual(sender.register(source.data_ptr(), source.numel()), 0)
+        self.assertEqual(
+            receiver.register(destination.data_ptr(), destination.numel()), 0
+        )
+        try:
+
+            def transfer():
+                self.assertEqual(
+                    sender.transfer_sync(
+                        receiver.get_session_id(),
+                        source.data_ptr(),
+                        destination.data_ptr(),
+                        source.numel(),
+                    ),
+                    0,
+                )
+
+            transfer()  # Warm transport setup before placing the delayed writer.
+            torch.testing.assert_close(destination.cpu(), source, atol=0, rtol=0)
+            with torch.cuda.stream(execution):
+                torch.cuda._sleep(100_000_000)
+                destination.fill_(7)
+            fence = ModelExecutor.zero_cache_pages(fake, [4])
+            # Match the receive submission: without a returned event, external
+            # RDMA can finish before the previous owner's delayed GPU write.
+            if fence is not None:
+                fence.synchronize()
+            transfer()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(destination.cpu(), source, atol=0, rtol=0)
+        finally:
+            torch.cuda.synchronize()
+            sender.deregister(source.data_ptr())
+            receiver.deregister(destination.data_ptr())
 
     def test_missing_flag_defaults_to_skip(self):
         pool = types.SimpleNamespace()  # attribute absent entirely

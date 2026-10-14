@@ -250,6 +250,71 @@ class MooncakeMasterLiveTest(unittest.TestCase):
             "device_name": "",
         }
 
+    def test_global_objects_survive_async_writer_shutdown(self) -> None:
+        from tokenspeed.runtime.cache.l3.async_executor import (
+            AsyncL3Executor,
+            StorageJob,
+        )
+        from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+
+        owner_host = _Host(nbytes=4096, page=64)
+        owner = MooncakeKvStore(
+            self._extra_config(),
+            host_buffer=owner_host.host_buffer,
+            tp_size=1,
+            pp_size=1,
+        )
+        self.addCleanup(owner.close)
+        clients = dict(self._extra_config(), global_segment_size=0)
+        config = L3AsyncConfig.from_extra_config(
+            None, host_blocks=8, prefix_granularity=64
+        )
+        key = f"global-async-{time.monotonic_ns()}"
+        payload = bytes(range(64))
+
+        def client():
+            host = _Host(nbytes=4096, page=64)
+            backend = MooncakeKvStore(
+                clients, host_buffer=host.host_buffer, tp_size=1, pp_size=1
+            )
+            return AsyncL3Executor(
+                L3HostStore(backend, host, key_prefix="global-async", rank=0),
+                config=config,
+                prefix_for_weight_version=None,
+            )
+
+        def complete(executor):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                results = executor.poll().completions
+                if results:
+                    self.assertEqual(len(results), 1)
+                    self.assertTrue(results[0].retired)
+                    self.assertEqual(results[0].success, (True,))
+                    return
+                time.sleep(0.01)
+            self.fail("native asynchronous storage did not complete")
+
+        writer = client()
+        try:
+            writer.store.host_storage.host_buffer[:64] = payload
+            writer.submit(StorageJob(1, "put", (key,), (0,), (64,)))
+            complete(writer)
+        finally:
+            writer.shutdown(timeout_s=10)
+            writer.store.close()
+        reader = client()
+        try:
+            reader.submit(StorageJob(1, "get", (key,), (128,), (64,)))
+            complete(reader)
+            self.assertEqual(
+                bytes(reader.store.host_storage.host_buffer[128:192]), payload
+            )
+            self.assertTrue(reader.store.backend.remove_by_prefix(key))
+        finally:
+            reader.shutdown(timeout_s=10)
+            reader.store.close()
+
     def test_l3_host_store_round_trips_through_mooncake_master(self) -> None:
         host = _Host(nbytes=4096, page=64)
         payload = b"mooncake-l3-bytes"
@@ -274,7 +339,109 @@ class MooncakeMasterLiveTest(unittest.TestCase):
         self.assertEqual(bytes(host.host_buffer[0 : len(payload)]), payload)
         l3.rotate_namespace()
         self.assertEqual(l3.exists(pages), [False])
+        # Exercise the deployed wheel's retirement contract, not just a mock
+        # return code: eviction after EXISTS must be a safely retired miss.
+        result = backend.batch_get_into_result(
+            [l3.object_key("h0", 0, 0)], host.host_buffer, [0], [64]
+        )
+        self.assertEqual(result.success, (False,))
+        self.assertTrue(result.retired)
         l3.close()
+
+    def test_monitor_recovers_after_owned_master_restart(self) -> None:
+        """An actual metadata outage opens the circuit; a new owner can serve it.
+
+        Only the master created by this fixture may be stopped. This checks
+        recovery of cache service, not persistence of the old in-memory objects.
+        """
+        from dataclasses import replace
+
+        from tokenspeed.runtime.cache.l3.async_executor import (
+            AsyncL3Executor,
+            StorageJob,
+        )
+        from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+
+        cls = type(self)
+        if not cls.started_master:
+            self.skipTest("restart testing requires a fixture-owned master")
+        command = cls.master_proc.args
+        restarted = False
+
+        def restart():
+            nonlocal restarted
+            cls.master_log = open(f"/tmp/mooncake-restart-{os.getpid()}.log", "wb")
+            cls.master_proc = subprocess.Popen(
+                command,
+                stdout=cls.master_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            host, _, port = cls.master_addr.rpartition(":")
+            _wait_tcp(host, int(port), timeout_s=20)
+            restarted = True
+
+        def complete(executor):
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                results = executor.poll().completions
+                if results:
+                    self.assertEqual(len(results), 1)
+                    self.assertTrue(results[0].retired)
+                    return results[0]
+                time.sleep(0.01)
+            self.fail("native storage operation timed out")
+
+        host = _Host(nbytes=4096, page=64)
+        config = dict(self._extra_config(), global_segment_size=0)
+        backend = MooncakeKvStore(
+            config, host_buffer=host.host_buffer, tp_size=1, pp_size=1
+        )
+        executor = AsyncL3Executor(
+            L3HostStore(backend, host, key_prefix="master-restart", rank=0),
+            config=replace(
+                L3AsyncConfig.from_extra_config(
+                    None, host_blocks=8, prefix_granularity=64
+                ),
+                recovery_interval_ms=50,
+            ),
+            prefix_for_weight_version=None,
+        )
+        owner = None
+        key = f"recovered-{time.monotonic_ns()}"
+        try:
+            cls._stop_master()
+            executor.submit(StorageJob(1, "query", (key,), (), ()))
+            self.assertEqual(complete(executor).success, (False,))
+            self.assertEqual(executor.snapshot().health.state, "open")
+            restart()
+            owner_host = _Host(nbytes=4096, page=64)
+            owner = MooncakeKvStore(
+                self._extra_config(),
+                host_buffer=owner_host.host_buffer,
+                tp_size=1,
+                pp_size=1,
+            )
+            time.sleep(0.06)
+            executor.submit(StorageJob(2, "query", (key,), (), ()))
+            self.assertEqual(complete(executor).success, (False,))
+            self.assertEqual(executor.snapshot().health.state, "healthy")
+            payload = bytes(range(64))
+            host.host_buffer[:64] = payload
+            executor.submit(StorageJob(3, "put", (key,), (0,), (64,)))
+            self.assertEqual(complete(executor).success, (True,))
+            host.host_buffer[:64] = bytes(64)
+            executor.submit(StorageJob(4, "get", (key,), (128,), (64,)))
+            self.assertEqual(complete(executor).success, (True,))
+            self.assertEqual(bytes(host.host_buffer[128:192]), payload)
+            self.assertTrue(backend.remove_by_prefix(key))
+        finally:
+            if not restarted:
+                restart()
+            executor.shutdown(timeout_s=10)
+            backend.close()
+            if owner is not None:
+                owner.close()
 
 
 if __name__ == "__main__":

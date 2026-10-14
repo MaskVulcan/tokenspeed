@@ -71,6 +71,7 @@ class _EventLoopHarness:
         self._pause = _PauseHarness(self.trace)
         self.scheduler = _SchedulerHarness(self.trace)
         self._device = _DeviceHarness(self.trace)
+        self._l3 = None
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
             None,
@@ -78,6 +79,8 @@ class _EventLoopHarness:
             attn_tp_cpu_group=None,
             pp_size=1,
             pp_cpu_group=None,
+            config=None,
+            metrics=None,
         )
         self.output_processor = SimpleNamespace(
             rid_to_state={}, finish_scheduler_aborted_requests=lambda aborts: None
@@ -180,6 +183,16 @@ def test_abort_uses_the_output_marker() -> None:
     )
     loop = SimpleNamespace(
         output_processor=output,
+        _l3_hooks=L3CacheHooks(
+            None,
+            None,
+            config=None,
+            attn_tp_size=1,
+            attn_tp_cpu_group=None,
+            pp_size=1,
+            pp_cpu_group=None,
+            metrics=None,
+        ),
     )
 
     EventLoop._request_abort_or_mark(

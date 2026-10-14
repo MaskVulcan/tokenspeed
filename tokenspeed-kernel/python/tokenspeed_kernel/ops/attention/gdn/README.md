@@ -22,6 +22,12 @@ for decode, MTP, BF16 state, and prefill.
 
 ## Variable prefill lengths
 
+CPU chunk-count hints cover all output tiles: 16, 32 and 64 tokens, for both
+ragged and uniform batches. A short prefill can select 32 even though the
+recurrence uses 64; omitting its hint would read a GPU scalar to size the
+chunk-index table and synchronize the forward thread. Tests cover every tile
+with synchronization checks enabled, including empty sequences.
+
 The Triton L2-normalization fallback uses a runtime token count. The launch
 grid and masked block pointers cover the exact rows, while head width and tile
 size stay compile-time parameters. Consecutive agentic turns therefore reuse

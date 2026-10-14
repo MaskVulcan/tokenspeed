@@ -135,4 +135,5 @@ class PdTransferHooks:
                         loop.output_processor.publish_finished_at_admission(
                             req_id, state
                         )
+        self._device.poll_transfer_submissions()
         return processed

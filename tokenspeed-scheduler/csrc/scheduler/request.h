@@ -44,6 +44,15 @@ namespace tokenspeed {
 
 class Request {
 public:
+    struct StoragePreparation {
+        enum class Phase { kUnseen, kWaiting, kReady, kBypass };
+        Phase phase{Phase::kUnseen};
+        std::uint64_t operation_id{0};
+        std::int64_t deadline_us{0};
+        std::vector<std::string> hashes;
+    };
+    StoragePreparation& StoragePreparationRef() { return storage_preparation_; }
+
     Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
 
     const std::string& Id() const { return id_; }
@@ -140,7 +149,7 @@ public:
     }
 
     // True in every state that carries ForwardResources; Bootstrapping,
-    // Submitted, Prefetching, Retracted and Finished hold no pages (Restoring
+    // Submitted, Retracted and Finished hold no pages (Restoring
     // does: its fresh pages are being filled).
     bool HoldsPages() const {
         return std::visit(Overloaded{
@@ -257,7 +266,6 @@ public:
         return std::visit(Overloaded{
                               [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
                               [](const fsm::Submitted&) -> std::string { return "Submitted"; },
-                              [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
                               [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
                               [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
                               [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
@@ -275,6 +283,7 @@ private:
     fsm::ForwardResources& forwardResources(const char* operation);
     const fsm::ForwardResources& forwardResources(const char* operation) const;
 
+    StoragePreparation storage_preparation_;
     std::string id_;
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};

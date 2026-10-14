@@ -137,10 +137,6 @@ Finished AbortEvent::operator()(Submitted&&) {
     return Finished{};
 }
 
-Finished AbortEvent::operator()(Prefetching&&) {
-    return Finished{};
-}
-
 template <typename State>
 Finished AbortEvent::abortForward(State&& state) {
     _assert(coordinator_ != nullptr, "AbortEvent requires a cache coordinator");

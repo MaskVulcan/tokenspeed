@@ -82,6 +82,12 @@ unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
 
+State paging prepares its immutable metadata tapes for every supported decode
+batch size when these buffers are built. Tape finalization uploads CPU
+descriptions, so it belongs to startup, including sizes outside the graph
+ladder. Refresh only supplies runtime registers and replays an existing tape.
+Rebuilding the buffers also rebuilds tapes that contain their addresses.
+
 ### Rebinding a cache pool
 
 `set_cache_pool` may run more than once on the same backend tree: a memory

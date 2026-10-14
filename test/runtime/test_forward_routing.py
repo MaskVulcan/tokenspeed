@@ -77,7 +77,11 @@ class _DecodePeer(DisaggDecodeExecutor):
     def __init__(self, trace) -> None:
         self._trace = trace
 
-    def execute(self, op) -> None:
+    def capture_receivers(self, op):
+        return ("original-receiver",)
+
+    def execute(self, op, *, receivers) -> None:
+        assert receivers == ("original-receiver",)
         self._trace.append("rdma")
 
 
@@ -107,6 +111,7 @@ def _plan(*, pages_to_zero=(), cache=(), remote_decode=None, remote_prefill=None
         pages_to_zero={"kv": list(pages_to_zero), "state": []},
         pages_to_copy_arrays=dict,
         cache=list(cache),
+        storage=[],
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
     )
@@ -149,8 +154,19 @@ def test_decode_node_triggers_the_receive_from_the_plan_stream():
     handle = _handle(trace, _DecodePeer(trace))
     # The plan's own page zeroing: the RDMA fence waits on it because
     # Mooncake writes are not ordered by the zeroing stream.
-    handle._executor.zero_cache_pages = lambda pages: SimpleNamespace(
-        synchronize=lambda: trace.append("zero-sync")
+    zero_event = object()
+    ready = [False]
+    handle._executor.zero_cache_pages = lambda pages: zero_event
+    handle._executor.default_stream = "default"
+    handle._executor.execution_stream = SimpleNamespace(
+        wait_stream=lambda stream: trace.append(("wait-stream", stream)),
+        wait_event=lambda event: trace.append(("wait-event", event)),
+    )
+    handle._executor.device_module = SimpleNamespace(
+        Event=lambda: SimpleNamespace(
+            record=lambda stream: trace.append("record-ready"),
+            query=lambda: ready[0],
+        )
     )
     remote_prefill = SimpleNamespace(request_pool_indices=[3, 4], num_extends=lambda: 1)
 
@@ -161,15 +177,25 @@ def test_decode_node_triggers_the_receive_from_the_plan_stream():
     trace.remove("submit")  # the zeroing submission itself
     trace.remove("submit")  # the receive submission itself
 
-    # No model output this round, and the whole path ran as one unit on the
-    # data plane, with the zeroing barrier before the manifest is published.
+    # Waiting for GPU readiness blocks neither a round nor unrelated forwards.
     assert pending is None
     assert trace == [
+        ("wait-stream", "default"),
         ("slots", [3]),
         "seed-lengths",
-        "zero-sync",
-        "rdma",
+        ("wait-event", zero_event),
+        "record-ready",
     ]
+    handle.poll_transfer_submissions()
+    assert "rdma" not in trace
+    handle.execute(_plan(), _planned())
+    assert any(isinstance(item, tuple) and item[0] == "forward" for item in trace)
+    ready[0] = True
+    # No further plan is required: the same poll also runs in paused rounds.
+    handle.poll_transfer_submissions()
+    assert trace[-2:] == ["submit", "rdma"]
+    handle.poll_transfer_submissions()
+    assert trace.count("rdma") == 1
 
 
 def test_decode_node_masks_local_batches_with_the_batch_grammar():
@@ -271,3 +297,50 @@ def test_an_unrecognized_transfer_peer_is_refused():
     type fails at startup rather than at the first transfer."""
     with pytest.raises(TypeError, match="Disagg"):
         _handle([], SimpleNamespace())
+
+
+def test_remote_readiness_poll_does_not_wait_for_preparation():
+    trace = []
+    handle = _handle(trace, _DecodePeer(trace))
+    future = Future()
+    handle._remote_prefill_preparations.append((future, object(), ()))
+    handle.poll_transfer_submissions()
+    assert trace == []
+    future.set_exception(ValueError("invalid destination"))
+    with pytest.raises(RuntimeError, match="destination preparation failed") as error:
+        handle.poll_transfer_submissions()
+    assert isinstance(error.value.__cause__, ValueError)
+
+
+def test_shutdown_discards_unpublished_receive_and_joins_queued_publication():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    trace = []
+    handle = _handle(trace, _DecodePeer(trace))
+    prepared = Future()
+    prepared.set_result(SimpleNamespace(query=lambda: True))
+    handle._remote_prefill_preparations.append((prepared, object(), ()))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def publish():
+        entered.set()
+        assert release.wait(5)
+        trace.append("published")
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        handle._transfer_submissions.append(workers.submit(publish))
+        assert entered.wait(5)
+        closing = workers.submit(handle.shutdown_transfers)
+        try:
+            assert not closing.done()
+            release.set()
+            closing.result(timeout=5)
+        finally:
+            release.set()
+    trace.append("peer-closed")
+    handle.poll_transfer_submissions()
+    assert trace == ["published", "peer-closed"]
+    assert not handle._remote_prefill_preparations
+    assert not handle._transfer_submissions

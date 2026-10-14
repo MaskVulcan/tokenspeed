@@ -49,7 +49,6 @@ from tokenspeed_scheduler import PD
 
 from tokenspeed.runtime.cache.transfer.ops import (
     HostTier,
-    PrefetchOp,
     RestoreOp,
     SnapshotOp,
 )
@@ -232,22 +231,6 @@ class _RestoreBatch:
         self.source_tiers = [[int(HostTier.SNAPSHOT_POOL)] for _ in rows]
 
 
-class _PrefetchBatch:
-    """The wire face of ``Cache.PrefetchOp``: ``rows`` is
-    ``[(op_id, pages)]``, one op per waiting request, one row per page."""
-
-    def __init__(self, rows) -> None:
-        self.op_ids = [op_id for op_id, _ in rows]
-        self.request_ids = [f"r{op_id}" for op_id, _ in rows]
-        self.first_pages = [0 for _ in rows]
-        self.num_pages = [pages for _, pages in rows]
-        self.group_ids = [[0] * pages for _, pages in rows]
-        self.host_pages = [[1 + i for i in range(pages)] for _, pages in rows]
-        self.content_hashes = [[f"h{i}" for i in range(pages)] for _, pages in rows]
-        self.page_offsets = [list(range(pages)) for _, pages in rows]
-        self.page_indices = [list(range(pages)) for _, pages in rows]
-
-
 @pytest.fixture()
 def wire_ops(monkeypatch):
     """Dispatch the plan adapter on the fakes above instead of the bindings."""
@@ -259,7 +242,6 @@ def wire_ops(monkeypatch):
             LoadBackOp=_LoadBackOp,
             SnapshotOp=_SnapshotBatch,
             RestoreOp=_RestoreBatch,
-            PrefetchOp=_PrefetchBatch,
         ),
     )
 
@@ -377,7 +359,6 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
             submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
                 ("load_backs", ops, prerequisite_stream)
             ),
-            submit_prefetches=lambda ops: None,
             poll_results=lambda: ["done"],
         ),
     )
@@ -422,7 +403,6 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
             submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
                 ("load_backs", ops)
             ),
-            submit_prefetches=lambda ops: None,
         ),
     )
     handle._executor.copy_cache_pages = lambda pairs: trace.append(
@@ -496,7 +476,6 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
         host_cache_executor=SimpleNamespace(
             submit_write_backs=submit_write_backs,
             submit_load_backs=submit_load_backs,
-            submit_prefetches=lambda ops: None,
         ),
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append(
@@ -551,7 +530,6 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
             submit_load_backs=lambda ops, *, prerequisite_stream: (
                 trace.append("load_backs")
             ),
-            submit_prefetches=lambda ops: None,
         ),
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append("zero")
@@ -601,7 +579,6 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll(wire_ops):
         host_cache_executor=SimpleNamespace(
             submit_write_backs=exploding,
             submit_load_backs=lambda ops, *, prerequisite_stream: None,
-            submit_prefetches=lambda ops: None,
             poll_results=lambda: [],
         ),
     )
@@ -612,56 +589,6 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll(wire_ops):
     with pytest.raises(RuntimeError, match="cache-plan submission failed") as info:
         handle.poll_cache_results()
     assert isinstance(info.value.__cause__, ValueError)
-
-
-def test_prefetches_start_on_the_control_plane_between_zeroing_and_loads(wire_ops):
-    """An L3 prefetch fills Host pages on the executor's own lane: no stream,
-    no Device page, so it is started right on the control plane -- after the
-    stores and the zeroing were queued, before the loads -- and never rides
-    the FIFO. Each op reaches the executor once, per request."""
-    trace: list = []
-    plan = _plan(
-        pages_to_zero=[2],
-        cache=[
-            _WriteBackOp("store"),
-            _PrefetchBatch([(4, 3), (5, 1)]),
-            _LoadBackOp("load"),
-        ],
-    )
-    handle = _handle(
-        trace,
-        host_cache_executor=SimpleNamespace(
-            submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
-                trace.append("write_backs")
-            ),
-            submit_prefetches=lambda ops: trace.append(
-                (
-                    "prefetches",
-                    [
-                        (op.op_id, len(op.rows))
-                        for op in ops
-                        if isinstance(op, PrefetchOp)
-                    ],
-                )
-            ),
-            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
-                "load_backs"
-            ),
-        ),
-    )
-    handle._executor.zero_cache_pages = lambda pages: trace.append("zero")
-
-    handle.execute(plan, None)
-
-    assert trace == [
-        "submit",
-        "write_backs",
-        "submit",
-        "zero",
-        ("prefetches", [(4, 3), (5, 1)]),
-        "submit",
-        "load_backs",
-    ]
 
 
 def test_shutdown_cache_joins_submissions_then_closes_on_the_forward_thread():

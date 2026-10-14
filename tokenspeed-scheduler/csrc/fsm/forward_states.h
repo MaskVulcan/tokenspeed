@@ -68,53 +68,16 @@ inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* to
     return shifted;
 }
 
-// Waiting for admission. A request whose L3 prefetch landed comes back here
-// holding the Host entries it fetched (prefetched_host_entries), pinned so
-// they are still there when its admission claims them as an ordinary Host hit;
-// the pins drop with the state at admission, after the admission acquired its
-// own references.
+// Waiting for admission. Async storage pins live in Request::StoragePreparation.
 struct Submitted {
     Submitted(TokenContainer* token_container, std::int32_t prefix_granularity)
         : token_container_{token_container}, prefix_granularity_{prefix_granularity} {}
-    Submitted(TokenContainer* token_container, std::int32_t prefix_granularity,
-              std::vector<CacheBlockRef> prefetched_host_entries)
-        : token_container_{token_container},
-          prefix_granularity_{prefix_granularity},
-          prefetched_host_entries_{std::move(prefetched_host_entries)} {}
-
     TokenContainer* TokenContainerPtr() const { return token_container_; }
     std::int32_t PrefixGranularity() const { return prefix_granularity_; }
-    // A further prefetch (the remainder beyond what landed) carries these on,
-    // so the first fetch's entries stay pinned until the admission that
-    // claims them all.
-    std::vector<CacheBlockRef> TakePrefetchedHostEntries() { return std::exchange(prefetched_host_entries_, {}); }
 
 private:
     TokenContainer* token_container_{};
     std::int32_t prefix_granularity_{};
-    std::vector<CacheBlockRef> prefetched_host_entries_;
-};
-
-// Before admission, with an L3 prefetch in flight: the request pins the Host
-// blocks the fetch fills -- and the entries an earlier prefetch of its own
-// already landed (host_blocks holds both) -- with nothing on the Device and
-// no request-pool row; it is skipped by admission (later Submitted requests
-// may be admitted past it, it holds no head of line) and is never a victim.
-// The op's ACK (PrefetchDone) returns it to Submitted holding every entry
-// that landed; an abort drops its pins, and the op's own pins keep the
-// blocks still being filled until the ACK.
-struct Prefetching {
-    Prefetching(TokenContainer* token_container, std::int32_t prefix_granularity,
-                std::vector<CacheBlockRef> host_blocks, std::uint32_t prefetch_op)
-        : token_container{token_container},
-          prefix_granularity{prefix_granularity},
-          host_blocks{std::move(host_blocks)},
-          prefetch_op{prefetch_op} {}
-
-    TokenContainer* token_container{};
-    std::int32_t prefix_granularity{};
-    std::vector<CacheBlockRef> host_blocks;
-    std::uint32_t prefetch_op{};
 };
 
 // Everything a page-holding state owns on the request's behalf: the KV

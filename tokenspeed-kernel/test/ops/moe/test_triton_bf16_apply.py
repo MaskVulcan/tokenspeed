@@ -84,4 +84,53 @@ def test_triton_bf16_moe_matches_torch(activation: str) -> None:
             expert_output.float() * topk_weights[token_ids, slots, None],
         )
 
-    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.01)
+    torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.0001)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_gemm_batch_counts_and_grid_sizes_do_not_recompile():
+    from types import SimpleNamespace
+
+    from tokenspeed_kernel.ops.moe._triton import bf16
+    from utils import assert_no_triton_compile
+
+    weights = SimpleNamespace(
+        w13_weight=torch.randn(4, 64, 128, device="cuda", dtype=torch.bfloat16) * 0.02,
+        w2_weight=torch.randn(4, 128, 32, device="cuda", dtype=torch.bfloat16) * 0.02,
+        ep_size=1,
+    )
+    plan = kernel_moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        ep_size=1,
+        ispp=32,
+        hidden=128,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        internal_activation_dtype="input",
+        fast_math=True,
+        combine_order="rank",
+        solution="triton",
+    )
+
+    def run(rows):
+        x = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16)
+        ids = (
+            torch.arange(2, device="cuda", dtype=torch.int32)
+            .expand(rows, 2)
+            .contiguous()
+        )
+        scales = torch.full((rows, 2), 0.5, device="cuda")
+        result = kernel_moe_apply(
+            plan, x, weights, None, topk_ids=ids, topk_weights=scales
+        )
+        assert torch.isfinite(result).all()
+
+    run(1)
+    run(17)  # Warm the two deliberate BLOCK_M buckets.
+    with assert_no_triton_compile(bf16._stage1_kernel, bf16._stage2_kernel):
+        for rows in (2, 3, 5, 8, 15, 16, 18, 31, 48, 129):
+            run(rows)

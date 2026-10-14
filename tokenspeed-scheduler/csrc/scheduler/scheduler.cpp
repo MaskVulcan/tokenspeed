@@ -94,7 +94,10 @@ Scheduler::Scheduler(SchedulerConfig config)
                                    config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
                                    snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost())},
-      tier_transfers_{coordinator_} {
+      tier_transfers_{coordinator_},
+      storage_transfers_{config_.enable_l3_storage
+                             ? std::make_unique<StorageTransferManager>(coordinator_, *config_.storage_config)
+                             : nullptr} {
     // config_.Validate() already ran; the body only derives state from it.
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
@@ -205,7 +208,7 @@ bool Scheduler::CanClearCache() const {
 bool Scheduler::cacheIsClearable(bool include_host) const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
-    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
+    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending());
     if (has_pd_transfers || has_tier_transfers || RetractedSize() > 0) {
         return false;
     }
@@ -225,7 +228,7 @@ bool Scheduler::clearCache(bool include_host) {
     // is not indexed anywhere, so the suspended set is checked directly.
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
-    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
+    const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending());
     const std::size_t suspended = RetractedSize();
     if (has_pd_transfers || has_tier_transfers || suspended > 0) {
         spdlog::info("[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} suspended_requests={}",
@@ -237,6 +240,7 @@ bool Scheduler::clearCache(bool include_host) {
         spdlog::info("[Scheduler] flush {}cache rejected: cached blocks are still pinned", include_host ? "" : "L1 ");
         return false;
     }
+    if (include_host && storage_transfers_) storage_transfers_->ClearMetadata();
     spdlog::info("[Scheduler] flush {}cache completed", include_host ? "" : "L1 ");
     return true;
 }
@@ -363,7 +367,7 @@ std::size_t Scheduler::BootstrappingSize() const {
 
 std::size_t Scheduler::WaitingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Submitted, fsm::Prefetching, fsm::Retracted, fsm::Restoring>();
+        return request->IsAnyOf<fsm::Submitted, fsm::Retracted, fsm::Restoring>();
     }));
 }
 
@@ -431,12 +435,18 @@ std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
     return it == requests_by_id_.end() ? -1 : it->second->TokenSize();
 }
 
+bool Scheduler::CanAbortBeforeAdmission(const std::string& id) const {
+    const auto it = requests_by_id_.find(id);
+    return config_.role == Role::kFused && it != requests_by_id_.end() && it->second->Is<fsm::Submitted>();
+}
+
 ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
     std::erase_if(requests_, [this](const auto& request) {
         if (!request->template Is<fsm::Finished>()) {
             return false;
         }
+        releaseStorage(*request);
         kv_event_hash_progress_.erase(request->Id());
         requests_by_id_.erase(request->Id());
         return true;
@@ -445,6 +455,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
     for (const auto& request : requests_) {
+        prepareStorage(*request);
         if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,
                              fsm::Retracted>()) {
             candidates.push_back(request.get());
@@ -452,17 +463,28 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
     ++plan_calls_;
     ExecutionPlan plan;
-    // Every group is listed, empty or not, so the runtime indexes the maps
-    // without guarding for absent groups.
     for (const std::string& group_id : cache_group_ids_) {
         plan.pages_to_zero[group_id];
         plan.pages_to_copy[group_id];
     }
-    BuiltOperations built = buildForwardOperations(plan, std::move(candidates), write_back_operations);
+    BuiltOperations built;
+    if (forward_allowed_) {
+        built = buildForwardOperations(plan, std::move(candidates), write_back_operations);
+        plan.With(ForwardBatch{std::move(built.forward)});
+    }
+    // The ordinary H2D ticket now owns the Host sources of admitted data.
+    for (const auto& request : requests_) {
+        if (request->HoldsPages()) releaseStorage(*request);
+    }
+    if (storage_transfers_) {
+        if (storage_allowed_)
+            storage_transfers_->StartBackups();
+        else
+            storage_transfers_->DropBackups();
+        plan.storage = storage_transfers_->TakeCommands();
+    }
 
-    plan.With(ForwardBatch{std::move(built.forward)});
-
-    if (config_.StreamsDeviceCacheToHost()) {
+    if (forward_allowed_ && config_.StreamsDeviceCacheToHost()) {
         // Boundary publications of live requests: their owners hold the pages,
         // and the ticket pins them until the ACK, so the copy stays off the
         // forward's critical path.
@@ -480,9 +502,6 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
     if (!built.snapshot_stores.empty()) {
         plan.With(CacheOperation{SnapshotStoreBatch{built.snapshot_stores}});
-    }
-    if (!built.prefetches.empty()) {
-        plan.With(CacheOperation{PrefetchBatch{built.prefetches}});
     }
     if (!built.load_backs.empty()) {
         plan.With(CacheOperation{LoadBackBatch{built.load_backs}});

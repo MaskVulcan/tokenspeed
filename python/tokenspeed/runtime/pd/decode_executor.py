@@ -52,16 +52,22 @@ class DisaggDecodeExecutor:
             bootstrap_room=info.bootstrap_room,
         )
 
-    def _cache_prefill(self, op) -> None:
+    def capture_receivers(self, op) -> tuple[MooncakeKVReceiver | None, ...]:
+        """Capture request incarnations before asynchronous GPU preparation."""
+        return tuple(self.receivers.get(request_id) for request_id in op.request_ids)
+
+    def _cache_prefill(self, op, *, receivers) -> None:
         pending = []
         num_extends = op.num_extends()
         if num_extends != len(op.request_ids):
             raise RuntimeError(
                 "CachePD Decode admission does not support mixed batches"
             )
+        if len(receivers) != num_extends:
+            raise ValueError("Remote prefill receiver count does not match admission")
         for index, request_id in enumerate(op.request_ids[:num_extends]):
-            receiver = self.receivers.get(request_id)
-            if receiver is None:
+            receiver = receivers[index]
+            if receiver is None or self.receivers.get(request_id) is not receiver:
                 continue
             prefix_len = int(op.extend_prefix_lens[index])
             block_manifest = build_cache_block_manifest(
@@ -84,6 +90,8 @@ class DisaggDecodeExecutor:
         # Validate every row before publishing any destination manifest. A later
         # invalid row must not leave an earlier Prefill sender waiting forever.
         for request_id, receiver, request_pool_index, block_manifest in pending:
+            if self.receivers.get(request_id) is not receiver:
+                continue
             self._admissions[request_id] = request_pool_index
             receiver.prefill(block_manifest=block_manifest)
 
@@ -95,7 +103,7 @@ class DisaggDecodeExecutor:
         self._local_states[request_id] = TransferPoll.Bootstrapping
         self._bootstrap(request_id, bootstrap_info)
 
-    def execute(self, op):
+    def execute(self, op, *, receivers):
         """Pull this admitted prompt's KV from the prefill node.
 
         The D-role half of the plan's remote streams, submitted on the
@@ -104,7 +112,7 @@ class DisaggDecodeExecutor:
         """
         if not isinstance(op, Forward.Batch):
             raise TypeError(f"Expected Batch, got {type(op).__name__}.")
-        self._cache_prefill(op)
+        self._cache_prefill(op, receivers=receivers)
 
     def generate_events(self):
         if not self.receivers:

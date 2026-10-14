@@ -242,6 +242,19 @@ class TestRouteSemantics(unittest.TestCase):
         self.assertEqual(client.get("/flush_cache").status_code, 200)
         self.assertEqual(client.post("/flush_cache").status_code, 200)
 
+    def test_flush_cache_preserves_scheduler_refusal_and_allows_retry(self):
+        llm = FakeLLM()
+        llm.succeed = False
+        client = TestClient(build_sglang_compat_app(llm))
+        for method in (client.get, client.post):
+            response = method("/flush_cache")
+            self.assertEqual(response.status_code, 400)
+            self.assertFalse(response.json()["success"])
+        llm.succeed = True
+        response = client.post("/flush_cache")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["success"])
+
 
 class TestUnsupportedWeightUpdateSources(unittest.TestCase):
     """Sources the scheduler has no branch for never reach it.

@@ -18,20 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GPU e2e: compact Host L2 round-trips through the Mooncake-compatible L3 store.
+"""GPU D2H/L3/H2D byte tests, including independent native Mooncake clients.
 
-CI has no Mooncake master. ``MemoryKvStore`` implements the same
-``batch_put_from`` / ``batch_get_into`` contract the Mooncake client uses on
-packed Host CacheBlocks.
+The default test uses MemoryKvStore. Set MOONCAKE_GPU_TEST_CONFIG to a JSON
+Mooncake configuration with global_segment_size=0 to also run native tests.
+Start a master and an independent storage owner first. Each native writer
+exits before its reader starts, so neither GPU nor Host allocations survive.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
+import subprocess
 import sys
-import threading
 import time
 import unittest
+import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -47,7 +51,6 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             import torch
 
             import tokenspeed.runtime.cache.l2.executor as executor_module
-            from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
             from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
             from tokenspeed.runtime.cache.transfer.layout import (
                 CacheField,
@@ -55,23 +58,74 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 CacheTransferLayout,
             )
         except (ImportError, ModuleNotFoundError) as exc:
+            if os.environ.get("MOONCAKE_GPU_TEST_CONFIG"):
+                raise
             self.skipTest(f"needs runtime dependencies: {exc}")
         if not torch.cuda.is_available():
+            if os.environ.get("MOONCAKE_GPU_TEST_CONFIG"):
+                self.fail("native Mooncake GPU test requires a CUDA device")
             self.skipTest("needs a CUDA device")
         self.torch = torch
         self.executor_module = executor_module
-        self.no_pool = RetractionPoolRequest(
-            host_gb=0.0,
-            ratio=0.0,
-            max_retracted_requests=0,
-            tail_lcm_blocks_per_request=0,
-        )
         self.MemoryKvStore = MemoryKvStore
         self.CacheField = CacheField
         self.CacheGroupLayout = CacheGroupLayout
         self.CacheTransferLayout = CacheTransferLayout
 
     def test_d2h_backup_host_wipe_prefetch_h2d_restores_bytes(self):
+        self._exercise(
+            backend="memory",
+            phase="roundtrip",
+            io_backend="direct",
+            namespace=f"e2e-{uuid.uuid4().hex}",
+            native_config=None,
+        )
+
+    def test_native_mooncake_survives_writer_process_exit(self):
+        raw = os.environ.get("MOONCAKE_GPU_TEST_CONFIG")
+        if not raw:
+            self.skipTest("set MOONCAKE_GPU_TEST_CONFIG for a live storage owner")
+        config = json.loads(raw)
+        self.assertEqual(config["global_segment_size"], 0)
+        for io_backend in ("direct", "kernel"):
+            with self.subTest(io_backend=io_backend):
+                namespace = f"gpu-native-{uuid.uuid4().hex}"
+                for phase in ("put", "get"):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            os.path.abspath(__file__),
+                            "--native-worker",
+                            phase,
+                            "--io-backend",
+                            io_backend,
+                            "--namespace",
+                            namespace,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode, 0, f"{result.stdout}\n{result.stderr}"
+                    )
+                    print(f"native Mooncake {io_backend} {phase}: passed", flush=True)
+
+    def _complete(self, executor, *, op_id, expected):
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            completed = executor.poll().completions
+            if completed:
+                self.assertEqual(len(completed), 1)
+                self.assertEqual(completed[0].op_id, op_id)
+                self.assertEqual(completed[0].success, expected)
+                self.assertTrue(completed[0].retired)
+                return
+            time.sleep(0.001)
+        self.fail(f"storage operation {op_id} did not complete")
+
+    def _exercise(self, *, backend, phase, io_backend, namespace, native_config):
         torch = self.torch
         first = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
         second = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
@@ -99,7 +153,12 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         class SyntheticPool:
             def __init__(self):
                 self.load_tracker = None
-                self.arena = None
+                self.arena = SimpleNamespace(
+                    cache_group_specs=tuple(
+                        SimpleNamespace(group_id=group.group_id)
+                        for group in layout.groups
+                    ),
+                )
 
             def cache_transfer_layout(self):
                 return layout
@@ -108,94 +167,88 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 self.load_tracker = tracker
 
         pool = SyntheticPool()
-        specs = tuple(
-            SimpleNamespace(group_id=group.group_id, shard_count=1)
-            for group in layout.groups
+        from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
+
+        executor = self.executor_module.HostCacheExecutor(
+            pool,
+            l2_tier=True,
+            snapshot_pool=RetractionPoolRequest(
+                host_gb=0.0,
+                ratio=0.0,
+                max_retracted_requests=0,
+                tail_lcm_blocks_per_request=0,
+            ),
+            slot_state_exporters=None,
+            kvp_rank=0,
+            host_ratio=1.0,
+            host_size_gb=0,
+            io_backend=io_backend,
+            attn_tp_rank=0,
+            host_memory_check=lambda size: None,
         )
-        pool.arena = SimpleNamespace(
-            cache_group_specs=specs,
-            runtime_contract=SimpleNamespace(
-                group_specs=specs,
-                virtual_block_counts={
-                    group.group_id: 1
-                    + layout.num_lcm_blocks * group.cache_blocks_per_lcm_block
-                    for group in layout.groups
-                },
+        if backend == "memory":
+            store = self.MemoryKvStore()
+        else:
+            self.assertEqual(backend, "mooncake")
+            from tokenspeed.runtime.cache.l3.mooncake import MooncakeKvStore
+
+            store = MooncakeKvStore(
+                native_config,
+                host_buffer=executor.host_storage.host_buffer,
+                tp_size=1,
+                pp_size=1,
+            )
+        from tokenspeed_scheduler import StorageKind
+
+        from tokenspeed.runtime.cache.l3.async_executor import AsyncL3Executor
+        from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
+        from tokenspeed.runtime.cache.l3.executor import L3HostStore
+
+        l3 = AsyncL3Executor(
+            L3HostStore(store, executor.host_storage, key_prefix=namespace, rank=0),
+            prefix_for_weight_version=lambda version: f"{namespace}-{version}",
+            config=L3AsyncConfig.from_extra_config(
+                None, host_blocks=4, prefix_granularity=2
             ),
         )
-        with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
-            executor = self.executor_module.HostCacheExecutor(
-                pool,
-                l2_tier=True,
-                host_ratio=1.0,
-                host_size_gb=0,
-                snapshot_pool=self.no_pool,
-                slot_state_exporters=None,
-                io_backend="direct",
-                attn_tp_rank=0,
-                kvp_rank=0,
-            )
-        store = self.MemoryKvStore()
-        executor.attach_l3_storage(
-            store,
-            key_prefix="e2e",
-            rank=0,
-            prefix_for_weight_version=lambda version: f"e2e-{version}",
-            prefetch_timeout_base_s=10.0,
-            prefetch_timeout_per_page_s=0.0,
-            prefetch_batch_pages=128,
-        )
+        self.addCleanup(l3.close, timeout_s=5.0)
         self.addCleanup(executor.shutdown)
 
-        # A CUDA fence cannot complete a CPU storage future. Hold PUT until
-        # the test observes the pending ACK, then let normal polling finish it.
-        put_started = threading.Event()
-        release_put = threading.Event()
-        self.addCleanup(release_put.set)
-        backend = executor.l3_store.backend
-        original_put = backend.batch_put_from
+        keys = [(0, "h0", 0), (0, "h1", 0), (1, "h2", 0)]
+        if phase in ("put", "roundtrip"):
+            l3.submit_operations(
+                [SimpleNamespace(op_id=1, kind=StorageKind.Query, keys=keys)]
+            )
+            self._complete(l3, op_id=1, expected=(False,) * 3)
+            first[16:20].fill_(0x11)
+            second[28:34].fill_(0x12)
+            first[40:44].fill_(0x41)
+            second[64:70].fill_(0x42)
+            first[94:99].fill_(0x73)
+            torch.cuda.synchronize()
 
-        def gated_put(keys, host_buffer, offsets, sizes):
-            put_started.set()
-            if not release_put.wait(timeout=10):
-                raise TimeoutError("test did not release the L3 backup")
-            return original_put(keys, host_buffer, offsets, sizes)
-
-        put_patch = patch.object(backend, "batch_put_from", gated_put)
-        put_patch.start()
-        self.addCleanup(put_patch.stop)
-
-        first[16:20].fill_(0x11)
-        second[28:34].fill_(0x12)
-        first[40:44].fill_(0x41)
-        second[64:70].fill_(0x42)
-        first[94:99].fill_(0x73)
-        torch.cuda.synchronize()
-
-        backup_pages = [
-            (0, 1, "h0", 0),
-            (0, 4, "h1", 0),
-            (1, 3, "h2", 0),
-        ]
-        executor._start_writing(  # pylint: disable=protected-access
-            [7],
-            [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
-            backup_pages,
-            lane=executor._pinned_write_lane,
-            prerequisite_stream=torch.cuda.current_stream(),
-        )
-        executor.write_stream.synchronize()
-        write_results = executor.poll_results()
-        self.assertEqual(write_results, [])
-        self.assertTrue(put_started.wait(timeout=10), "L3 backup did not start")
-        release_put.set()
-        deadline = time.monotonic() + 10
-        while not write_results and time.monotonic() < deadline:
+            executor._start_writing(  # pylint: disable=protected-access
+                [7],
+                [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
+                lane=executor._pinned_write_lane,
+                prerequisite_stream=torch.cuda.current_stream(),
+            )
+            executor.write_stream.synchronize()
             write_results = executor.poll_results()
-            if not write_results:
-                time.sleep(0.001)
-        self.assertEqual([int(event.op_id) for event in write_results], [7])
-        self.assertEqual(executor.l3_store.exists(backup_pages), [True, True, True])
+            self.assertEqual([int(event.op_id) for event in write_results], [7])
+            l3.submit_operations(
+                [
+                    SimpleNamespace(
+                        op_id=2,
+                        kind=StorageKind.Put,
+                        keys=keys,
+                        host_blocks=[1, 4, 3],
+                    )
+                ]
+            )
+            self._complete(l3, op_id=2, expected=(True,) * 3)
+            if phase == "put":
+                return
 
         # Prove restore comes from L3, not leftover Host bytes.
         executor.host_storage.host_buffer.fill_(0)
@@ -204,12 +257,20 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         torch.cuda.synchronize()
         self.assertFalse(bool(executor.host_storage.host_buffer.any().item()))
 
-        self.assertEqual(executor.l3_store.prefetch(backup_pages), [True, True, True])
+        l3.submit_operations(
+            [
+                SimpleNamespace(
+                    op_id=3, kind=StorageKind.Get, keys=keys, host_blocks=[2, 5, 4]
+                )
+            ]
+        )
+        self._complete(l3, op_id=3, expected=(True,) * 3)
         self.assertTrue(bool(executor.host_storage.host_buffer.any().item()))
 
         load_index = executor._start_loading(  # pylint: disable=protected-access
             [9],
-            [(0, 2, 1), (0, 5, 4), (1, 4, 3)],
+            [(0, 2, 2), (0, 5, 5), (1, 4, 4)],
+            success=True,
             prerequisite_stream=torch.cuda.current_stream(),
         )
         self.assertIsNotNone(load_index)
@@ -220,22 +281,49 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         load_results = executor.poll_results()
         self.assertEqual([int(event.op_id) for event in load_results], [9])
 
-        self.assertTrue(
-            torch.equal(first[24:28].cpu(), torch.full((4,), 0x11, dtype=torch.uint8))
+        # Check entire allocations, including padding and untouched blocks.
+        expected_first = torch.full((128,), 0xEE, dtype=torch.uint8)
+        expected_second = torch.full((128,), 0xEE, dtype=torch.uint8)
+        expected_first[24:28].fill_(0x11)
+        expected_second[40:46].fill_(0x12)
+        expected_first[48:52].fill_(0x41)
+        expected_second[76:82].fill_(0x42)
+        expected_first[104:109].fill_(0x73)
+        self.assertTrue(torch.equal(first.cpu(), expected_first))
+        self.assertTrue(torch.equal(second.cpu(), expected_second))
+
+        self.assertTrue(l3.store.backend.remove_by_prefix(namespace))
+        executor.host_storage.host_buffer.fill_(0)
+        l3.submit_operations(
+            [
+                SimpleNamespace(
+                    op_id=4, kind=StorageKind.Get, keys=keys, host_blocks=[2, 5, 4]
+                )
+            ]
         )
-        self.assertTrue(
-            torch.equal(second[40:46].cpu(), torch.full((6,), 0x12, dtype=torch.uint8))
-        )
-        self.assertTrue(
-            torch.equal(first[48:52].cpu(), torch.full((4,), 0x41, dtype=torch.uint8))
-        )
-        self.assertTrue(
-            torch.equal(second[76:82].cpu(), torch.full((6,), 0x42, dtype=torch.uint8))
-        )
-        self.assertTrue(
-            torch.equal(first[104:109].cpu(), torch.full((5,), 0x73, dtype=torch.uint8))
-        )
+        self._complete(l3, op_id=4, expected=(False,) * 3)
+        self.assertFalse(bool(executor.host_storage.host_buffer.any().item()))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    if "--native-worker" in sys.argv:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--native-worker", choices=("put", "get"), required=True)
+        parser.add_argument("--io-backend", choices=("direct", "kernel"), required=True)
+        parser.add_argument("--namespace", required=True)
+        args = parser.parse_args()
+        case = L3FlatKvRoundTripTest()
+        try:
+            case.setUp()
+            case._exercise(
+                backend="mooncake",
+                phase=args.native_worker,
+                io_backend=args.io_backend,
+                namespace=args.namespace,
+                native_config=json.loads(os.environ["MOONCAKE_GPU_TEST_CONFIG"]),
+            )
+        finally:
+            if not case.doCleanups():
+                raise RuntimeError("native Mooncake client cleanup failed")
+    else:
+        unittest.main()

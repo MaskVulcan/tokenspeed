@@ -602,7 +602,7 @@ def test_terminal_events_clear_transport_room_state(
     decode.cache_layout = _layout()
     admission = _op()
     admission.request_ids = ["request"]
-    decode._cache_prefill(admission)
+    decode._cache_prefill(admission, receivers=decode.capture_receivers(admission))
 
     assert len(decode.generate_events()) == 1
     assert decode.pop_remote_cache_slot("request") == 7
@@ -662,7 +662,8 @@ def test_decode_publishes_manifest_through_contract_receiver() -> None:
     executor.receivers = {"request-0": receiver}
     executor._admissions = {}
 
-    executor._cache_prefill(_op())
+    op = _op()
+    executor._cache_prefill(op, receivers=executor.capture_receivers(op))
 
     assert len(calls) == 1
     args, kwargs = calls[0]
@@ -680,6 +681,27 @@ def test_decode_publishes_manifest_through_contract_receiver() -> None:
     manifest = calls[0][1]["block_manifest"]
     assert manifest.state_prefix_cached is True
     assert manifest.groups[1].block_ids == ()
+
+
+def test_delayed_receive_cannot_publish_to_reused_request_id() -> None:
+    import tokenspeed.runtime.pd.decode_executor as decode_module
+
+    calls = []
+    old = SimpleNamespace(prefill=lambda **kwargs: calls.append("old"))
+    new = SimpleNamespace(prefill=lambda **kwargs: calls.append("new"))
+    executor = object.__new__(decode_module.DisaggDecodeExecutor)
+    executor.cache_layout = _layout()
+    executor.receivers = {"request-0": old}
+    executor._admissions = {}
+    op = _op()
+    captured = executor.capture_receivers(op)
+    # Failure removed the old room while GPU readiness was still pending.
+    executor.receivers["request-0"] = new
+    executor._cache_prefill(op, receivers=captured)
+    assert calls == []
+    assert executor._admissions == {}
+    executor._cache_prefill(op, receivers=executor.capture_receivers(op))
+    assert calls == ["new"]
 
 
 def test_prefill_submits_manifest_through_contract_sender() -> None:

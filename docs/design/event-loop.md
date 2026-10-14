@@ -90,11 +90,10 @@ Consequences:
   stage/drain device half; the commit-side SHM release). A generic "run this
   closure" slot is the hole this whole design closes, so a second KIND of
   user does not join it — it gets its own name.
-  L3 adds named Host-tier operations for the existence probe,
-  the prefetch lane's progress and completion (the hooks converge them each
-  round), namespace and weight-version changes, and cache shutdown. These
-  keep the executor and Host buffer hidden; they do not introduce another
-  generic work slot. The
+  L3 is a separate Host-only capability returned by the builder, held by
+  the L3 hooks and request handler. Its CPU workers cannot reach the device
+  handle. The loop submits `plan.storage` independently from device work;
+  completion facts enter the existing head feedback point. The
   retraction snapshot pool adds no operation at all: its stores ride
   `execute` with the write-backs, its restores with the load-backs, its ACKs
   `poll_cache_results`, and `shutdown_cache` closes it with L2 -- one
@@ -271,7 +270,8 @@ There are exactly two call sites, each with a documented reason:
 
 * **Head of the round** — completed Host cache-op events
   (`_cache_hooks.poll_ready_events()`: `WriteBackDone`, `LoadBackDone`,
-  `PrefetchDone`, `SnapshotDone`, `RestoreDone`, each replica-intersected).
+  `SnapshotDone`, `RestoreDone`, each replica-intersected), together with
+  the L3 hooks' agreed storage facts.
   These must advance *before* `next_execution_plan`, otherwise cache-gated
   admissions -- a prefetched request's admission, a suspended request's
   restore, which waits for both of its store ACKs, then its own -- are
@@ -395,20 +395,11 @@ seconds the greedy packing takes). The loop's one line is
 `note_round(forwarded=...)` after its forward submission. Nothing in the
 loop body knows a rebalance exists.
 
-`L3CacheHooks` owns the two replica-wide L3 decisions: prefix registration at
-submission (the `batch_exists` probe, MIN-reduced so every mirrored scheduler
-registers the same keys) and, once a round, the convergence of the in-flight
-prefetch ops -- the scheduler fetches an L3 hit into Host pages *before* it
-admits the request (`Cache.PrefetchOp`, a CPU lane behind `DeviceHandle`),
-and the hooks MIN-reduce each op's done flag and landed prefix across the
-replica, completing a converged op on the device so its one
-`PrefetchDoneEvent(op_id, landed_pages)` rides the next cache poll. They
-return nothing and never advance the scheduler; no forward is ever skipped
-or retracted because of L3, since only the L3-to-Host leg can miss and it
-runs before admission. With L3 disabled, the same hooks submit requests
-without token hashing, storage probes or replica collectives. Storage state
-and the prefetch lane remain behind `DeviceHandle`; namespace deletion and
-flush coordination stay in `RequestHandler`.
+`L3CacheHooks` agrees completion masks, native retirement, elapsed time and
+admission permissions across cache owners. It returns scheduler events at the
+head feedback point. It neither probes storage on ingress nor decides a prefix.
+The separate Host-only executor owns queues and backend health; C++ owns the
+request transaction. Namespace changes stay in `RequestHandler`.
 
 Per-round dispatch needs no hooks class at all: the loop hands
 `DeviceHandle.execute` the plan and the round's `PlannedForward`, and the
@@ -438,28 +429,18 @@ For orientation, one iteration of `event_loop`:
 
 1. Receive and admit new requests (`_process_new_requests`), with the pause
    and EPD admission hooks inline as single lines.
-2. Converge the in-flight L3 prefetches (`_l3_hooks.converge_prefetches`:
-   a replica MIN of each op's landed prefix; a finished op is completed on
-   the device), then poll completed Host cache ops (L2 write-backs/
-   load-backs, prefetches, snapshot stores/restores); **advance the
-   scheduler (head call site)** so this round's plan sees them.
-3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
-   step. Otherwise: plan (`next_execution_plan`),
-   count its cache ops, finish the requests the plan aborted
-   (`plan.aborts`: a capacity retraction whose victim could not be imaged
-   aborted the newest resident inside the plan build; the scheduler
-   released its pages in that round and emits nothing further for it, so
-   the output processor finishes it toward the client with
-   `ABORT_CODE.CapacityAbort` and no event flows back -- the one request
-   finish that is not a forward result), derive the forward op, record
-   metrics, DP-sync, and gather per-batch state (draining the in-flight
-   queue first if the dispatch depends on a pending commit, Principle 4).
+2. Poll Host copy completions and asynchronous L3 facts; **advance the
+   scheduler (head call site)** so this round's plan sees them. Hooks also
+   agree forward/storage permissions and a monotonic clock for soft deadlines.
+3. Plan with those permissions, including frozen rounds. Submit storage ops,
+   count device cache ops, finish `plan.aborts`, and prepare the forward batch.
+   A frozen round drains in-flight forwards and still dispatches cleanup;
+   it does not introduce another scheduling path. Metrics, DP synchronization
+   and pending-commit dependencies retain the same boundaries.
 4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
    that is itself a correctness contract for same-round page reuse. The
    handle adapts the plan's cache ops once (`cache_ops_from_plan`, on the
-   control plane), starts the L3 prefetches on the executor's CPU lane
-   (`PrefetchOp`: no stream, no Device page, nothing on the FIFO) and
-   submits, on the FIFO: the Host-bound stores first --
+   control plane) and submits, on the FIFO: the Host-bound stores first --
    `WriteBackOp` and `SnapshotOp`, a retraction image's two legs (the
    stream-ordered L2 write-back of the victim's hash-complete pages and the
    snapshot store of its tail pages and slot state) must read the reused
@@ -476,9 +457,7 @@ For orientation, one iteration of `event_loop`:
    pairs reading it; a destination is never zeroed; no op id, no ACK), then
    page zeroing (the new
    owner's sanitization),
-   then L3 prefetches (`PrefetchOp`: Host-lane submissions with no stream
-   dependency, nothing in the round reads their pages), then the
-   Device-bound copies -- `LoadBackOp` and `RestoreOp`, ordered
+   then the Device-bound copies -- `LoadBackOp` and `RestoreOp`, ordered
    behind the zeroing: a load-back lands on zeroed pages and the forward
    reads it layer by layer behind the layerwise fences, so the loads start
    first on the load stream; a restore queues behind them, overwrites its
@@ -581,26 +560,8 @@ For orientation, one iteration of `event_loop`:
   `remove_by_prefix`, before any rank mutates Device/Host. The frontend
   ANDs every DP worker's reply. Independent TokenSpeed jobs that share a
   tenant are not in those groups.
-  PP fans the request stream across WORLD so every cache-owning rank enters
-  the same exists MIN; without PP the attention-TP broadcast already does.
-  `batch_exists` is not a lease, so the L3 pages are fetched before the
-  request is admitted: the scheduler allocates their Host blocks, emits a
-  `Cache.PrefetchOp`, and holds the request in a pre-admission state
-  (`Prefetching`: no Device page, no request-pool row, admission skips past
-  it) while the executor's lane fills the pages in prefix order, stopping at
-  the first missing object or at the deadline -- which bounds when the next
-  batch may start, not a batch in flight: the store's `batch_get_into` has
-  no timeout, so a hung get holds the single-thread lane and every later
-  prefetch, the namespace delete and shutdown behind it. Each round the hooks
-  MIN-reduce every in-flight op's landed prefix across the replica; the
-  converged op is acknowledged once as `PrefetchDoneEvent(op_id,
-  landed_pages)`, the scheduler publishes the landed prefix in the Host
-  tier and forgets the rest of the keys, and the request's next admission
-  is an ordinary Host hit whose Host-to-Device load overlaps its first
-  chunk layer by layer, as any L2 hit's does. No forward is skipped and
-  nothing is retracted; there is no blacklist (a later `batch_exists` hit
-  may register a key again). A backend exception or malformed existence
-  result is a local miss, a lane fault a landing of nothing, so every
-  cache-owning rank still enters the replica MIN; raising would hang healthy
-  peers. Clients are not failed. The D role never prefetches: its admission
-  probes Device only.
+  Async L3 is restricted to PP=1 and KVP=1. GET completion is separate from
+  the device copy ACKs. Only retired all-owner successes publish Host rows;
+  failures fall back before admission. Soft deadlines detach requests while
+  native work retains its Host buffers; uncertain retirement quarantines them.
+  The D role receives its missing cache from its prefill peer.

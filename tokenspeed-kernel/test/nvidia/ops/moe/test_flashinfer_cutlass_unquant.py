@@ -32,9 +32,9 @@ Flash-3B, KV-page sharding on), the whole routed output came back NaN for
 finite inputs, reproducibly for that call, while any caller-provided
 workspace gave the reference result. The wrapper now hands every call one
 persistent zero-filled buffer per device; the workspace tests pin that.
-The last test covers an expert-parallel rank whose tokens repeat a
-zero-weight placeholder expert, as LongCat's zero experts do, with the
-allocator primed with NaN garbage between calls.
+The general routing prologue assumes distinct expert IDs per token. Tests
+refuse repeated routes at plan selection and compare unique routes, including
+zero-weight slots, against the reference with NaN garbage in the allocator.
 """
 
 from __future__ import annotations
@@ -176,25 +176,65 @@ def _reference(x, ids, weights, w13, w2, first_expert):
     return out
 
 
-@pytest.mark.parametrize("ep_rank", [0, 1])
-def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
+def test_repeated_routes_are_refused_before_execution() -> None:
+    _requires_flashinfer_hopper()
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    with pytest.raises(NoKernelFoundError):
+        kernel_moe_plan(
+            "unquant",
+            input_dtype=torch.bfloat16,
+            activation="swiglu",
+            routing_mode="precomputed_topk",
+            ep_size=4,
+            ispp=128,
+            hidden=256,
+            swiglu_form="standard",
+            activation_clamped=False,
+            expert_id_repeats=True,
+            internal_activation_dtype="input",
+            fast_math=True,
+            combine_order="rank",
+            solution="flashinfer_cutlass",
+        )
+
+
+@pytest.mark.parametrize(
+    ("solution", "repeats", "tokens", "top_k", "ep_rank", "padding_nan"),
+    [
+        ("flashinfer_cutlass", False, 5, k, rank, False)
+        for k in (6, 12)
+        for rank in range(4)
+    ]
+    + [("flashinfer_cutlass", False, 257, 8, rank, False) for rank in (0, 1)]
+    + [("triton", True, 5, 12, 0, True)],
+)
+def test_ep_routing_matches_reference(
+    solution, repeats, tokens, top_k, ep_rank, padding_nan
+):
     _requires_flashinfer_hopper()
 
     torch.manual_seed(0)
     device = "cuda"
-    num_experts, ep_size, hidden, inter, top_k, tokens = 16, 2, 256, 128, 6, 5
+    num_experts, hidden, inter = 32, 256, 128
+    ep_size = 1 if solution == "triton" else 4
     local = num_experts // ep_size
     w13 = (torch.randn(local, 2 * inter, hidden, device=device) * 0.05).bfloat16()
     w2 = (torch.randn(local, hidden, inter, device=device) * 0.05).bfloat16()
     x = torch.randn(tokens, hidden, device=device).bfloat16()
-    # Every token routes a few real experts; the remaining slots repeat
-    # placeholder expert 0 at weight zero.
+    # CUTLASS requires unique zero-weight IDs too; Triton also accepts the
+    # repeated placeholders and an unrelated nonfinite padding row.
     ids = torch.zeros(tokens, top_k, dtype=torch.int32, device=device)
     weights = torch.zeros(tokens, top_k, device=device)
     for token in range(tokens):
         real = 1 + token % 4
-        ids[token, :real] = torch.randperm(num_experts - 1, device=device)[:real] + 1
+        ids[token] = torch.randperm(num_experts, device=device)[:top_k]
         weights[token, :real] = torch.rand(real, device=device)
+        if repeats:
+            ids[token, real:] = 0
+    if padding_nan:
+        x[-1].fill_(float("nan"))
+    valid_rows = tokens - 1 if padding_nan else tokens
 
     plan = kernel_moe_plan(
         "unquant",
@@ -206,11 +246,11 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         hidden=hidden,
         swiglu_form="standard",
         activation_clamped=False,
-        expert_id_repeats=True,
+        expert_id_repeats=repeats,
         internal_activation_dtype="input",
         fast_math=True,
         combine_order="rank",
-        solution="flashinfer_cutlass",
+        solution=solution,
     )
     reference_w13 = w13.clone()
     layer = SimpleNamespace(
@@ -241,5 +281,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
             num_tokens_global=tokens,
             max_num_tokens_per_gpu=tokens,
         )
-        assert torch.isfinite(out).all()
-        torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
+        assert torch.isfinite(out[:valid_rows]).all()
+        torch.testing.assert_close(
+            out[:valid_rows].float(), expected[:valid_rows], atol=4e-3, rtol=2e-2
+        )

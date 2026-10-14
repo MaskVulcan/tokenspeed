@@ -1084,46 +1084,45 @@ in `--kvstore-storage-backend-extra-config`, for example:
 Constructing `MooncakeKvStore` requires `extra_config`. Pass `None` to
 use `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other env defaults.
 
-**Prefetch before admission.** An L3 hit is never loaded under a running
-forward. When a waiting request's registered L3 keys past its Device/Host
-hit span at least `--kvstore-prefetch-min-pages` prefix pages, the
-scheduler allocates Host blocks for them, emits a prefetch op and holds the
-request in a pre-admission state that owns those Host blocks and nothing
-else -- no Device page, no batch slot -- while later requests may be
-admitted past it. The Host cache executor's prefetch lane (a CPU thread)
-fills the pages in prefix order, `--kvstore-prefetch-batch-pages` per
-`batch_get_into`, and stops at the first missing page or at the deadline
-`--kvstore-prefetch-timeout-base-s + --kvstore-prefetch-timeout-per-page-s
-x pages`, counted from when the op starts on the lane and checked between
-batches only (a `batch_get_into` already issued runs to completion -- the
-store API has no timeout -- so one batch may overrun the deadline, and a
-hung store holds the lane and every later prefetch behind it); the replica
-agrees (a MIN across TP, CP and PP) on the pages
-landed, the scheduler publishes exactly that prefix in Host L2 and forgets
-the rest of the keys, and the request's admission is then an ordinary Host
-hit whose Host-to-Device load overlaps its first chunk layer by layer.
-Fewer free Host blocks than the hit truncate the prefetch; below the minimum
-there is none and the pages are computed -- admission never waits on Host
-room. The cost: an L3 hit waits for its prefetch before it is admitted (one
-plan of latency at least), holding no Device pages meanwhile; the gain: no
-forward is ever skipped or recomputed because of L3. The decode role of a PD
-deployment never prefetches (its admission probes Device only). The four
-knobs are required with `--kvstore-storage-backend` and refused without it:
+**Asynchronous preparation before admission.** Queries and GETs hold no Device
+pages. All-owner retired GET successes become ordinary Host hits; a soft
+deadline permits local computation while keeping native buffers pinned until
+retirement. D2H publication never waits for PUT. Queue pressure bypasses new
+reads/writes while existing work retires. The PD decode role does not fetch
+L3; its prefill peer supplies the missing cache.
 
-| Argument | Description |
-| --- | --- |
-| `--kvstore-prefetch-min-pages` | The shortest L3-only prefix, in prefix pages, worth a prefetch; a shorter hit is computed. The reference engine's `prefetch_threshold`. |
-| `--kvstore-prefetch-timeout-base-s` | The prefetch deadline's base term in seconds (positive). The deadline says when the lane stops starting batches; it does not interrupt a batch in flight. |
-| `--kvstore-prefetch-timeout-per-page-s` | The deadline's per-page term in seconds (0 for a fixed deadline). |
-| `--kvstore-prefetch-batch-pages` | Prefix pages per `batch_get_into` of a prefetch; the fetch stops at the first batch with a missing page (the reference engine uses 128). |
+Configure limits in the `async` object of
+`--kvstore-storage-backend-extra-config`, for example:
 
-`--kvstore-storage-backend memory` is an in-process dict for tests only.
-CI exercises that Mooncake-compatible contract end-to-end (scheduler
-prefetch after `register_storage_keys` / Host eviction, and a CUDA
-D2H → store → Host wipe → prefetch → H2D round trip). A separate
-ubuntu job boots `mooncake_master` and runs
-`test/test_l3_mooncake_master.py` against the real TCP client
-(`P2PHANDSHAKE`). Reuse an already-running master with
-`MOONCAKE_MASTER=host:port`.
+```json
+{
+  "master_server_address": "store.example:50051",
+  "protocol": "rdma",
+  "global_segment_size": 0,
+  "async": {
+    "max_operations": 32,
+    "max_keys_per_operation": 256,
+    "wait_timeout_ms": 2000,
+    "ready_timeout_ms": 1000,
+    "min_prefetch_tokens": 2048,
+    "max_prefetch_tokens": 32768,
+    "query_workers": 2,
+    "read_workers": 2,
+    "write_workers": 1
+  }
+}
+```
+
+`global_segment_size=0` explicitly selects a client with no local storage
+segment; deploy separate memory-store owners. The old four
+`--kvstore-prefetch-*` arguments are removed. Queue sizes, Host credits,
+hysteresis and observability are documented in
+[asynchronous L3](../design/async-l3-cache.md). L3 currently requires PP=1
+and KVP=1; Host L2 and snapshot pools retain their existing KVP support.
+
+`--kvstore-storage-backend memory` is for tests. CPU tests cover the scheduler,
+real queue workers and gloo agreement; GPU tests round-trip packed cache bytes.
+`test/test_l3_mooncake_master.py` starts a real master and tests native Store
+I/O; `MOONCAKE_MASTER=host:port` reuses an existing master.
 Mooncake Store is the offload backend. PD KV transfer still uses the
 separate Mooncake TransferEngine (`--disaggregation-transfer-backend`).

@@ -37,6 +37,7 @@ from tokenspeed.runtime.cache.l3.backend import (
     cache_layout_signature,
     l3_cache_quantization_id,
     l3_checkpoint_id,
+    l3_kv_producer_id,
     resolve_l3_weight_version,
     share_l3_checkpoint_ids,
     storage_key_prefix,
@@ -109,13 +110,15 @@ class StorageKeyTest(unittest.TestCase):
                 "draft_attention_backend": "",
                 "skip_softmax_threshold": 0.0,
                 "eagle3_layers_to_capture": [],
+                "kv_producer": "resolved-numerics",
             }
             values.update(overrides)
             return storage_key_prefix(**values)
 
         base = prefix()
         self.assertEqual(base, prefix())
-        self.assertTrue(base.startswith("tsl3v1-"))
+        self.assertTrue(base.startswith("tsl3v2-"))
+        self.assertNotEqual(base, prefix(kv_producer="different-numerics"))
         self.assertNotEqual(base, prefix(model_name="org_model"))
         self.assertNotEqual(base, prefix(revision="def"))
         self.assertNotEqual(base, prefix(weight_version="v2"))
@@ -149,7 +152,7 @@ class StorageKeyTest(unittest.TestCase):
         self.assertNotEqual(
             prefix(draft_attention_backend="fa3"), prefix(draft_attention_backend="fa4")
         )
-        self.assertNotEqual(base, prefix(runtime_compat="2"))
+        self.assertNotEqual(base, prefix(runtime_compat="previous-epoch"))
         self.assertEqual(prefix(runtime_compat="1"), prefix(runtime_compat="1"))
         self.assertNotEqual(base, prefix(skip_softmax_threshold=1e-2))
         self.assertEqual(
@@ -168,6 +171,8 @@ class StorageKeyTest(unittest.TestCase):
             prefix(eagle3_layers_to_capture="2,16,29")
         with self.assertRaises(TypeError):
             prefix(model_overrides=["rope_theta"])
+        with self.assertRaises(ValueError):
+            prefix(kv_producer="")
 
     def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):
         return l3_checkpoint_id(
@@ -1605,12 +1610,26 @@ class MooncakeKvStoreTest(unittest.TestCase):
 
             def batch_put_from(self, keys, ptrs, sizes):
                 del ptrs, sizes
-                return [-1] * len(keys)
+                return [-705] * len(keys)
 
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = _Store()
         host = SimpleNamespace(data_ptr=lambda: 100)
         self.assertEqual(adapter.batch_put_from(["k"], host, [0], [8]), [True])
+
+    def test_failed_put_cannot_be_retired_by_an_exists_recheck(self):
+        calls = []
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_is_exist=lambda keys: calls.append("exists") or [0] * len(keys),
+            batch_put_from=lambda keys, ptrs, sizes: [-800] * len(keys),
+        )
+        result = adapter.batch_put_from_result(
+            ["k"], SimpleNamespace(data_ptr=lambda: 100), [0], [8]
+        )
+        self.assertEqual(result.success, (False,))
+        self.assertFalse(result.retired)
+        self.assertEqual(calls, ["exists"])
 
     def test_truncated_exists_does_not_ack_unuploaded_keys(self):
         class _Store:
@@ -1653,6 +1672,27 @@ class MooncakeKvStoreTest(unittest.TestCase):
             [False, False],
         )
 
+    def test_object_evicted_after_exists_is_a_retired_miss(self):
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_is_exist=lambda keys: [1] * len(keys),
+            batch_get_into=lambda keys, ptrs, sizes: [-704, 8],
+        )
+        host = SimpleNamespace(data_ptr=lambda: 100)
+        self.assertEqual(adapter.batch_exists(["evicted", "resident"]), [True, True])
+        result = adapter.batch_get_into_result(
+            ["evicted", "resident"], host, [0, 8], [8, 8]
+        )
+        self.assertEqual(result.success, (False, True))
+        self.assertTrue(result.retired)
+        self.assertEqual(result.object_failures, (True, False))
+        adapter.store.batch_get_into = lambda keys, ptrs, sizes: [-704, -800]
+        result = adapter.batch_get_into_result(
+            ["evicted", "unknown"], host, [0, 8], [8, 8]
+        )
+        self.assertFalse(result.retired)
+        self.assertEqual(result.object_failures, (True, False))
+
     def test_truncated_get_into_is_rejected(self):
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = SimpleNamespace(batch_get_into=lambda keys, ptrs, sizes: [1])
@@ -1670,6 +1710,9 @@ class MooncakeKvStoreTest(unittest.TestCase):
             adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8]),
             [False, True],
         )
+        result = adapter.batch_get_into_result(["k0", "k1"], host, [0, 8], [8, 8])
+        self.assertTrue(result.retired)
+        self.assertEqual(result.object_failures, (True, False))
         adapter.store = SimpleNamespace(
             batch_get_into=lambda keys, ptrs, sizes: [0, -1]
         )
@@ -1742,6 +1785,24 @@ class MooncakeKvStoreTest(unittest.TestCase):
                 pp_size=1,
             )
         self.assertEqual(captured["segment"], 2 * 1024**3)
+        with mock.patch.dict(
+            sys.modules, {"mooncake": package, "mooncake.store": store_module}
+        ):
+            MooncakeKvStore(
+                dict(extra, global_segment_size=0),
+                host_buffer=host,
+                tp_size=8,
+                pp_size=1,
+            )
+            self.assertEqual(captured["segment"], 0)
+            for size in (-1, 1):
+                with self.assertRaisesRegex(ValueError, "too small"):
+                    MooncakeKvStore(
+                        dict(extra, global_segment_size=size),
+                        host_buffer=host,
+                        tp_size=8,
+                        pp_size=1,
+                    )
 
 
 if __name__ == "__main__":

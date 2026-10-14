@@ -5,6 +5,20 @@ on:
     branches: [main]
     paths:
       - "python/tokenspeed/runtime/cache/l3/**"
+      - "python/tokenspeed/runtime/cache/l2/executor.py"
+      - "python/tokenspeed/runtime/cache/host_memory.py"
+      - "python/tokenspeed/runtime/cache/transfer/host_storage.py"
+      - "python/tokenspeed/runtime/engine/l3_cache_hooks.py"
+      - "python/tokenspeed/runtime/engine/event_loop.py"
+      - "python/tokenspeed/runtime/execution/device.py"
+      - "tokenspeed-scheduler/**"
+      - "test/test_async_l3_*.py"
+      - "test/test_l3_metrics.py"
+      - "test/test_host_cache_storage.py"
+      - "test/test_host_memory.py"
+      - "test/test_l3_benchmark_client.py"
+      - "test/benchmarks/l3/**"
+      - "test/runtime/test_l3_storage_hits.py"
       - "test/test_l3_mooncake_master.py"
       - "test/test_l3_kvstore.py"
       - ".github/workflows/mooncake-l3-test.yml"
@@ -12,6 +26,20 @@ on:
     branches: [main]
     paths:
       - "python/tokenspeed/runtime/cache/l3/**"
+      - "python/tokenspeed/runtime/cache/l2/executor.py"
+      - "python/tokenspeed/runtime/cache/host_memory.py"
+      - "python/tokenspeed/runtime/cache/transfer/host_storage.py"
+      - "python/tokenspeed/runtime/engine/l3_cache_hooks.py"
+      - "python/tokenspeed/runtime/engine/event_loop.py"
+      - "python/tokenspeed/runtime/execution/device.py"
+      - "tokenspeed-scheduler/**"
+      - "test/test_async_l3_*.py"
+      - "test/test_l3_metrics.py"
+      - "test/test_host_cache_storage.py"
+      - "test/test_host_memory.py"
+      - "test/test_l3_benchmark_client.py"
+      - "test/benchmarks/l3/**"
+      - "test/runtime/test_l3_storage_hits.py"
       - "test/test_l3_mooncake_master.py"
       - "test/test_l3_kvstore.py"
       - ".github/workflows/mooncake-l3-test.yml"
@@ -56,3 +84,33 @@ jobs:
           PYTHONPATH: python
         run: |
           python -m unittest test.test_l3_kvstore test.test_l3_mooncake_master -v
+
+  async-protocol:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install CPU protocol test dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install psutil prometheus-client -e 'tokenspeed-scheduler[test]'
+
+      - name: Run asynchronous storage and replica agreement tests
+        env:
+          PYTHONPATH: python
+        run: |
+          python -m pytest -q \
+            test/test_async_l3_executor.py \
+            test/test_async_l3_agreement.py \
+            test/test_l3_metrics.py \
+            test/test_host_cache_storage.py \
+            test/test_host_memory.py \
+            test/test_l3_benchmark_client.py \
+            test/runtime/test_l3_storage_hits.py
