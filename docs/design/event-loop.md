@@ -560,7 +560,9 @@ For orientation, one iteration of `event_loop`:
   `remove_by_prefix`, before any rank mutates Device/Host. The frontend
   ANDs every DP worker's reply. Independent TokenSpeed jobs that share a
   tenant are not in those groups.
-  Async L3 is restricted to PP=1 and KVP=1. GET completion is separate from
+  Async L3 is restricted to PP=1. Cyclic KV-page owners use the same Host
+  translation as L2; replica-stable keys permit a new allocation to select
+  another owner. Replicated state fields retain per-rank keys. GET completion is separate from
   the device copy ACKs. Only retired all-owner successes publish Host rows;
   failures fall back before admission. Soft deadlines detach requests while
   native work retains its Host buffers; uncertain retirement quarantines them.

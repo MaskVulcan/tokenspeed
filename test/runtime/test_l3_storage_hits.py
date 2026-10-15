@@ -65,7 +65,7 @@ def test_storage_ranges_and_namespace_are_captured_before_queueing():
     host = SimpleNamespace(
         host_buffer=bytearray(64), host_block_range=lambda g, b: ((b - 1) * 8, 8)
     )
-    store = L3HostStore(MemoryKvStore(), host, key_prefix="old", rank=0)
+    store = L3HostStore(MemoryKvStore(), host, key_prefix="old", rank=0, ownership=None)
     executor = AsyncL3Executor(
         store,
         config=L3AsyncConfig.from_extra_config(
@@ -105,6 +105,7 @@ def test_namespace_mutation_rejects_inflight_io_without_waiting():
         SimpleNamespace(host_buffer=bytearray(64)),
         key_prefix="old",
         rank=0,
+        ownership=None,
     )
     executor = AsyncL3Executor(
         store,
@@ -183,7 +184,7 @@ def test_rejected_get_retries_same_remote_keys_after_recovery(reject):
     scheduler = ts.Scheduler(cfg)
     host = SimpleNamespace(host_buffer=bytearray(256))
     backend = MemoryKvStore()
-    store = L3HostStore(backend, host, key_prefix="retry", rank=0)
+    store = L3HostStore(backend, host, key_prefix="retry", rank=0, ownership=None)
     now = [1.0]
     executor = AsyncL3Executor(
         store, config=config, clock=lambda: now[0], prefix_for_weight_version=None

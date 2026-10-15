@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from tokenspeed.runtime.cache.l3.backend import KvStoreStorage, storage_object_key
+from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +46,13 @@ class L3HostStore:
         *,
         key_prefix: str,
         rank: int,
+        ownership: BlockOwnerTranslation | None,
     ):
         self.backend = backend
         self.host_storage = host_storage
         self._base_key_prefix = key_prefix
         self.rank = int(rank)
+        self.ownership = ownership
 
     @property
     def key_prefix(self) -> str:
@@ -96,7 +99,11 @@ class L3HostStore:
             group_id,
             page_offset,
             prefix=self.key_prefix,
-            rank=self.rank,
+            rank=(
+                self.rank // self.ownership.shard_counts[group_id]
+                if self.ownership is not None
+                else self.rank
+            ),
         )
 
     def exists(self, pages: Sequence[StoragePage]) -> list[bool]:
@@ -148,41 +155,60 @@ class L3HostStore:
 
     def _ranges(
         self, pages: Sequence[StoragePage]
-    ) -> tuple[list[str], list[int], list[int]]:
-        keys = []
-        offsets = []
-        sizes = []
-        for group_id, host_block_id, content_hash, page_offset in pages:
-            offset, size = self.host_storage.host_block_range(
-                int(group_id), int(host_block_id)
+    ) -> tuple[list[str], list[int | None], list[int]]:
+        """Capture local Host ranges in logical-key order.
+
+        A None offset means this rank owns no bytes of that logical object.
+        Its completion is neutral in the all-owner intersection. Sharded
+        objects use the replica rank in their keys, so a different Host owner
+        can restore a page written by an earlier allocation.
+        """
+        keys = [self.object_key(h, int(g), int(o)) for g, _, h, o in pages]
+        if self.ownership is None:
+            ranges = [
+                self.host_storage.host_block_range(int(g), int(b))
+                for g, b, _, _ in pages
+            ]
+            return keys, [offset for offset, _ in ranges], [size for _, size in ranges]
+        offsets: list[int | None] = [None] * len(pages)
+        sizes = [
+            self.host_storage.host_cache_block_bytes[int(g)] for g, _, _, _ in pages
+        ]
+        owned = self.ownership.owned_host_positions(
+            [(int(g), int(b)) for g, b, _, _ in pages]
+        )
+        for position, (group, local_block) in owned:
+            offsets[position], sizes[position] = self.host_storage.host_block_range(
+                group, local_block
             )
-            keys.append(self.object_key(content_hash, int(group_id), int(page_offset)))
-            offsets.append(offset)
-            sizes.append(size)
         return keys, offsets, sizes
 
-    def backup(self, pages: Sequence[StoragePage]) -> list[bool]:
-        if not pages:
-            return []
+    def _copy(self, pages: Sequence[StoragePage], *, write: bool) -> list[bool]:
         keys, offsets, sizes = self._ranges(pages)
-        results = self.backend.batch_put_from(
-            keys, self.host_storage.host_buffer, offsets, sizes
-        )
-        logger.info(
-            f"[L3] backup pages={len(pages)} ok={sum(1 for ok in results if ok)}"
-        )
+        positions = [i for i, offset in enumerate(offsets) if offset is not None]
+        flags = [True] * len(keys)
+        if positions:
+            operation = (
+                self.backend.batch_put_from if write else self.backend.batch_get_into
+            )
+            results = operation(
+                [keys[i] for i in positions],
+                self.host_storage.host_buffer,
+                [offsets[i] for i in positions],
+                [sizes[i] for i in positions],
+            )
+            for position, success in zip(positions, results, strict=True):
+                flags[position] = success
+        return flags
+
+    def backup(self, pages: Sequence[StoragePage]) -> list[bool]:
+        results = self._copy(pages, write=True)
+        logger.info(f"[L3] backup pages={len(pages)} ok={sum(results)}")
         return results
 
     def prefetch(self, pages: Sequence[StoragePage]) -> list[bool]:
-        if not pages:
-            return []
-        keys, offsets, sizes = self._ranges(pages)
-        results = self.backend.batch_get_into(
-            keys, self.host_storage.host_buffer, offsets, sizes
-        )
-        logger.info(
-            f"[L3] prefetch pages={len(pages)} ok={sum(1 for ok in results if ok)}"
-        )
+        results = self._copy(pages, write=False)
+        logger.info(f"[L3] prefetch pages={len(pages)} ok={sum(results)}")
         return results
 
     def close(self) -> None:

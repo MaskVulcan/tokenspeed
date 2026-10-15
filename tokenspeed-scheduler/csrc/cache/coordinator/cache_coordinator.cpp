@@ -79,13 +79,6 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
             _assert(spec.attn_kind == AttnKind::kSlidingWindow, "a replayable group must be a sliding window");
             replay_window_tokens_ = std::max(replay_window_tokens_, spec.sliding_window);
         }
-        // Every Host copy keeps the bucket of its Device end, so a page-cyclic
-        // owner translation selects the same rows on both sides. An L3
-        // prefetch allocates its Host page before any Device destination
-        // exists and would have to choose the bucket blind, so L3 stays
-        // replicated-only.
-        _assert(!enable_l3_storage_ || spec.shard_count == 1,
-                "L3 storage is not supported for page-cyclic sharded cache groups");
         if (groups_[i].Matcher().IsPrefixClosed()) {
             match_order_.push_back(i);
         }
@@ -1743,6 +1736,7 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(std:
         if (probe.num_common_tokens <= floor) return {};
         StorageReservation result;
         std::vector<std::uint32_t> groups;
+        std::vector<std::int32_t> buckets;
         // Pin every warm dependency before any allocation can evict another hit.
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const auto begin = floor / prefix_granularity_ * BlocksPerBoundary(static_cast<std::int32_t>(i));
@@ -1755,12 +1749,14 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(std:
                 else {
                     result.keys.push_back(key);
                     groups.push_back(key.group_id);
+                    // Place successive logical pages across cyclic owners. The
+                    // L3 object is independent of its original Host allocation.
+                    buckets.push_back((begin + static_cast<std::int32_t>(j)) % groups_[i].Spec().shard_count);
                 }
             }
         }
         if (result.keys.empty()) return {};
         if (result.keys.size() + result.warm_blocks.size() <= max_blocks) {
-            const std::vector<std::int32_t> buckets(groups.size(), 0);
             auto allocation = AcquireHostBlocks(groups, buckets);
             if (allocation.stats.allocated == groups.size()) {
                 result.blocks = std::move(allocation.blocks);

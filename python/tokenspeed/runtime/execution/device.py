@@ -1628,12 +1628,35 @@ def build_device_side(
 
         from tokenspeed.runtime.cache.l3.async_executor import AsyncL3Executor
         from tokenspeed.runtime.cache.l3.executor import L3HostStore
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+            build_cache_transfer_schema,
+        )
 
+        transfer_schema = build_cache_transfer_schema(
+            views.token_to_kv_pool.arena.plan,
+            model_config=model_config,
+            draft_model_config=draft_model_config,
+        )
+        shard_counts = {
+            spec.group_id: spec.shard_count
+            for spec in views.token_to_kv_pool.arena.runtime_contract.group_specs
+        }
+        for group in host_cache_executor.layout.groups:
+            if shard_counts[group.group_id] > 1:
+                for field in group.fields:
+                    if transfer_schema.partition_for(field.field_id) is not None:
+                        raise ValueError(
+                            f"L3 page sharding requires replicated field payloads; "
+                            f"{field.field_id} is head-partitioned"
+                        )
+
+        assert host_cache_executor.block_owners is not None
         l3_store = L3HostStore(
             storage_backend,
             host_cache_executor.host_storage,
             key_prefix=prefix_for_weight_version(server_args.weight_version),
             rank=attn_tp_rank,
+            ownership=host_cache_executor.block_owners,
         )
         l3_executor = AsyncL3Executor(
             l3_store,

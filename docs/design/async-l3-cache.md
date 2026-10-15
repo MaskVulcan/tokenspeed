@@ -54,6 +54,13 @@ round sequencing, and the shared Host resource owns its allocation.
    ownership to the existing H2D ticket. Ready expiry releases the hold. H2D
    and the forward use the same execution path as every Host hit.
 
+`max_host_blocks` counts logical references across all groups and outstanding
+storage operations, including recurrent-state checkpoints. It is neither a
+byte budget nor a quota per worker. Page sharding changes the transferred bytes,
+not this logical count. A read with no legal prefix within the remaining budget
+uses ordinary local admission; deployments must budget for the prefix lengths
+and concurrency they intend to restore together.
+
 Retraction restores exact images through `HostCacheExecutor`; it never starts
 a fresh L3 preparation. State groups use the current fixed two-slot checkpoint
 contract. Runtime compatibility epoch 2 isolates objects from the prior layout.
@@ -182,6 +189,11 @@ credits and explicit pressure watermarks; it does not estimate per-request
 transfer benefit or auto-tune limits. Pressure does not report a backend fault,
 and a successful backend call does not override C++ pressure admission.
 
+PD bootstrap and L3 preparation may run together while the request owns no
+Device pages. Bootstrap completion does not discard a pending or Ready storage
+transaction; ordinary admission still requires both dependencies. The D role
+continues to obtain its missing prefix from the prefill peer.
+
 ## Completion agreement and ordering
 
 Every attention-TP owner sends its newly completed records once over the CPU
@@ -205,6 +217,15 @@ fields must be actual booleans; per-key masks have equal lengths and success
 cannot also report an object failure. Query/PUT cannot report read failures.
 A truthy value is not proof of native retirement. Malformed backend
 results follow the backend's explicit exception-retirement contract.
+
+Page-cyclic groups use the existing Host owner translation. Each worker copies
+only its locally owned rows; other rows contribute success and retirement but
+no object failure or transferred bytes. Their keys name the payload replica
+(`attention_tp_rank // shard_count`), so a new Host allocation may restore the
+same object on another cyclic owner. Replicated state groups retain rank-local
+keys. Startup rejects head-partitioned fields in a page-sharded group: changing
+page owner must not change what bytes an object means. The producer namespace
+also includes KVP, QCP and linear-attention TP geometry.
 
 The TP leader supplies the common monotonic clock; permissions are intersected.
 The head advance applies that tick and cancellation before completion records,

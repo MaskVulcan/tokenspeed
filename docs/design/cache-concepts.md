@@ -506,9 +506,12 @@ to other ranks is still acknowledged by this rank from an empty copy; the
 hooks' replica intersection completes the op only once every owner has. The
 scheduler side (residue-class allocation for every tier transfer, the Host
 pools registered with each group's `shard_count`) is what makes the
-translation exact, so both Host tiers serve a KV-page-sharded engine; L3
-storage does not (`scheduler.md`), because an L3 key names content and
-position while ownership is decided at allocation.
+translation exact, so both Host tiers serve a KV-page-sharded engine. L3
+uses the same Host owner translation before Device admission. A sharded
+object key names the replica (`attention_tp_rank / shard_count`) rather than
+the writer's cyclic owner. Its bytes must be replicated within that owner
+subgroup; startup rejects head-partitioned fields in a page-sharded group.
+Replicated state groups keep the full rank in their keys.
 
 ## block vs. page
 
@@ -834,7 +837,9 @@ Its responsibilities:
   never invalidates a usable L2 entry. An independent GET transaction fills
   Host before admission. Runtime workers receive immutable CPU byte geometry
   and no reference to Device buffers or layouts.
-  Object keys are `{tsl3v2-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`;
+  Object keys are `{tsl3v2-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{object_rank}|c0`;
+  `object_rank` is the TP rank for replicated groups and the payload replica
+  rank (`tp_rank // shard_count`) for cyclic page groups;
   the trailing `c0` is the retired context-parallel shard id, kept literal
   (as is the `cp_size: 1` entry of the hashed namespace) so objects written
   before its removal stay addressable until the next deliberate key-format
@@ -1350,11 +1355,14 @@ in its source's bucket (`AcquireHostBlocks(group_ids, buckets)`,
 a batch. A Host block's residue is therefore its owner exactly as a Device
 block's is, and one `owned_local_pages` translation serves both ends of every
 row: a rank keeps the rows it owns and translates both ids to local pages, a
-replicated group (`D = 1`) owns every row. L3 storage stays refused with a
-sharded group (`SchedulerConfig::Validate`): an L3 key names content, group,
-offset and `tp_rank`, but which rank owns a block is decided at allocation,
-so a rank probing `batch_exists` can only answer for the blocks it owned when
-the object was written. A residue-constrained acquisition can fail while
+replicated group (`D = 1`) owns every row. L3 probes replica-stable keys on
+all owners, then reads or writes only the Host blocks this rank owns. A rank
+with no local bytes reports neutral success and proven retirement, performs
+no native I/O and cannot act as a health recovery probe. The all-owner
+intersection still requires the actual owner's success before publication.
+L3 reservations distribute successive logical pages across cyclic owners;
+Device admission later preserves each restored Host block's residue.
+A residue-constrained acquisition can fail while
 other buckets have room; a restore then waits like any readmission, and the
 balanced allocator keeps ordinary admissions within one block per bucket, so
 the imbalance a restore sees is bounded by what its own victim table

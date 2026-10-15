@@ -943,7 +943,7 @@ with no request suspended both must read empty and zero.
 the newest resident instead of imaging one; §2) and `max_retracted_requests`
 (`0` with no pool, `> 0` with one; the runtime's slot-state arena has that
 many rows plus the null row) are validated together, the P role refuses a
-pool, and L3 storage is refused with a page-cyclic sharded group
+pool, and L3 addresses page-cyclic sharded groups through replica-stable object keys
 (`cache-concepts.md`). `debug_force_retraction_interval` (§2) is the only
 knob that chooses victims outside capacity pressure, and it is refused
 without a pool. Every diagnostic names the binding field and the server arg

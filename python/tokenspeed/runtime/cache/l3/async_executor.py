@@ -124,7 +124,7 @@ class StorageJob:
     op_id: int
     kind: str
     keys: tuple[str, ...]
-    offsets: tuple[int, ...]
+    offsets: tuple[int | None, ...]
     sizes: tuple[int, ...]
 
 
@@ -208,23 +208,24 @@ class AsyncL3Executor:
                 self.store.object_key(str(h), int(g), int(o))
                 for g, h, o in logical_keys
             )
-            ranges = (
-                tuple(
-                    self.store.host_storage.host_block_range(int(key[0]), int(block))
-                    for key, block in zip(
-                        logical_keys, operation.host_blocks, strict=True
-                    )
+            if kind == "query":
+                offsets, sizes = (), ()
+            else:
+                _, offsets, sizes = self.store._ranges(
+                    [
+                        (int(g), int(block), str(h), int(o))
+                        for (g, h, o), block in zip(
+                            logical_keys, operation.host_blocks, strict=True
+                        )
+                    ]
                 )
-                if kind != "query"
-                else ()
-            )
             self.submit(
                 StorageJob(
                     int(operation.op_id),
                     kind,
                     keys,
-                    tuple(offset for offset, _ in ranges),
-                    tuple(size for _, size in ranges),
+                    tuple(offsets),
+                    tuple(sizes),
                 )
             )
 
@@ -271,7 +272,15 @@ class AsyncL3Executor:
                 # The scheduler bounds all accepted operations; exceeding that
                 # bound is a protocol fault, not a silent dropped completion.
                 raise RuntimeError("L3 scheduler exceeded operation credits")
-            state = _JobState(job, self._clock(), sum(job.sizes))
+            state = _JobState(
+                job,
+                self._clock(),
+                sum(
+                    size
+                    for offset, size in zip(job.offsets, job.sizes)
+                    if offset is not None
+                ),
+            )
             self._counters[job.kind].accepted += 1
             self._jobs[job.op_id] = state
             if self._stopping.is_set() or self._unsafe_io:
@@ -321,10 +330,19 @@ class AsyncL3Executor:
         state.completed = True
         counters = self._counters[state.job.kind]
         counters.completed += 1
-        counters.success_keys += sum(result.success)
-        counters.failed_keys += len(result.success) - sum(result.success)
+        positions = (
+            range(len(state.job.keys))
+            if state.job.kind == "query"
+            else [i for i, offset in enumerate(state.job.offsets) if offset is not None]
+        )
+        counters.success_keys += sum(result.success[i] for i in positions)
+        counters.failed_keys += sum(not result.success[i] for i in positions)
         counters.success_bytes += sum(
-            size for size, success in zip(state.job.sizes, result.success) if success
+            size
+            for offset, size, success in zip(
+                state.job.offsets, state.job.sizes, result.success
+            )
+            if offset is not None and success
         )
         if state.started_at is None:
             counters.queue_seconds += self._clock() - state.submitted_at
@@ -364,12 +382,38 @@ class AsyncL3Executor:
                 self._counters[kind].queue_seconds += (
                     state.started_at - state.submitted_at
                 )
+            positions = (
+                tuple(range(len(job.keys)))
+                if kind == "query"
+                else tuple(
+                    i for i, offset in enumerate(job.offsets) if offset is not None
+                )
+            )
+            if not positions:
+                # No native work exists on this owner. It must not act as a
+                # health recovery probe or charge bytes it did not transfer.
+                with self._lock:
+                    self._finish_locked(
+                        state,
+                        StorageIOResult(
+                            (True,) * len(job.keys), True, (False,) * len(job.keys)
+                        ),
+                    )
+                work_queue.task_done()
+                continue
+            local_keys = tuple(job.keys[i] for i in positions)
+            local_offsets = (
+                tuple(job.offsets[i] for i in positions) if kind != "query" else ()
+            )
+            local_sizes = (
+                tuple(job.sizes[i] for i in positions) if kind != "query" else ()
+            )
             token = self._health.begin_operation()
             if token is None:
                 with self._lock:
                     self._counters[kind].rejected += 1
                 result = StorageIOResult(
-                    (False,) * len(job.keys), True, (False,) * len(job.keys)
+                    (False,) * len(local_keys), True, (False,) * len(local_keys)
                 )
             else:
                 started_at = self._clock()
@@ -378,27 +422,29 @@ class AsyncL3Executor:
                 try:
                     backend = self.store.backend
                     if kind == "query":
-                        flags = tuple(backend.batch_exists(job.keys))
-                        result = StorageIOResult(flags, True, (False,) * len(job.keys))
+                        flags = tuple(backend.batch_exists(local_keys))
+                        result = StorageIOResult(
+                            flags, True, (False,) * len(local_keys)
+                        )
                     elif kind == "get":
                         result = backend.batch_get_into_result(
-                            job.keys,
+                            local_keys,
                             self.store.host_storage.host_buffer,
-                            job.offsets,
-                            job.sizes,
+                            local_offsets,
+                            local_sizes,
                         )
                     else:
                         result = backend.batch_put_from_result(
-                            job.keys,
+                            local_keys,
                             self.store.host_storage.host_buffer,
-                            job.offsets,
-                            job.sizes,
+                            local_offsets,
+                            local_sizes,
                         )
                     if (
                         type(result.retired) is not bool
-                        or len(result.success) != len(job.keys)
+                        or len(result.success) != len(local_keys)
                         or any(type(flag) is not bool for flag in result.success)
-                        or len(result.object_failures) != len(job.keys)
+                        or len(result.object_failures) != len(local_keys)
                         or any(
                             type(flag) is not bool for flag in result.object_failures
                         )
@@ -414,9 +460,9 @@ class AsyncL3Executor:
                 except Exception:
                     logger.exception(f"L3 {kind} failed for operation {job.op_id}")
                     result = StorageIOResult(
-                        (False,) * len(job.keys),
+                        (False,) * len(local_keys),
                         kind == "query" or self.store.backend.failures_retire,
-                        (False,) * len(job.keys),
+                        (False,) * len(local_keys),
                     )
                     self._health.report_failure(token)
                 else:
@@ -437,6 +483,13 @@ class AsyncL3Executor:
                         self._counters[kind].backend_seconds += (
                             self._clock() - started_at
                         )
+            success = [True] * len(job.keys)
+            failures = [False] * len(job.keys)
+            for position, ok, failed in zip(
+                positions, result.success, result.object_failures, strict=True
+            ):
+                success[position], failures[position] = ok, failed
+            result = StorageIOResult(tuple(success), result.retired, tuple(failures))
             with self._lock:
                 self._finish_locked(state, result)
             work_queue.task_done()

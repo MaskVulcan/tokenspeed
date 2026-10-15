@@ -48,7 +48,7 @@ def config():
 
 def executor(backend, *, cfg, data=None):
     host = SimpleNamespace(host_buffer=bytearray(64) if data is None else data)
-    store = L3HostStore(backend, host, key_prefix="test", rank=0)
+    store = L3HostStore(backend, host, key_prefix="test", rank=0, ownership=None)
     return AsyncL3Executor(store, config=cfg, prefix_for_weight_version=None)
 
 
@@ -301,7 +301,7 @@ def test_pressure_snapshot_tracks_queue_and_cancelled_native_work_until_retireme
 
     host = SimpleNamespace(host_buffer=bytearray(64))
     e = AsyncL3Executor(
-        L3HostStore(Backend(), host, key_prefix="pressure", rank=0),
+        L3HostStore(Backend(), host, key_prefix="pressure", rank=0, ownership=None),
         config=replace(config(), read_workers=1),
         clock=lambda: now[0],
         prefix_for_weight_version=None,
@@ -355,7 +355,9 @@ def test_query_pressure_counts_metadata_jobs_without_fake_payload_bytes():
 
     host = SimpleNamespace(host_buffer=bytearray(64))
     e = AsyncL3Executor(
-        L3HostStore(Backend(), host, key_prefix="query-pressure", rank=0),
+        L3HostStore(
+            Backend(), host, key_prefix="query-pressure", rank=0, ownership=None
+        ),
         config=replace(config(), query_workers=1),
         clock=lambda: now[0],
         prefix_for_weight_version=None,
@@ -483,7 +485,7 @@ def test_close_waits_for_native_retirement_and_preserves_host_owner():
     backend = Backend()
     host = SimpleNamespace(host_buffer=bytearray(b"abcdefgh"))
     backend.batch_put_from(("a",), host.host_buffer, (0,), (8,))
-    store = L3HostStore(backend, host, key_prefix="test", rank=0)
+    store = L3HostStore(backend, host, key_prefix="test", rank=0, ownership=None)
     e = AsyncL3Executor(store, config=config(), prefix_for_weight_version=None)
     del host, store  # L2's resource reference can disappear independently.
     try:

@@ -734,7 +734,7 @@ TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {
     }
 }
 
-TEST(SchedulerConfigValidateTest, L3StorageRequiresReplicatedGroups) {
+TEST(SchedulerConfigValidateTest, L3StorageAcceptsCyclicOwnerGroups) {
     SchedulerConfig config = MakeValidConfig();
     config.host_allocator.total_pages = 32;
     config.enable_l3_storage = true;
@@ -742,8 +742,7 @@ TEST(SchedulerConfigValidateTest, L3StorageRequiresReplicatedGroups) {
         8, 32, 4, 32, 16, 2, 100, 100, StoragePressure{8, 1048576, 1000}, StoragePressure{4, 524288, 500}};
     config.cache_groups[0].cache_blocks_per_lcm_block = 2;
     config.cache_groups[0].shard_count = 2;
-    EXPECT_THROW(config.Validate(), std::invalid_argument)
-        << "an L3 prefetch allocates its Host page before any Device destination exists";
+    EXPECT_NO_THROW(config.Validate());
     config.cache_groups[0].shard_count = 1;
     EXPECT_NO_THROW(config.Validate());
 }

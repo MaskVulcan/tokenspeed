@@ -153,11 +153,11 @@ def test_the_pool_is_independent_of_the_kvstore():
     assert not args.retraction_snapshot_pool_disabled
 
 
-def test_kvp_takes_both_host_tiers_but_not_l3():
+def test_kvp_takes_both_host_tiers_and_l3():
     # The scheduler allocates every Host block in its Device block's residue
     # class and the executor translates ownership on both ends of every row,
     # so a KV-page-sharded engine may run the Host KVStore and the snapshot
-    # pool. L3 keys have no owner-stable form under sharding and stay refused.
+    # pool. L3 page keys follow the replica rather than the allocated owner.
     sharded_decode = dict(
         model="x",
         world_size=2,
@@ -167,8 +167,8 @@ def test_kvp_takes_both_host_tiers_but_not_l3():
     )
     args = ServerArgs(**sharded_decode, retraction_snapshot_host_gb=1.0)
     assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
-    with pytest.raises(ValueError, match="L3.*kv-parallel-size"):
-        ServerArgs(**sharded_decode, kvstore_storage_backend="mooncake")
+    args = ServerArgs(**sharded_decode, kvstore_storage_backend="mooncake")
+    assert args.kvstore_storage_backend == "mooncake"
 
 
 def test_forced_retraction_is_a_test_knob_that_needs_a_pool():

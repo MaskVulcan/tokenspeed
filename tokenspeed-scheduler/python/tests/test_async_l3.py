@@ -20,12 +20,14 @@
 
 from __future__ import annotations
 
+import pytest
 import tokenspeed_scheduler as ts
 from conftest import _advance, _spec
 
 
-def scheduler(*, groups=1, host=32, timeout=100):
+def scheduler(*, role, groups=1, host=32, timeout=100):
     cfg = ts.SchedulerConfig()
+    cfg.role = role
     cfg.prefix_granularity = 2
     cfg.num_snapshot_pages = 1
     cfg.num_device_pages = 64
@@ -50,6 +52,7 @@ def scheduler(*, groups=1, host=32, timeout=100):
             group_id=f"g{i}",
             block_granularity=2,
             total_pages=64,
+            transfer_policy=ts.CacheTransferPolicy.FullSuffix,
             attn_kind=ts.AttnKind.Full,
         )
         for i in range(groups)
@@ -99,7 +102,7 @@ def read_pending(s, rid="r"):
 
 
 def test_get_holds_only_host_then_uses_normal_loadback():
-    s = scheduler()
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     before = s.available_lcm_blocks()
     read = read_pending(s)
     assert s.available_lcm_blocks() == before
@@ -116,7 +119,7 @@ def test_get_holds_only_host_then_uses_normal_loadback():
 
 
 def test_soft_timeout_does_not_free_native_destination():
-    s = scheduler()
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     read = read_pending(s)
     held = s.storage_held_blocks()
     tick(s, 102, forward=True, storage=True)
@@ -133,7 +136,7 @@ def test_soft_timeout_does_not_free_native_destination():
 
 
 def test_unknown_retirement_quarantines_instead_of_reusing_blocks():
-    s = scheduler()
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     read = read_pending(s)
     done(s, read, [0] * len(read.keys), retired=False)
     plan = s.next_execution_plan()
@@ -144,7 +147,7 @@ def test_unknown_retirement_quarantines_instead_of_reusing_blocks():
 
 
 def test_short_read_is_not_published_and_negative_metadata_is_bounded():
-    s = scheduler(groups=2)
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused, groups=2)
     read = read_pending(s)
     done(s, read, [0] * len(read.keys), retired=True)
     assert s.storage_negative_keys() == 4
@@ -155,7 +158,7 @@ def test_short_read_is_not_published_and_negative_metadata_is_bounded():
 
 
 def test_later_query_can_progress_while_earlier_query_is_pending():
-    s = scheduler()
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     s.submit_requests([_spec("a", list(range(8))), _spec("b", list(range(10, 18)))])
     queries = s.next_execution_plan().storage
     assert len(queries) == 2
@@ -165,7 +168,7 @@ def test_later_query_can_progress_while_earlier_query_is_pending():
 
 
 def test_zero_logprob_bound_never_queries_storage():
-    s = scheduler()
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     spec = _spec("r", list(range(8)))
     spec.max_cached_prefix_tokens = 0
     s.submit_requests([spec])
@@ -174,7 +177,7 @@ def test_zero_logprob_bound_never_queries_storage():
 
 
 def test_ready_result_is_protected_while_forward_is_frozen():
-    s = scheduler()
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     read = read_pending(s)
     tick(s, 2, forward=False, storage=False)
     done(s, read, [1] * len(read.keys), retired=True)
@@ -190,7 +193,7 @@ def test_ready_result_is_protected_while_forward_is_frozen():
 
 
 def test_d2h_publishes_before_put_and_freeze_drops_unowned_candidates():
-    s = scheduler()
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     s.submit_requests([_spec("r", list(range(8)))])
     q = s.next_execution_plan().storage[0]
     done(s, q, [0] * len(q.keys), retired=True)
@@ -214,7 +217,7 @@ def test_d2h_publishes_before_put_and_freeze_drops_unowned_candidates():
 
 
 def test_query_credits_never_split_a_prefix_boundary_across_groups():
-    s = scheduler(groups=6)
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused, groups=6)
     s.submit_requests([_spec("bounded", list(range(16)))])
     op = s.next_execution_plan().storage[0]
     assert op.kind == ts.StorageKind.Query
@@ -226,7 +229,7 @@ def test_query_credits_never_split_a_prefix_boundary_across_groups():
 
 
 def test_storage_statistics_separate_request_expiry_from_native_retirement():
-    s = scheduler()
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     read = read_pending(s)
     stats = s.storage_stats()
     assert stats.waiting_requests == stats.operations == 1
@@ -243,7 +246,7 @@ def test_storage_statistics_separate_request_expiry_from_native_retirement():
 
 
 def test_ready_expiration_and_detach_have_distinct_statistics():
-    s = scheduler()
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     read = read_pending(s)
     tick(s, 2, forward=False, storage=False)
     done(s, read, [1] * len(read.keys), retired=True)
@@ -254,7 +257,7 @@ def test_ready_expiration_and_detach_have_distinct_statistics():
     assert stats.wait_timeouts == 0 and stats.ready_expirations == 1
     assert stats.operations == stats.ready_requests == stats.held_blocks == 0
 
-    s = scheduler()
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     read = read_pending(s)
     event(s, ts.Cache.StorageDetach("r"))
     done(s, read, [0] * len(read.keys), retired=False)
@@ -274,7 +277,7 @@ def pressure_tick(s, now, *, queued, byte_count, age):
 
 
 def test_pressure_bypasses_new_requests_and_reopens_only_below_low_watermarks():
-    s = scheduler(timeout=10000)
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused, timeout=10000)
     pressure_tick(s, 2, queued=8, byte_count=0, age=0)
     s.submit_requests([_spec("bypass", list(range(8)))])
     plan = s.next_execution_plan()
@@ -292,7 +295,7 @@ def test_pressure_bypasses_new_requests_and_reopens_only_below_low_watermarks():
 
 def test_pressure_detaches_query_without_waiting_for_deadline_or_issuing_get():
     for completed in (False, True):
-        s = scheduler(timeout=10000)
+        s = scheduler(role=ts.SchedulerConfig.Role.Fused, timeout=10000)
         s.submit_requests([_spec("r", list(range(8)))])
         query = s.next_execution_plan().storage[0]
         pressure_tick(s, 2, queued=0, byte_count=0, age=1000)
@@ -313,7 +316,7 @@ def test_pressure_detaches_query_without_waiting_for_deadline_or_issuing_get():
 
 
 def test_active_get_and_ready_data_progress_while_pressure_blocks_new_work():
-    s = scheduler(timeout=10000)
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused, timeout=10000)
     read = read_pending(s)
     held = s.storage_held_blocks()
     pressure_tick(s, 2, queued=8, byte_count=0, age=0)
@@ -333,7 +336,7 @@ def test_active_get_and_ready_data_progress_while_pressure_blocks_new_work():
 
 
 def test_pressure_does_not_pause_soft_timeout_or_release_detached_native_get():
-    s = scheduler(timeout=100)
+    s = scheduler(role=ts.SchedulerConfig.Role.Fused, timeout=100)
     read = read_pending(s)
     held = s.storage_held_blocks()
     pressure_tick(s, 2, queued=8, byte_count=0, age=0)
@@ -345,3 +348,33 @@ def test_pressure_does_not_pause_soft_timeout_or_release_detached_native_get():
     done(s, read, [1] * len(read.keys), retired=True)
     assert s.storage_held_blocks() == 0
     assert s.host_pool_cached_blocks() == 0
+
+
+@pytest.mark.parametrize("bootstrap_before_get", [False, True])
+def test_prefill_storage_preparation_survives_bootstrap(bootstrap_before_get):
+    s = scheduler(role=ts.SchedulerConfig.Role.P)
+    before = s.available_lcm_blocks()
+    s.submit_requests([_spec("p", list(range(8)))])
+    plan = s.next_execution_plan()
+    assert not requests(plan)
+    assert len(plan.storage) == 1 and plan.storage[0].kind == ts.StorageKind.Query
+    query = plan.storage[0]
+    if bootstrap_before_get:
+        event(s, ts.PD.BootstrappedEvent("p"))
+    done(s, query, [1] * len(query.keys), retired=True)
+    plan = s.next_execution_plan()
+    assert not requests(plan)
+    assert len(plan.storage) == 1 and plan.storage[0].kind == ts.StorageKind.Get
+    read = plan.storage[0]
+    assert s.available_lcm_blocks() == before
+    done(s, read, [1] * len(read.keys), retired=True)
+    if not bootstrap_before_get:
+        plan = s.next_execution_plan()
+        assert not requests(plan) and not plan.storage
+        assert s.available_lcm_blocks() == before
+        event(s, ts.PD.BootstrappedEvent("p"))
+    plan = s.next_execution_plan()
+    assert requests(plan) == ["p"]
+    assert list(plan.forward[0].extend_prefix_lens) == [6]
+    assert any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)
+    assert s.storage_held_blocks() == 0

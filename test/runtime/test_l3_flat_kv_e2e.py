@@ -205,7 +205,13 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         from tokenspeed.runtime.cache.l3.executor import L3HostStore
 
         l3 = AsyncL3Executor(
-            L3HostStore(store, executor.host_storage, key_prefix=namespace, rank=0),
+            L3HostStore(
+                store,
+                executor.host_storage,
+                key_prefix=namespace,
+                rank=0,
+                ownership=None,
+            ),
             prefix_for_weight_version=lambda version: f"{namespace}-{version}",
             config=L3AsyncConfig.from_extra_config(
                 None, host_blocks=4, prefix_granularity=2

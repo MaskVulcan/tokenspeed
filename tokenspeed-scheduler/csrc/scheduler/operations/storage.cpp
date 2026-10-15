@@ -102,7 +102,9 @@ void Scheduler::prepareStorage(Request& request) {
     using Phase = Request::StoragePreparation::Phase;
     if (!storage_transfers_) return;
     auto& state = request.StoragePreparationRef();
-    if (!request.Is<fsm::Submitted>()) {
+    // Both pre-admission states hold no Device resources. Storage preparation
+    // may overlap bootstrap; the normal admission still waits for its ACK.
+    if (!request.IsAnyOf<fsm::Bootstrapping, fsm::Submitted>()) {
         releaseStorage(request);
         return;
     }

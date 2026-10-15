@@ -278,7 +278,9 @@ class MooncakeMasterLiveTest(unittest.TestCase):
                 clients, host_buffer=host.host_buffer, tp_size=1, pp_size=1
             )
             return AsyncL3Executor(
-                L3HostStore(backend, host, key_prefix="global-async", rank=0),
+                L3HostStore(
+                    backend, host, key_prefix="global-async", rank=0, ownership=None
+                ),
                 config=config,
                 prefix_for_weight_version=None,
             )
@@ -327,7 +329,7 @@ class MooncakeMasterLiveTest(unittest.TestCase):
             pp_size=1,
         )
         self.assertIsInstance(backend, MooncakeKvStore)
-        l3 = L3HostStore(backend, host, key_prefix="live", rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="live", rank=0, ownership=None)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
         self.assertEqual(l3.exists(pages), [True])
@@ -398,7 +400,9 @@ class MooncakeMasterLiveTest(unittest.TestCase):
             config, host_buffer=host.host_buffer, tp_size=1, pp_size=1
         )
         executor = AsyncL3Executor(
-            L3HostStore(backend, host, key_prefix="master-restart", rank=0),
+            L3HostStore(
+                backend, host, key_prefix="master-restart", rank=0, ownership=None
+            ),
             config=replace(
                 L3AsyncConfig.from_extra_config(
                     None, host_blocks=8, prefix_granularity=64

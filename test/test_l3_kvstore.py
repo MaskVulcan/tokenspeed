@@ -1424,7 +1424,7 @@ class L3HostStoreTest(unittest.TestCase):
     def test_backups_and_prefetches_packed_pages(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, ownership=None)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
         self.assertEqual(l3.exists(pages), [True])
@@ -1445,14 +1445,14 @@ class L3HostStoreTest(unittest.TestCase):
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, ownership=None)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
         old_key = l3.object_key("h0", 0, 0)
         l3.rotate_namespace()
         self.assertEqual(old_key, l3.object_key("h0", 0, 0))
         self.assertEqual(l3.exists(pages), [False])
-        restarted = L3HostStore(backend, host, key_prefix="m", rank=1)
+        restarted = L3HostStore(backend, host, key_prefix="m", rank=1, ownership=None)
         self.assertEqual(restarted.object_key("h0", 0, 0), old_key)
         self.assertEqual(restarted.exists(pages), [False])
 
@@ -1460,7 +1460,11 @@ class L3HostStoreTest(unittest.TestCase):
         backend = mock.Mock()
         backend.remove_by_prefix.return_value = False
         l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
+            backend,
+            _FakeHost(b"abcdefgh", size=64),
+            key_prefix="m",
+            rank=1,
+            ownership=None,
         )
         old_key = l3.object_key("h0", 0, 0)
 
@@ -1472,7 +1476,11 @@ class L3HostStoreTest(unittest.TestCase):
         backend = mock.Mock()
         backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
         l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
+            backend,
+            _FakeHost(b"abcdefgh", size=64),
+            key_prefix="m",
+            rank=1,
+            ownership=None,
         )
         old_key = l3.object_key("h0", 0, 0)
 
@@ -1483,7 +1491,7 @@ class L3HostStoreTest(unittest.TestCase):
     def test_set_key_prefix_republishes_under_the_new_namespace(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0, ownership=None)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
         old_key = l3.object_key("h0", 0, 0)

@@ -4144,4 +4144,25 @@ TEST_F(TailPublicationTest, CapDropsTheLeastRecentlyUsedTailUnderOnePriorWithIts
 }
 
 }  // namespace
+TEST(StoragePrefixReservationTest, DistributesRestoredPagesAcrossCyclicOwners) {
+    BlockPool pool(4, {2});
+    BlockPool host_pool(4, {2});
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2, .shard_count = 2},
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/true, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true);
+    const std::vector<std::string> hashes{"h0", "h1", "h2", "h3"};
+    const auto query = coordinator.MissingStorageKeys(hashes, 16);
+    ASSERT_EQ(query.keys.size(), 4u);
+    const auto reservation = coordinator.ReserveStoragePrefix(hashes, query.keys, 4);
+    ASSERT_EQ(reservation.blocks.size(), 4u);
+    for (std::size_t i = 0; i < reservation.blocks.size(); ++i) {
+        EXPECT_EQ(coordinator.Allocator(0).BucketOf(reservation.blocks[i]->Location()),
+                  static_cast<std::int32_t>(i % 2));
+    }
+}
+
 }  // namespace tokenspeed::test
