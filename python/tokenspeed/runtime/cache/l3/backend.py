@@ -931,7 +931,7 @@ def _file_digest(path: str) -> str:
 # those would split the store on every non-cache commit while staying
 # 0.1.0 across cache-affecting edits.
 # Isolates this Host-storage contract from earlier producer implementations.
-L3_RUNTIME_COMPAT = "5"
+L3_RUNTIME_COMPAT = "6"
 
 
 def l3_kv_producer_id(args: ServerArgs, *, dtype: str, draft_dtype: str) -> str:

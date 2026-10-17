@@ -19,6 +19,7 @@ over CUDA 13 packages from a previous installation:
 uv venv .venv-cu129 --python 3.11 --seed
 source .venv-cu129/bin/activate
 export CUDA_HOME=/usr/local/cuda
+export TRITON_PTXAS_PATH="$CUDA_HOME/bin/ptxas"
 CUDA_VARIANT=cu129 bash test/ci_system/install_deps.sh
 ```
 
@@ -31,11 +32,38 @@ files, and required runtime libraries. The recipe does not run apt or sudo.
 Each pip call uses the active Python interpreter and inherits proxy
 environment variables.
 
+Keep `TRITON_PTXAS_PATH` set when serving or running GPU tests, including after
+reactivating the venv. TokenSpeed Triton and FLA use this selection for JIT
+kernels. Their bundled assembler may target a newer CUDA version than the
+host driver; setting `CUDA_HOME` alone does not select Triton's assembler.
+The installation helper sets this path for its own subprocesses too.
+
+For Mooncake RDMA tests, select `protocol=rdma` in the store configuration
+and leave the optional NVLink transport switches unset:
+
+```bash
+unset MC_INTRANODE_NVLINK MC_INTRA_NVLINK
+export MC_STORE_MEMCPY=0
+```
+
+The SDK enables its NVLink transport when the environment variable exists,
+including when its value is `0`. Its CUDA 12.8+ batch-copy path also requires
+support from the installed driver; selecting a CUDA 12 toolkit does not add
+that driver API. These settings keep cache data and PD transfers on RDMA.
+Tensor-parallel communication can still use the framework's normal collectives.
+
+Use a C++20-capable host compiler for the pinned Torch headers, such as GCC 12,
+and preserve `CC` and `CXX` when starting the server. GCC 10 accepts `-std=c++20`
+but reports an older `__cplusplus` value, so the graph tensor-alias extension
+cannot build and falls back to owning references, increasing graph-pool memory.
+
 The helper rejects installed CUDA 13 runtime packages and Torch wheels marked
 cu13 before changing packages. It reports the conflicting distributions and
 leaves them installed. Use a fresh cu129 venv instead of mixing the two
 stacks, because constraints cannot remove unrelated CUDA 13 packages left in
-an old environment.
+an old environment. The cuDNN frontend also requires the CUDA 13 DSL tooling
+bundle. That bundle may coexist with the selected CUDA 12 DSL bundle; it does
+not install a CUDA 13 runtime and is excluded from this runtime check.
 
 DeepEP follows the same pinned installation path as the other native packages.
 The dependency remains `tokenspeed-deepep==2.1.0.post20260810`; pending upstream

@@ -72,6 +72,12 @@ can never see a silently-defaulted one. This is deliberate — a `= False`
 default once hid `extend_with_prefix` being swallowed by a composite's
 `**kwargs`, and FlashMLA planned a ragged prefill for a prefix-cached batch.
 
+Extend planning uses these existing CPU mirrors for host length arithmetic:
+the total cache length is the cached prefix plus the new input length.
+FlashInfer plans receive host CSR metadata derived from those mirrors, with
+fresh pinned sources for asynchronous uploads. Planning must not download the
+device lengths or indptrs; mixed batches apply this rule to their extend rows.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
@@ -81,6 +87,19 @@ buffers are sized by `max_decode_bs` — `init_cuda_graph_state` runs
 unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
+
+State paging prepares its immutable metadata tapes for every supported decode
+batch size when these buffers are built. Tape finalization uploads CPU
+descriptions, so it belongs to startup, including sizes outside the graph
+ladder. Refresh only supplies runtime registers and replays an existing tape.
+Rebuilding the buffers also rebuilds tapes that contain their addresses.
+
+Distributed-argmax eligibility and communication state are prepared after the
+LM heads and sampling configuration are wired, before graph owners or any
+forward. Prefill-only, eager and captured execution use that same prepared
+processor; decode warmup is not an initializer. A prepared fallback is distinct
+from an uninitialized state, and the forward never probes or rendezvouses to
+choose the distributed argmax implementation.
 
 ### Rebinding a cache pool
 

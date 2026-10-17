@@ -33,7 +33,7 @@ _total_chunks_hint: dict[tuple[int, int], int] = {}
 def set_total_chunks_hint(
     seq_lens_cpu,
     cu_seqlens: torch.Tensor,
-    chunk_sizes: tuple[int, ...] = (16, 64),
+    chunk_sizes: tuple[int, ...] = (16, 32, 64),
 ) -> None:
     """Pre-compute total chunk counts on CPU and bind them to a specific
     cu_seqlens tensor (by id), avoiding cross-batch hint pollution."""
@@ -48,7 +48,7 @@ def set_total_chunks_hint_uniform(
     bs: int,
     tokens_per_seq: int,
     cu_seqlens: torch.Tensor,
-    chunk_sizes: tuple[int, ...] = (16, 64),
+    chunk_sizes: tuple[int, ...] = (16, 32, 64),
 ) -> None:
     """Fast path for spec verify / draft-extend where every sequence has the
     same length (tokens_per_seq). Avoids allocating a per-seq numpy array."""

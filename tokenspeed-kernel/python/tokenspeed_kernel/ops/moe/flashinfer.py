@@ -154,6 +154,8 @@ if platform.is_nvidia:
             "weight_dtype": frozenset({"unquant"}),
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
+            # General permutation cannot represent repeated expert IDs.
+            "expert_id_repeats": frozenset({False}),
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),

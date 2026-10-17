@@ -11,7 +11,8 @@ SCRIPT = Path(__file__).with_name("package_cache.sh")
 
 def run_bash(command: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", "-c", f'source "{SCRIPT}"; {command}'],
+        # Under SSH, even noninteractive Bash may read .bashrc and rewrite PATH.
+        ["bash", "--noprofile", "--norc", "-c", f'source "{SCRIPT}"; {command}'],
         check=True,
         capture_output=True,
         text=True,

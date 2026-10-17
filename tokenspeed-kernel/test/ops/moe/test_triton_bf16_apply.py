@@ -170,3 +170,64 @@ def test_triton_bf16_moe_matches_torch(
         rtol=0.02,
         atol=0.0002 if precision_policy != "default" else 0.01,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("intermediate", [32, 128])
+def test_gemm_batch_counts_and_grid_sizes_do_not_recompile(intermediate):
+    from dataclasses import dataclass
+
+    from tokenspeed_kernel.ops.moe._triton import bf16
+    from utils import assert_no_triton_compile
+
+    @dataclass
+    class Weights:
+        w13_weight: torch.Tensor
+        w2_weight: torch.Tensor
+        ep_size: int
+
+    weights = Weights(
+        w13_weight=torch.randn(
+            4, 2 * intermediate, 128, device="cuda", dtype=torch.bfloat16
+        )
+        * 0.02,
+        w2_weight=torch.randn(4, 128, intermediate, device="cuda", dtype=torch.bfloat16)
+        * 0.02,
+        ep_size=1,
+    )
+    plan = kernel_moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        ep_size=1,
+        ispp=intermediate,
+        hidden=128,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        internal_activation_dtype="input",
+        fast_math=True,
+        combine_order="rank",
+        solution="triton",
+    )
+
+    def run(rows):
+        x = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16)
+        ids = (
+            torch.arange(2, device="cuda", dtype=torch.int32)
+            .expand(rows, 2)
+            .contiguous()
+        )
+        scales = torch.full((rows, 2), 0.5, device="cuda")
+        result = kernel_moe_apply(
+            plan, x, weights, None, topk_ids=ids, topk_weights=scales
+        )
+        assert torch.isfinite(result).all()
+
+    run(1)
+    run(17)  # Warm the two deliberate BLOCK_M buckets.
+    run(129)  # The deep pipeline keeps its 16-row bucket for longer.
+    with assert_no_triton_compile(bf16._stage1_kernel, bf16._stage2_kernel):
+        for rows in (2, 3, 5, 8, 15, 16, 18, 31, 48, 129):
+            run(rows)

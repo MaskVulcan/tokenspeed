@@ -54,6 +54,20 @@ CUDA13_UNSUFFIXED_PACKAGES = {
 CUDA_VERSIONED_PACKAGES = {"cuda-toolkit", "cuda-python", "cuda-bindings"}
 
 
+def _is_cuda13_runtime(name: str, version: str) -> bool:
+    name = re.sub(r"[-_.]+", "-", name).lower()
+    # cuDNN frontend requires both DSL bundles; the cu12 runtime selects its
+    # own bundle. This tooling dependency does not install a CUDA 13 runtime.
+    if name == "nvidia-cutlass-dsl-libs-cu13":
+        return False
+    return bool(
+        (name.startswith("nvidia-") and name.endswith("-cu13"))
+        or name in CUDA13_UNSUFFIXED_PACKAGES
+        or (name in CUDA_VERSIONED_PACKAGES and re.match(r"^13(?:\.|$)", version))
+        or (name in {"torch", "torchvision"} and re.search(r"\+cu13[0-9]", version))
+    )
+
+
 def validate_environment(workspace: Path, cuda_home: Path) -> None:
     """Reject an unsupported or mixed CUDA environment before installing packages.
 
@@ -91,12 +105,7 @@ def validate_environment(workspace: Path, cuda_home: Path) -> None:
     for distribution in importlib.metadata.distributions():
         name = re.sub(r"[-_.]+", "-", distribution.metadata.get("Name", "")).lower()
         version = distribution.version
-        if (
-            (name.startswith("nvidia-") and name.endswith("-cu13"))
-            or name in CUDA13_UNSUFFIXED_PACKAGES
-            or (name in CUDA_VERSIONED_PACKAGES and re.match(r"^13(?:\.|$)", version))
-            or (name in {"torch", "torchvision"} and re.search(r"\+cu13[0-9]", version))
-        ):
+        if _is_cuda13_runtime(name, version):
             conflicts.append(f"{name}=={version}")
     if conflicts:
         raise RuntimeError(
@@ -153,6 +162,7 @@ def main() -> None:
     os.environ.update(
         CUDA_HOME=str(cuda_home),
         FLASHINFER_NVCC=str(cuda_home / "bin" / "nvcc"),
+        TRITON_PTXAS_PATH=str(cuda_home / "bin" / "ptxas"),
         TOKENSPEED_KERNEL_BACKEND="cuda",
         TOKENSPEED_KERNEL_CUDA_VARIANT="cu129",
         FLASHINFER_CUDA_ARCH_LIST="9.0a",

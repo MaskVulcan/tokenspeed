@@ -109,7 +109,7 @@ and concurrency they intend to restore together.
 
 Retraction restores exact images through `HostCacheExecutor`; it never starts
 a fresh L3 preparation. State groups use the current fixed two-slot checkpoint
-contract. Runtime compatibility epoch 5 isolates this implementation from
+contract. Runtime compatibility epoch 6 isolates this implementation from
 earlier producer and storage contracts. A different runtime epoch starts a
 separate namespace even with the same weights; objects are not converted.
 

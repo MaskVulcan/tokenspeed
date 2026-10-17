@@ -101,6 +101,40 @@ def test_pack_gdn_projection_reads_rows_past_int32_offsets(device: str):
         assert torch.equal(packed, source)
 
 
+@pytest.mark.parametrize("uniform", [False, True])
+def test_chunk_count_hints_cover_every_short_prefill_tile_without_sync(uniform):
+    if not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    from tokenspeed_kernel.ops.attention.gdn._triton.index import (
+        prepare_chunk_indices,
+        set_total_chunks_hint,
+        set_total_chunks_hint_uniform,
+    )
+
+    lengths = [7, 7, 7] if uniform else [21, 7, 0]
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    if uniform:
+        set_total_chunks_hint_uniform(len(lengths), lengths[0], cu_seqlens)
+    else:
+        set_total_chunks_hint(lengths, cu_seqlens)
+    for chunk_size in (16, 32, 64):
+        original_mode = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            indices = prepare_chunk_indices(cu_seqlens, chunk_size)
+        finally:
+            torch.cuda.set_sync_debug_mode(original_mode)
+        expected = [
+            [sequence, chunk]
+            for sequence, length in enumerate(lengths)
+            for chunk in range((length + chunk_size - 1) // chunk_size)
+        ]
+        assert indices.tolist() == expected
+
+
 def _fla_chunk_gated_delta_rule():
     from tokenspeed_kernel.ops.attention.gdn._triton.chunk import (
         chunk_gated_delta_rule,

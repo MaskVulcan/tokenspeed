@@ -946,5 +946,53 @@ class TestInlineLogprobPassThrough:
         assert ([e[1] for e in meta["output_token_logprobs"]]) == ([1, 2])
 
 
+class TestCoalescedOutputFrames(unittest.TestCase):
+    """Repeated token deltas survive a consumer that has not taken a frame yet."""
+
+    def test_repeated_tokens_and_logprobs_across_receiver_modes(self):
+        tokenizer = types.SimpleNamespace(
+            batch_decode=lambda rows, **kwargs: ["0" * len(row) for row in rows]
+        )
+        for inline in (False, True):
+            for stream_output in (False, True):
+                for fmt in ("vllm", "sglang"):
+                    with self.subTest(
+                        inline=inline, stream_output=stream_output, fmt=fmt
+                    ):
+                        manager = _StubTokenizerManager(
+                            tokenizer if inline else None,
+                            enable_inline_detokenizer=inline,
+                            stream_output=stream_output,
+                        )
+                        state = _mk_logprob_state(fmt=fmt)
+                        _register(manager, state)
+                        for count in (1, 2, 3):
+                            manager.output_processor.handle_batch_output(
+                                _batch_token_id_out(
+                                    ["r1"],
+                                    decode_ids=[[15]],
+                                    completion_tokens=[count],
+                                    finished_reasons=[
+                                        (
+                                            {"type": "length", "length": count}
+                                            if count == 3
+                                            else None
+                                        )
+                                    ],
+                                    output_token_logprobs_val=[[-0.25]],
+                                    output_token_logprobs_idx=[[15]],
+                                )
+                            )
+                        output = state.collector.take()
+                        self.assertEqual(output["output_ids"], [15, 15, 15])
+                        self.assertEqual(output["meta_info"]["completion_tokens"], 3)
+                        logprob_key = (
+                            "logprobs" if fmt == "vllm" else "output_token_logprobs"
+                        )
+                        self.assertEqual(len(output["meta_info"][logprob_key]), 3)
+                        if inline:
+                            self.assertEqual(output["text"], "000")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", *sys.argv[1:]]))

@@ -125,7 +125,7 @@ def _validate(
     return topk_weights, topk_ids, activation
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _stage1_kernel(
     x_ptr,
     w13_ptr,
@@ -142,7 +142,6 @@ def _stage1_kernel(
     ACTIVATION: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
     ROUND_GEMM_OUTPUTS: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -218,12 +217,12 @@ def _stage1_kernel(
                 + tl.arange(0, BLOCK_N)[None, :]
             )
             tl.store(inter_ptr + inter_offsets, activated, mask=row_mask[:, None])
-            tile_idx += NUM_PROGRAMS
+            tile_idx += tl.num_programs(0)
 
         problem_start += problem_tiles
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _stage2_kernel(
     inter_ptr,
     w2_ptr,
@@ -235,7 +234,6 @@ def _stage2_kernel(
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
     top_k: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -294,7 +292,7 @@ def _stage2_kernel(
                 + tl.arange(0, BLOCK_N)[None, :]
             )
             tl.store(route_output_ptr + output_offsets, acc, mask=row_mask[:, None])
-            tile_idx += NUM_PROGRAMS
+            tile_idx += tl.num_programs(0)
 
         problem_start += problem_tiles
 
@@ -375,7 +373,6 @@ def _route_outputs(
         ACTIVATION=activation,
         HAS_LINEAR_BETA=situ_linear_beta is not None,
         ROUND_GEMM_OUTPUTS=round_intermediates,
-        NUM_PROGRAMS=stage1_programs,
         BLOCK_M=block_m,
         BLOCK_N=stage1_block_n,
         BLOCK_K=block_k,
@@ -394,7 +391,6 @@ def _route_outputs(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         top_k=top_k,
-        NUM_PROGRAMS=stage2_programs,
         BLOCK_M=block_m,
         BLOCK_N=stage2_block_n,
         BLOCK_K=block_k,
