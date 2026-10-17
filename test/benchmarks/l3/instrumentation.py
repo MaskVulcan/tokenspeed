@@ -133,7 +133,7 @@ class Observer:
                     pss = int(line.split()[1]) * 1024
         return dict(
             executor=asdict(hooks._l3.snapshot()) if hooks._l3 is not None else None,
-            namespace=hooks._l3.store.key_prefix if hooks._l3 is not None else None,
+            namespace=hooks._l3.key_prefix if hooks._l3 is not None else None,
             pending=s.storage_pending(),
             held=stats.held_blocks,
             quarantine=stats.quarantined,
@@ -199,7 +199,7 @@ class Observer:
             if keys:
                 assert self.client is not None
                 assert hooks._l3 is not None
-                prefix = f"{hooks._l3.store.key_prefix}_"
+                prefix = f"{hooks._l3.key_prefix}_"
                 assert all(
                     key.startswith(prefix) for key in keys
                 ), "Cleanup key is outside the isolated benchmark namespace"
