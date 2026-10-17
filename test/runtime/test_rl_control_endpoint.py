@@ -256,12 +256,12 @@ class TestRouteSemantics:
         client = TestClient(build_sglang_compat_app(llm))
         for method in (client.get, client.post):
             response = method("/flush_cache")
-            self.assertEqual(response.status_code, 400)
-            self.assertFalse(response.json()["success"])
+            assert response.status_code == 400
+            assert response.json()["success"] is False
         llm.succeed = True
         response = client.post("/flush_cache")
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.json()["success"])
+        assert response.status_code == 200
+        assert response.json()["success"] is True
 
 
 class TestUnsupportedWeightUpdateSources:
