@@ -63,6 +63,15 @@ def _never_ready(writer):
     time.sleep(_TIMEOUT_S * 10)
 
 
+def _fail_with_background_peer(writer):
+    # Like a late L3 construction failure after PD started its peer threads.
+    # The normal loop-owned SIGTERM handler cannot stop a partial constructor.
+    shutdown = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_args: shutdown.set())
+    threading.Thread(target=threading.Event().wait, daemon=False).start()
+    writer.close()
+
+
 class TestReadyPipe:
     def test_ready_message_reaches_parent(self, start_process) -> None:
         proc, reader = start_process(_report_ready, (7,))
@@ -125,6 +134,18 @@ class TestReadyPipe:
         # its process exit, not its pipe, shows it.
         started = [start_process(_never_ready), start_process(_report_then_die)]
         assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
+
+    def test_failed_startup_reaps_background_peer_without_waiting_for_other_ranks(
+        self, start_process
+    ) -> None:
+        started = [
+            start_process(_never_ready),
+            start_process(_fail_with_background_peer),
+        ]
+        failed, _ = started[1]
+        assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
+        assert not failed.is_alive()
+        assert failed.exitcode == -signal.SIGKILL
 
 
 if __name__ == "__main__":

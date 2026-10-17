@@ -30,17 +30,29 @@ read or write entry points: runtime QUERY/GET/PUT use the executor's bounded
 queues and explicit completion/retirement protocol. Idle administrative namespace
 purge remains a synchronous management call.
 
-The construction boundary returns separate device and L3 capabilities. The
-loop captures `plan.cache` once, submits its Host-storage subset to L3 and
+Device construction returns a complete DeviceHandle and a startup-only
+`HostCacheBuild`: shared Host storage, owner translation and immutable
+layout/partition/producer facts, with no Device buffers or L2 executor.
+The startup caller constructs L3 separately through `cache/l3/factory.py`.
+`DeviceSpecs` contains no L3 configuration; scheduler configuration receives
+the factory's limits explicitly. Without a storage backend the factory returns
+before checkpoint I/O, client registration, workers or collectives. Checkpoint
+agreement uses the caller's explicit Gloo world group, never a default device
+process group.
+If construction fails after PD starts its background threads, readiness EOF
+triggers bounded process reaping. It does not set a deadline on healthy model
+loading or checkpoint agreement.
+The loop captures `plan.cache` once, submits its Host-storage subset to L3 and
 passes its Device-copy subset explicitly to DeviceHandle from the same plan,
 including frozen-round cleanup. L3 hooks poll the L3 executor directly
 and return agreed facts to the existing head feedback point. RequestHandler
 coordinates namespace/version changes through that same L3 capability.
-Startup passes the shared Host allocation, CPU owner translation and immutable
-layout/partition facts to `cache/l3/factory.py`. The factory snapshots checkpoint
-and producer identity, validates page-sharded payloads and constructs the backend,
+The factory snapshots checkpoint and producer identity, validates page-sharded
+payloads and constructs the backend,
 Host store and asynchronous executor. It retains no L2 executor or device
-capability; the device builder only extracts the facts and wires the result.
+capability. The device builder only extracts resolved facts; it neither selects
+an L3 backend nor starts storage work. L2 copies remain inside device construction
+because they bind Device buffers, streams and slot-state exporters.
 
 No additional HiCacheEngine is needed: C++ owns policy, the existing loop owns
 round sequencing, and the shared Host resource owns its allocation.

@@ -53,7 +53,6 @@ def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
     return SimpleNamespace(
         cache_geometry=SimpleNamespace(num_device_pages=64, prefix_granularity=16),
         cache_groups=[],
-        l3_config=None,
         num_host_pages=num_host_pages,
         num_snapshot_pages=num_snapshot_pages,
         max_retracted_requests=max_retracted,
@@ -61,13 +60,15 @@ def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
 
 
 def _config(args: ServerArgs, specs):
+    l3_config = None
     if args.kvstore_storage_backend is not None:
-        specs.l3_config = L3AsyncConfig.from_extra_config(
+        l3_config = L3AsyncConfig.from_extra_config(
             None, host_blocks=specs.num_host_pages - 1, prefix_granularity=16
         )
     return scheduler_config_from_args(
         args,
         specs,
+        l3_config=l3_config,
         max_scheduled_tokens=args.chunked_prefill_size,
         max_batch_size=args.retraction_snapshot_max_requests or 8,
         decode_input_tokens=1,

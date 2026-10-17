@@ -152,7 +152,12 @@ def receive_ready_messages(
 
 def _raise_process_died(procs: Sequence[mp.Process], index: int) -> None:
     proc = procs[index]
-    proc.join()
+    # EOF already means startup failed. A partial constructor may leave
+    # non-daemon transport threads alive, even after its target returns.
+    proc.join(timeout=1.0)
+    if proc.is_alive():
+        proc.kill()
+        proc.join(timeout=1.0)
     raise RuntimeError(
         f"Scheduler process {index} (pid {proc.pid}) exited with code "
         f"{proc.exitcode} before startup finished. Please check if there are "

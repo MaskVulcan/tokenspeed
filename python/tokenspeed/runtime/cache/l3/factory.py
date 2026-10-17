@@ -23,20 +23,17 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.cache.l3.backend import KvStoreStorage, MemoryKvStore
 
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
     from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
     from tokenspeed.runtime.cache.l3.executor import L3Executor
-    from tokenspeed.runtime.cache.transfer.host_storage import HostCacheStorage
-    from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
+    from tokenspeed.runtime.cache.transfer.host_storage import HostCacheBuild
     from tokenspeed.runtime.configs.model_config import ModelConfig
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
-        CacheTransferSchema,
-    )
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -82,41 +79,36 @@ def build_l3_cache(
     model_config: ModelConfig,
     draft_model_config: ModelConfig | None,
     *,
-    host_storage: HostCacheStorage,
-    ownership: BlockOwnerTranslation,
-    host_blocks: int,
-    prefix_granularity: int,
-    cache_signature: str,
-    cache_fields: Sequence[Sequence[str]],
-    transfer_schema: CacheTransferSchema,
-    attention_backend_name: str,
-    draft_attention_backend_name: str,
-    eagle3_layers_to_capture: Sequence[int],
-) -> tuple[L3AsyncConfig, L3Executor]:
+    host_cache: HostCacheBuild | None,
+    world_cpu_group: ProcessGroup | None,
+) -> tuple[L3AsyncConfig | None, L3Executor | None]:
     """Build an independent L3 executor without retaining device capabilities.
 
     Args:
         server_args: Resolved launch settings; numerical choices are snapshotted.
         model_config: Target checkpoint configuration, without model weights.
         draft_model_config: Draft checkpoint configuration, or None.
-        host_storage: Shared pinned Host allocation and CPU-only byte geometry.
-        ownership: Existing CPU translation for this Host pool's cyclic owners.
-        host_blocks: Usable Host parents, excluding the reserved null block.
-        prefix_granularity: Scheduler prefix boundary in tokens.
-        cache_signature: Immutable signature of the resolved cache layout.
-        cache_fields: Field IDs grouped in the Host layout's group order.
-        transfer_schema: CPU-only field partition descriptions.
-        attention_backend_name: Resolved target attention backend.
-        draft_attention_backend_name: Resolved draft attention backend.
-        eagle3_layers_to_capture: Resolved auxiliary layer IDs, empty without EAGLE3.
+        host_cache: Startup-only Host resource and resolved byte/producer facts.
+            None when device construction produced no Host L2 allocation.
+        world_cpu_group: The existing Gloo world group for checkpoint agreement;
+            None in a single-process deployment.
 
     Returns:
         Async limits and their Host-only executor. No L2 executor, device handle
         or attention buffer is retained. Namespace inputs are frozen before
-        the backend is created and workers start.
+        the backend is created and workers start. Both values are None when
+        no storage backend is configured; no client, worker or collective runs.
     """
     if server_args.kvstore_storage_backend is None:
-        raise ValueError("L3 construction requires an explicit storage backend")
+        return None, None
+    if host_cache is None:
+        raise ValueError("L3 construction requires a Host L2 allocation")
+    host_storage = host_cache.storage
+    ownership = host_cache.ownership
+    cache_fields = tuple(
+        tuple(field.field_id for field in group.fields) for group in host_cache.groups
+    )
+    transfer_schema = host_cache.transfer_schema
     if len(cache_fields) != len(ownership.shard_counts):
         raise ValueError("L3 field groups and Host ownership must agree")
     for fields, shards in zip(cache_fields, ownership.shard_counts, strict=True):
@@ -128,13 +120,20 @@ def build_l3_cache(
                         f"{field_id} is head-partitioned"
                     )
 
-    eagle3_layers_to_capture = tuple(eagle3_layers_to_capture)
+    eagle3_layers_to_capture = host_cache.eagle3_layers_to_capture
+    attention_backend_name = host_cache.attention_backend_name
+    draft_attention_backend_name = host_cache.draft_attention_backend_name
+    from tokenspeed.runtime.cache.l3.backend import cache_layout_signature
     from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
 
+    cache_signature = cache_layout_signature(
+        host_cache,
+        cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
+    )
     l3_config = L3AsyncConfig.from_extra_config(
         server_args.kvstore_storage_backend_extra_config,
-        host_blocks=host_blocks,
-        prefix_granularity=prefix_granularity,
+        host_blocks=host_storage.num_host_lcm_blocks,
+        prefix_granularity=host_cache.prefix_granularity,
     )
     import torch.distributed as dist
 
@@ -147,10 +146,16 @@ def build_l3_cache(
         storage_key_prefix,
     )
 
-    world_size = (
-        dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-    )
-    rank = dist.get_rank() if world_size > 1 else 0
+    initialized = dist.is_available() and dist.is_initialized()
+    if world_cpu_group is not None:
+        if not initialized or dist.get_backend(world_cpu_group) != "gloo":
+            raise ValueError("L3 checkpoint agreement requires a Gloo CPU group")
+        world_size = dist.get_world_size(world_cpu_group)
+        rank = dist.get_rank(world_cpu_group)
+    else:
+        if initialized and dist.get_world_size() > 1:
+            raise ValueError("L3 checkpoint agreement requires an explicit CPU group")
+        world_size, rank = 1, 0
     checkpoint_id = l3_checkpoint_id(
         model_config.model_path,
         hf_config=model_config.hf_config,
@@ -175,7 +180,7 @@ def build_l3_cache(
 
     def gather_checkpoint_ids(payload: list) -> list:
         gathered = [None] * world_size
-        dist.all_gather_object(gathered, payload)
+        dist.all_gather_object(gathered, payload, group=world_cpu_group)
         return gathered
 
     checkpoint_id, draft_revision = share_l3_checkpoint_ids(

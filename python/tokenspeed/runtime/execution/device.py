@@ -58,6 +58,8 @@ hold each piece:
   needs is ``server_args`` or an object this builder already owns.
 - ``encoder_model_facts`` — a startup-only callable for EPD admission,
   resolved past its gate because a text-only model has no vision tower.
+- ``host_cache`` — startup-only Host storage and immutable payload facts,
+  consumed by Host-only storage construction outside the device builder.
 - ``DeviceHandle`` — the running handle, and the only piece the loop stores.
 
 Startup steps that need a real device object (the layerwise step counter,
@@ -109,8 +111,7 @@ from tokenspeed.runtime.utils.startup_timing import startup_phase
 logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.cache.l3.config import L3AsyncConfig
-    from tokenspeed.runtime.cache.l3.executor import L3Executor
+    from tokenspeed.runtime.cache.transfer.host_storage import HostCacheBuild
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
@@ -232,7 +233,6 @@ class DeviceSpecs:
     supports_prompt_logprobs: bool
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
-    l3_config: L3AsyncConfig | None
     num_snapshot_pages: int
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
@@ -261,7 +261,8 @@ class DeviceBuild:
         specs: Plain values the control plane plans with; safe to keep.
         transfer: The PD transfer peer's control face — bootstrap
             register/abort, event polling — or None outside PD.
-        l3: Independent Host-only storage executor, or None.
+        host_cache: Startup-only Host resources and immutable payload facts,
+            or None without an L2 Host allocation. Contains no Device buffers.
         handle: The running handle; the loop's only reach into the device.
         encoder_model_facts: Zero-argument callable extracting the facts EPD
             admission needs (``EncoderModelFacts``). A callable, not a value:
@@ -274,7 +275,7 @@ class DeviceBuild:
     specs: DeviceSpecs
     transfer: Any
     handle: "DeviceHandle"
-    l3: L3Executor | None
+    host_cache: HostCacheBuild | None
     encoder_model_facts: Any
 
 
@@ -631,7 +632,7 @@ class DeviceHandle:
         A cache plan, a PD transfer or a page copy the last round queued is
         settled by the next round's execute or poll; at shutdown there is no
         next round, so they are joined here and the first failure re-raised
-        after the Host cache (L2/L3, pool) is closed.
+        after the Device copy executors and their Host pools are drained.
         """
         errors = []
         for submissions in (
@@ -1463,8 +1464,7 @@ def build_device_side(
     # model executor's peer: it lays out the slot-state exporters the model
     # executor lists, so it is built after it.
     host_cache_executor = None
-    l3_executor = None
-    l3_config = None
+    host_cache = None
     snapshot_pool = _retraction_pool_request(
         server_args,
         views.token_to_kv_pool.arena.runtime_contract,
@@ -1502,9 +1502,8 @@ def build_device_side(
         logger.info(
             NO_POOL.describe(host_lcm_block_bytes=0, blob_bytes=0, l2_tier=False)
         )
-    if server_args.enable_kvstore and server_args.kvstore_storage_backend is not None:
-        from tokenspeed.runtime.cache.l3.backend import cache_layout_signature
-        from tokenspeed.runtime.cache.l3.factory import build_l3_cache
+    if host_cache_executor is not None and host_cache_executor.host_storage is not None:
+        from tokenspeed.runtime.cache.transfer.host_storage import HostCacheBuild
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
             build_cache_transfer_schema,
         )
@@ -1520,22 +1519,11 @@ def build_device_side(
                     eagle3_layers_to_capture = [int(layer) for layer in draft_layers]
 
         assert host_cache_executor.block_owners is not None
-        l3_config, l3_executor = build_l3_cache(
-            server_args,
-            model_config,
-            draft_model_config,
-            host_storage=host_cache_executor.host_storage,
+        host_cache = HostCacheBuild(
+            storage=host_cache_executor.host_storage,
             ownership=host_cache_executor.block_owners,
-            host_blocks=host_cache_executor.num_host_pages - 1,
+            groups=host_cache_executor.layout.groups,
             prefix_granularity=views.cache_geometry.prefix_granularity,
-            cache_signature=cache_layout_signature(
-                host_cache_executor.layout,
-                cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
-            ),
-            cache_fields=tuple(
-                tuple(field.field_id for field in group.fields)
-                for group in host_cache_executor.layout.groups
-            ),
             transfer_schema=build_cache_transfer_schema(
                 views.token_to_kv_pool.arena.plan,
                 model_config=model_config,
@@ -1543,7 +1531,7 @@ def build_device_side(
             ),
             attention_backend_name=attention.attention_backend_name,
             draft_attention_backend_name=attention.draft_attention_backend_name,
-            eagle3_layers_to_capture=eagle3_layers_to_capture,
+            eagle3_layers_to_capture=tuple(eagle3_layers_to_capture),
         )
 
     kv_transfer = _build_kv_transfer(
@@ -1564,7 +1552,6 @@ def build_device_side(
         executor.config.spec_num_tokens,
     )
     specs = DeviceSpecs(
-        l3_config=l3_config,
         cache_geometry=views.cache_geometry,
         cache_groups=views.cache_groups,
         cache_storage=attention.cache_storage,
@@ -1609,7 +1596,7 @@ def build_device_side(
         return EncoderModelFacts.from_model(target.model, device=executor.device)
 
     return DeviceBuild(
-        l3=l3_executor,
+        host_cache=host_cache,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,

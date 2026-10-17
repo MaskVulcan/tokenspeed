@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,8 @@ from transformers import Qwen3Config
 
 from tokenspeed.runtime.cache.l3.executor import StorageJob
 from tokenspeed.runtime.cache.l3.factory import build_l3_cache
+from tokenspeed.runtime.cache.transfer.host_storage import HostCacheBuild
+from tokenspeed.runtime.cache.transfer.layout import CacheField, CacheGroupLayout
 from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
@@ -60,6 +63,7 @@ class Host:
     def __init__(self):
         self.host_buffer = bytearray(64)
         self.host_cache_block_bytes = (4,)
+        self.num_host_lcm_blocks = 16
 
     def host_block_range(self, group: int, block: int) -> tuple[int, int]:
         assert group == 0 and 1 <= block <= 16
@@ -104,24 +108,22 @@ def construction(tmp_path):
         dtype="bfloat16",
     )
     host = Host()
-    inputs = dict(
-        host_storage=host,
+    host_cache = HostCacheBuild(
+        storage=host,
         ownership=BlockOwnerTranslation(
             shard_counts=(1,),
             device_virtual_counts=(17,),
             host_virtual_counts=(17,),
             rank=0,
         ),
-        host_blocks=16,
         prefix_granularity=2,
-        cache_signature="test-packed-host-layout",
-        cache_fields=(("k",),),
+        groups=(CacheGroupLayout("full", 1, (CacheField("k", 0, 0, 4, 4),)),),
         transfer_schema=CacheTransferSchema(),
         attention_backend_name="triton",
         draft_attention_backend_name="",
-        eagle3_layers_to_capture=[0],
+        eagle3_layers_to_capture=(0,),
     )
-    return args, model, host, inputs
+    return args, model, host, {"host_cache": host_cache, "world_cpu_group": None}
 
 
 def complete(executor):
@@ -139,7 +141,7 @@ def test_factory_roundtrips_through_the_shared_host_resource(construction):
     args, model, host, inputs = construction
     config, executor = build_l3_cache(args, model, None, **inputs)
     try:
-        assert config.max_host_blocks <= inputs["host_blocks"]
+        assert config.max_host_blocks <= host.num_host_lcm_blocks
         host.host_buffer[:4] = b"KV01"
         key = executor.store.object_key("prefix", 0, 0)
         executor.submit(StorageJob(1, "put", (key,), (0,), (4,)))
@@ -165,7 +167,9 @@ def test_factory_freezes_namespace_inputs_before_weight_version_switch(construct
         executor.set_weight_version("v1")
         model.model_override_args["new_override"] = {"nested": [1, 2]}
         args.disable_tf32 = not args.disable_tf32
-        inputs["eagle3_layers_to_capture"].append(3)
+        inputs["host_cache"] = replace(
+            inputs["host_cache"], eagle3_layers_to_capture=(0, 3)
+        )
         executor.set_weight_version("v2")
         assert executor.store.key_prefix == expected
         _, changed = build_l3_cache(args, model, None, **inputs)
@@ -196,25 +200,44 @@ def test_factory_includes_the_draft_checkpoint_identity(construction, tmp_path):
 
 def test_factory_refuses_head_partitioned_payload_on_cyclic_owners(construction):
     args, model, _, inputs = construction
-    inputs["ownership"] = BlockOwnerTranslation(
+    ownership = BlockOwnerTranslation(
         shard_counts=(2,),
         device_virtual_counts=(17,),
         host_virtual_counts=(17,),
         rank=0,
     )
-    inputs["transfer_schema"] = CacheTransferSchema(
+    schema = CacheTransferSchema(
         fields=(
             CacheFieldTransferSpec("k", CacheFieldPartition(axis=0, global_extent=8)),
         )
+    )
+    inputs["host_cache"] = replace(
+        inputs["host_cache"], ownership=ownership, transfer_schema=schema
     )
     with pytest.raises(ValueError, match="k is head-partitioned"):
         build_l3_cache(args, model, None, **inputs)
 
 
 def test_factory_validates_limits_against_actual_host_capacity(construction):
-    args, model, _, inputs = construction
+    args, model, host, inputs = construction
     args.kvstore_storage_backend_extra_config = json.dumps(
-        {"async": {"max_host_blocks": inputs["host_blocks"] + 1}}
+        {"async": {"max_host_blocks": host.num_host_lcm_blocks + 1}}
     )
     with pytest.raises(ValueError, match="exceeds usable Host parents"):
         build_l3_cache(args, model, None, **inputs)
+
+
+def test_unconfigured_storage_needs_neither_host_memory_nor_checkpoint_io(construction):
+    args, model, _, _ = construction
+    args.kvstore_storage_backend = None
+    Path(model.model_path, "model.safetensors").unlink()
+    assert build_l3_cache(args, model, None, host_cache=None, world_cpu_group=None) == (
+        None,
+        None,
+    )
+
+
+def test_configured_storage_requires_host_memory(construction):
+    args, model, _, _ = construction
+    with pytest.raises(ValueError, match="requires a Host L2 allocation"):
+        build_l3_cache(args, model, None, host_cache=None, world_cpu_group=None)

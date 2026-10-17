@@ -33,6 +33,7 @@ how long the caller may hold each piece:
 | `DeviceSpecs` | plain values the loop plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
 | `DeviceHandle` | the running handle: the complete list of what the loop may ask of the device side | the only one stored (`self._device`) |
 | `transfer` | the PD peer's CONTROL face — bootstrap register/abort, event polling — or None outside PD | held by the PD hooks |
+| `host_cache` | shared Host allocation, CPU owner translation and immutable payload facts; no Device buffers or executor | consumed by Host-storage construction at startup |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
 Encoder facts describe the transferred tensor, independently of the language
@@ -100,9 +101,12 @@ Consequences:
   stage/drain device half; the commit-side SHM release). A generic "run this
   closure" slot is the hole this whole design closes, so a second KIND of
   user does not join it — it gets its own name.
-  L3 is a separate Host-only capability returned by the builder, held by
-  the L3 hooks and request handler. Its CPU workers cannot reach the device
-  handle. The loop submits the storage subset of `plan.cache` independently from device work;
+  L3 is constructed separately at startup by `cache/l3/factory.py`, using
+  the builder's Host resource and CPU-only payload facts. `DeviceBuild` does
+  not create a backend or workers, and `DeviceSpecs` carries no L3 settings.
+  The L3 hooks and request handler hold the resulting Host-only capability;
+  its CPU workers cannot reach the device handle. The loop submits the
+  storage subset of `plan.cache` independently from device work;
   completion facts enter the existing head feedback point. The
   retraction snapshot pool adds no operation at all: its stores ride
   `execute` with the write-backs, its restores with the load-backs, its ACKs
