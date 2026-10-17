@@ -1036,8 +1036,8 @@ def storage_key_prefix(
     and therefore the KV those layers produce. Empty strings and an empty
     override dict are valid and mean "unset" (no draft pool, no extra cache
     scales, no HF overrides). ``kv_producer`` is the immutable numerical
-    signature from ``l3_kv_producer_id``. V2 deliberately isolates objects
-    written before this signature was required; old namespaces remain cold.
+    signature from ``l3_kv_producer_id``. ``runtime_compat`` is the single
+    compatibility epoch; the literal ``tsl3-`` only identifies this cache.
     The payload keeps a literal ``cp_size`` of 1, the retired CP width.
     ``attn_tp_size``
     belongs here rather than only in the per-object ``r{tp_rank}`` shard
@@ -1079,7 +1079,7 @@ def storage_key_prefix(
         sort_keys=True,
         separators=(",", ":"),
     )
-    return "tsl3v2-" + hashlib.sha256(payload.encode()).hexdigest()
+    return "tsl3-" + hashlib.sha256(payload.encode()).hexdigest()
 
 
 def host_buffer_ptr(host_buffer: Any) -> int:
@@ -1120,6 +1120,8 @@ class KvStoreStorage(Protocol):
     offsets into that registered buffer (SGLang HiCacheStorage v1).
     """
 
+    # An exception or malformed result proves that Host access ended only
+    # under this backend contract. Valid results carry their own retired fact.
     failures_retire: bool
 
     def batch_get_into_result(

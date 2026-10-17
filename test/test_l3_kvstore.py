@@ -162,7 +162,7 @@ class TestStorageKeyTest:
 
         base = prefix()
         assert base == prefix()
-        assert base.startswith("tsl3v2-")
+        assert base.startswith("tsl3-")
         assert base != prefix(kv_producer="different-numerics")
         assert base != prefix(model_name="org_model")
         assert base != prefix(revision="def")
