@@ -485,12 +485,13 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         builds_work = !built.forward.empty() || plan.remote_decode.has_value() || plan.remote_prefill.has_value();
         plan.With(ForwardBatch{std::move(built.forward)});
     }
+    std::vector<StorageOperation> storage_operations;
     if (storage_transfers_) {
         if (storage_allowed_)
             storage_transfers_->StartBackups();
         else
             storage_transfers_->DropBackups();
-        plan.storage = storage_transfers_->TakeCommands();
+        storage_operations = storage_transfers_->TakeCommands();
     }
 
     if (forward_allowed_ && config_.StreamsDeviceCacheToHost()) {
@@ -503,7 +504,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
 
     // Store legs precede loads: the runtime fences page reuse behind the
-    // stream-ordered stores. L3 descriptors travel separately in plan.storage.
+    // stream-ordered stores. Host-only storage ops keep their own completion
+    // protocol; their position does not add ordering against Device copies.
     if (!write_back_operations.empty()) {
         plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }
@@ -516,9 +518,13 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     if (!built.snapshot_restores.empty()) {
         plan.With(CacheOperation{SnapshotRestoreBatch{built.snapshot_restores}});
     }
+    const bool has_storage_work = !storage_operations.empty();
+    for (auto& operation : storage_operations) {
+        plan.With(CacheOperation{std::move(operation)});
+    }
     trackStalledRounds(num_live_requests,
                        /*plan_is_empty=*/!builds_work && write_back_operations.empty() &&
-                           built.snapshot_stores.empty() && plan.storage.empty() && built.load_backs.empty() &&
+                           built.snapshot_stores.empty() && !has_storage_work && built.load_backs.empty() &&
                            built.snapshot_restores.empty() && plan.aborts.empty());
     return plan;
 }

@@ -43,6 +43,8 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
+from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
@@ -445,7 +447,7 @@ def test_count_plan_ops_counts_each_request_of_a_snapshot_or_restore_batch():
             RestoreOp=_RestoreBatch,
         ),
     ):
-        num_retracted = hooks.count_plan_ops(plan)
+        num_retracted = hooks.count_ops(cache_ops_from_plan(plan).device)
     assert hooks._num_inflight == 3
     # The return counts retraction victims only: one per snapshot-store
     # request, restores excluded — it feeds the preemption counter.

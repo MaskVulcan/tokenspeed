@@ -28,7 +28,6 @@
 #include <vector>
 
 #include "scheduler/operations/inc.h"
-#include "cache/tier/storage.h"
 
 namespace tokenspeed {
 
@@ -89,7 +88,6 @@ public:
     // P role: completed prefills whose final chunk's result has landed; each
     // one's decode happens on the peer node, so its KV goes out. Rows are
     // self-contained (bootstrap token + drafter candidates).
-    std::vector<StorageOperation> storage;
     std::optional<ForwardBatch> remote_decode;
     // D role: admitted prompts whose prefill runs on the peer node; the
     // receive pulls their KV into the freshly admitted (and sanitized)

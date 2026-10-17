@@ -767,33 +767,59 @@ def restore_ops_from_wire(op) -> list[RestoreOp]:
     return ops
 
 
-def cache_ops_from_plan(execution_plan) -> list:
-    """The plan's cache ops as the runtime consumes them, in plan order.
+def is_device_cache_op(operation) -> bool:
+    """Whether an adapted operation belongs to the GPU copy executor."""
+    return isinstance(
+        operation, (Cache.WriteBackOp, Cache.LoadBackOp, SnapshotOp, RestoreOp)
+    )
 
-    The one adapter between the scheduler's wire batches and the Host cache
-    executor. An L2 ``Cache.WriteBackOp`` / ``Cache.LoadBackOp`` batch passes
-    through: the executor consumes its lists-of-lists as one ticket per
-    ``op_ids`` entry. A ``Cache.SnapshotOp`` / ``Cache.RestoreOp`` batch
-    becomes one ``SnapshotOp`` / ``RestoreOp`` per request
-    (``cache/transfer/ops.py``): the executor exports or imports one slot, so
-    the per-request op is its unit of work and its ACK. Each consumer
-    evaluates it once per plan: the binding copies the ops out of C++ on
-    every read of ``plan.cache``.
 
-    Raises:
-        TypeError: The plan carries a cache op kind the runtime cannot run.
+class CacheOperations(NamedTuple):
+    """One validated plan snapshot, partitioned by its execution owner.
+
+    Each tuple keeps the plan's order. It defines no ordering between Host
+    storage I/O and Device copies; tickets and completions express dependencies.
     """
-    ops: list = []
+
+    device: tuple[Cache.WriteBackOp | Cache.LoadBackOp | SnapshotOp | RestoreOp, ...]
+    storage: tuple[
+        Cache.StorageQueryOp
+        | Cache.StorageGetOp
+        | Cache.StoragePutOp
+        | Cache.StorageCancelOp,
+        ...,
+    ]
+
+
+def cache_ops_from_plan(execution_plan) -> CacheOperations:
+    """Read and validate every cache op once before any owner submits work.
+
+    L2 wire batches pass through; snapshot/restore batches become per-request
+    operations. Host-only QUERY/GET/PUT/Cancel descriptors go to the storage
+    tuple. Unknown kinds fail the whole conversion without partial submission.
+    """
+    device: list = []
+    storage: list = []
     for op in execution_plan.cache:
         if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
-            ops.append(op)
+            device.append(op)
         elif isinstance(op, Cache.SnapshotOp):
-            ops.extend(snapshot_ops_from_wire(op))
+            device.extend(snapshot_ops_from_wire(op))
         elif isinstance(op, Cache.RestoreOp):
-            ops.extend(restore_ops_from_wire(op))
+            device.extend(restore_ops_from_wire(op))
+        elif isinstance(
+            op,
+            (
+                Cache.StorageQueryOp,
+                Cache.StorageGetOp,
+                Cache.StoragePutOp,
+                Cache.StorageCancelOp,
+            ),
+        ):
+            storage.append(op)
         else:
             raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
-    return ops
+    return CacheOperations(tuple(device), tuple(storage))
 
 
 def cache_event_key(payload: dict) -> tuple[str, int]:

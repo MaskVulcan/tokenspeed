@@ -22,6 +22,7 @@
 
 import threading
 import time
+from test.l3_test_utils import storage_ops
 
 import pytest
 import tokenspeed_scheduler as ts
@@ -77,7 +78,7 @@ def test_disabled_storage_admits_without_owner_agreement_or_storage_events():
     plan = scheduler.next_execution_plan()
     assert [rid for batch in plan.forward for rid in batch.request_ids] == ["plain"]
     assert list(plan.forward[0].extend_prefix_lens) == [0]
-    assert not plan.storage
+    assert not storage_ops(plan)
 
 
 class _ControlledMemoryStore(MemoryKvStore):
@@ -172,7 +173,7 @@ def _query(scheduler, request_id):
     request.tokens = list(range(8))
     request.max_new_tokens = 2
     scheduler.submit_requests([request])
-    operation = scheduler.next_execution_plan().storage[0]
+    operation = storage_ops(scheduler.next_execution_plan())[0]
     assert operation.kind == ts.StorageKind.Query
     return operation
 
@@ -232,7 +233,7 @@ def _get_descriptor(config, backend, store):
             query.op_id, backend.batch_exists(keys), True, [False] * len(keys)
         ),
     )
-    operation = scheduler.next_execution_plan().storage[0]
+    operation = storage_ops(scheduler.next_execution_plan())[0]
     assert operation.kind == ts.StorageKind.Get
     return scheduler, operation, keys
 
@@ -300,7 +301,7 @@ def test_cancelled_queued_scheduler_get_retires_without_writing_host(runtime):
     aborted = ts.ForwardEvent.Abort()
     aborted.request_id = "snapshot"
     _send(scheduler, aborted)
-    cancellations = scheduler.next_execution_plan().storage
+    cancellations = storage_ops(scheduler.next_execution_plan())
     assert len(cancellations) == 1 and cancellations[0].kind == ts.StorageKind.Cancel
     executor.submit_operations(cancellations)
     result = _completions(executor, 1)[0]
@@ -438,7 +439,7 @@ def test_transient_get_failure_retries_same_remote_keys_after_recovery(runtime):
     _seed(backend, keys, b"abcdefgh")
     executor.submit_operations([query])
     _finish(scheduler, _completions(executor, 1)[0])
-    read = scheduler.next_execution_plan().storage[0]
+    read = storage_ops(scheduler.next_execution_plan())[0]
     assert read.kind == ts.StorageKind.Get
     backend.fail_next_read = True
     executor.submit_operations([read])
@@ -458,7 +459,7 @@ def test_transient_get_failure_retries_same_remote_keys_after_recovery(runtime):
     executor.submit_operations([query2])
     _finish(scheduler, _completions(executor, 1)[0])
     assert executor.snapshot().health.state == "healthy"
-    read2 = scheduler.next_execution_plan().storage[0]
+    read2 = storage_ops(scheduler.next_execution_plan())[0]
     assert read2.keys == read.keys
     executor.submit_operations([read2])
     _finish(scheduler, _completions(executor, 1)[0])

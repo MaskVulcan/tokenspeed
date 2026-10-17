@@ -39,7 +39,6 @@ StorageStats = _ext.StorageStats
 StorageConfig = _ext.StorageConfig
 StoragePressure = _ext.StoragePressure
 StorageKind = _ext.StorageKind
-StorageOperation = _ext.StorageOperation
 
 PD = _ext.PD
 Cache = _ext.Cache
@@ -73,7 +72,6 @@ __all__ = [
     "StoragePressure",
     "StorageStats",
     "StorageKind",
-    "StorageOperation",
     "RequestSpec",
     "AttnKind",
     "CacheGroupConfig",

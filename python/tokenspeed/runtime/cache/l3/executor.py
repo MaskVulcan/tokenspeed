@@ -264,6 +264,8 @@ class L3Executor:
             len(job.keys) == len(job.offsets) == len(job.sizes)
         ):
             raise ValueError("Ragged L3 job ranges")
+        if job.kind == "query" and (job.offsets or job.sizes):
+            raise ValueError("L3 queries cannot carry Host byte ranges")
         with self._lock:
             if job.op_id <= self._last_submitted:
                 raise ValueError("L3 operation ids must increase")

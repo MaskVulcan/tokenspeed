@@ -31,8 +31,9 @@ queues and explicit completion/retirement protocol. Idle administrative namespac
 purge remains a synchronous management call.
 
 The construction boundary returns separate device and L3 capabilities. The
-loop submits `plan.storage` to L3 and device work to DeviceHandle from the same
-plan, including frozen-round cleanup. L3 hooks poll the L3 executor directly
+loop captures `plan.cache` once, submits its Host-storage subset to L3 and
+passes its Device-copy subset explicitly to DeviceHandle from the same plan,
+including frozen-round cleanup. L3 hooks poll the L3 executor directly
 and return agreed facts to the existing head feedback point. RequestHandler
 coordinates namespace/version changes through that same L3 capability.
 Startup passes the shared Host allocation, CPU owner translation and immutable
@@ -58,9 +59,20 @@ the pre-admission state, expires independently and remains charged to its
 storage ticket until ordinary admission acquires the Host sources. Native
 I/O and its memory references may outlive cancellation or a soft deadline;
 that lifetime stays in `StorageTransferManager`, independently of the FSM.
-`plan.storage` carries Query/Get/Put/Cancel alongside the same plan's cache and
-forward work. Cache operations continue to own ordered Device/Host copies;
-storage completion never substitutes for an H2D completion.
+`plan.cache` contains both Device copies and four Host-only command types:
+`StorageQueryOp`, `StorageGetOp`, `StoragePutOp` and `StorageCancelOp`.
+Query carries keys, Get carries Host destinations, Put carries Host sources,
+and Cancel names the existing operation without creating another ticket.
+Their read-only `kind` is fixed by type. They share one L3 executor and
+completion protocol; storage completion never substitutes for an H2D fence.
+
+The control plane reads and validates the plan once. Its immutable
+`CacheOperations` snapshot preserves order within the Device and storage
+subsets. The cache hooks count only Device tickets, DeviceHandle receives
+that same Device tuple explicitly, and L3Executor receives the storage tuple.
+A missing executor or an unsupported operation fails explicitly. Frozen and
+DP-idle rounds still dispatch cancellation and Device cleanup. This grouping
+adds no ordering between the two executors: tickets express the dependencies.
 
 ## Read transaction
 
@@ -71,7 +83,7 @@ storage completion never substitutes for an H2D completion.
    full prefix boundaries and matching tails from the local `TailTable`, plus
    the exact reusable request bound. Each boundary's group keys enter the
    query together or not at all when the key budget is exhausted.
-2. `plan.storage` carries a query with a monotonically increasing operation
+2. the storage subset of `plan.cache` carries a query with a monotonically increasing operation
    ID and immutable keys. Querying reserves no Device pages or batch slots.
 3. After all owners report existence, C++ runs the existing group matcher
    with these temporary hints. It pins all warm dependencies before allocating

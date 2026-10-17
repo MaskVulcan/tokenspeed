@@ -22,7 +22,7 @@
 
 import pytest
 import tokenspeed_scheduler as ts
-from conftest import _advance, _finish, _spec
+from conftest import _advance, _finish, _spec, storage_ops
 from test_async_l3 import done, event, requests, tick
 
 
@@ -73,7 +73,7 @@ def submit(s, rid="r", tokens=None):
         # Keep the general transaction cases aligned; tail cases supply tokens.
         spec.max_cached_prefix_tokens = 6
     s.submit_requests([spec])
-    return s.next_execution_plan().storage[0]
+    return storage_ops(s.next_execution_plan())[0]
 
 
 def read(s, query, flags=None):
@@ -82,7 +82,7 @@ def read(s, query, flags=None):
 
 
 def acknowledge_get(s, plan):
-    op = next(x for x in plan.storage if x.kind == ts.StorageKind.Get)
+    op = next(x for x in storage_ops(plan) if x.kind == ts.StorageKind.Get)
     done(s, op, [1] * len(op.keys), retired=True)
     return s.next_execution_plan()
 
@@ -167,7 +167,7 @@ def test_sparse_state_hit_uses_existing_group_matcher(state_groups):
     }
     flags = [int(key[0] == 0 or tuple(key) in final_states) for key in q.keys]
     get_plan = read(s, q, flags)
-    get = get_plan.storage[0]
+    get = storage_ops(get_plan)[0]
     assert sum(key[0] != 0 for key in get.keys) == state_groups
     plan = acknowledge_get(s, get_plan)
     assert list(plan.forward[0].extend_prefix_lens) == [6]
@@ -175,7 +175,7 @@ def test_sparse_state_hit_uses_existing_group_matcher(state_groups):
 
 def test_partial_get_uses_only_complete_contiguous_prefix():
     s = start(config())
-    get = read(s, submit(s)).storage[0]
+    get = storage_ops(read(s, submit(s)))[0]
     done(s, get, [1, 0, 1], retired=True)
     plan = s.next_execution_plan()
     assert list(plan.forward[0].extend_prefix_lens) == [2]
@@ -189,17 +189,17 @@ def test_l2_warm_new_request_does_not_send_query():
     s.submit_requests([_spec("warm", list(range(8)))])
     plan = s.next_execution_plan()
     assert "warm" in requests(plan)
-    assert not any(x.kind == ts.StorageKind.Query for x in plan.storage)
+    assert not any(x.kind == ts.StorageKind.Query for x in storage_ops(plan))
 
 
 def test_abort_id_reuse_does_not_publish_old_get():
     s = start(config())
-    old_get = read(s, submit(s)).storage[0]
+    old_get = storage_ops(read(s, submit(s)))[0]
     abort = ts.ForwardEvent.Abort()
     abort.request_id = "r"
     event(s, abort)
     cancel_plan = s.next_execution_plan()
-    assert cancel_plan.storage[0].kind == ts.StorageKind.Cancel
+    assert storage_ops(cancel_plan)[0].kind == ts.StorageKind.Cancel
     query = submit(s, tokens=list(range(10, 18)))
     assert query.op_id != old_get.op_id
     done(s, old_get, [1] * len(old_get.keys), retired=True)
@@ -219,7 +219,7 @@ def test_l3_put_failure_preserves_published_host_cache():
     event(s, ack)
     cached = s.host_pool_cached_blocks()
     put = next(
-        x for x in s.next_execution_plan().storage if x.kind == ts.StorageKind.Put
+        x for x in storage_ops(s.next_execution_plan()) if x.kind == ts.StorageKind.Put
     )
     assert cached > 0 and s.storage_held_blocks() > 0
     done(s, put, [0] * len(put.keys), retired=True)
@@ -255,7 +255,7 @@ def test_state_groups_cannot_resume_from_different_remote_checkpoints():
     plan = read(s, q, [int(k[0] == 0 or tuple(k) in hits) for k in q.keys])
     assert requests(plan) == ["r"]
     assert list(plan.forward[0].extend_prefix_lens) == [0]
-    assert not any(op.kind == ts.StorageKind.Get for op in plan.storage)
+    assert not any(op.kind == ts.StorageKind.Get for op in storage_ops(plan))
 
 
 def test_storage_configuration_cannot_be_silently_ignored():
@@ -295,7 +295,7 @@ def test_cold_reader_restores_actual_published_unaligned_checkpoint(
             event(writer, ack)
     puts = [
         op
-        for op in writer.next_execution_plan().storage
+        for op in storage_ops(writer.next_execution_plan())
         if op.kind == ts.StorageKind.Put
     ]
     remote = {tuple(key) for op in puts for key in op.keys}
@@ -310,9 +310,9 @@ def test_cold_reader_restores_actual_published_unaligned_checkpoint(
     # prompt: nothing beyond that token count may be claimed.
     spec.max_cached_prefix_tokens = 5
     reader.submit_requests([spec])
-    query = reader.next_execution_plan().storage[0]
+    query = storage_ops(reader.next_execution_plan())[0]
     plan = read(reader, query, [int(tuple(key) in remote) for key in query.keys])
-    get = next(op for op in plan.storage if op.kind == ts.StorageKind.Get)
+    get = next(op for op in storage_ops(plan) if op.kind == ts.StorageKind.Get)
     assert all(tuple(key) in remote for key in get.keys)
     assert [sum(key[0] == gid for key in get.keys) for gid in range(len(kinds))] == [
         {"full": 3, "swa": 2, "state": 1}[kind] for kind in kinds

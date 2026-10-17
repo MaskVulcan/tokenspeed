@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <variant>
 
 #include "cache/core/cache_types.h"
 
@@ -55,12 +56,33 @@ struct StorageConfig {
     void Validate() const;
 };
 
-struct StorageOperation {
+struct StorageQueryOperation {
+    static constexpr StorageKind kKind = StorageKind::kQuery;
     std::uint64_t op_id;
-    StorageKind kind;
     std::vector<CacheKey> keys;
-    std::vector<std::int32_t> host_blocks;
 };
+
+struct StorageGetOperation {
+    static constexpr StorageKind kKind = StorageKind::kGet;
+    std::uint64_t op_id;
+    std::vector<CacheKey> keys;
+    std::vector<std::int32_t> host_blocks;  // Destinations held until native retirement.
+};
+
+struct StoragePutOperation {
+    static constexpr StorageKind kKind = StorageKind::kPut;
+    std::uint64_t op_id;
+    std::vector<CacheKey> keys;
+    std::vector<std::int32_t> host_blocks;  // Sources held until native retirement.
+};
+
+struct StorageCancelOperation {
+    static constexpr StorageKind kKind = StorageKind::kCancel;
+    std::uint64_t op_id;  // The original operation; no new ticket or completion.
+};
+
+using StorageOperation =
+    std::variant<StorageQueryOperation, StorageGetOperation, StoragePutOperation, StorageCancelOperation>;
 
 // Scheduler-owned observations. Runtime queue and transport counters live in
 // the executor; these values describe logical leases and preparation instead.

@@ -33,6 +33,7 @@ import os
 import time
 import uuid
 from contextlib import ExitStack
+from test.l3_test_utils import storage_ops
 
 import pytest
 import tokenspeed_scheduler as ts
@@ -109,7 +110,7 @@ def _submit(scheduler, tokens, *, reuse_bound):
     request.tokens = tokens
     request.max_cached_prefix_tokens = reuse_bound
     scheduler.submit_requests([request])
-    return scheduler.next_execution_plan().storage[0]
+    return storage_ops(scheduler.next_execution_plan())[0]
 
 
 def _complete(scheduler, executor, operation):
@@ -225,7 +226,7 @@ def test_cold_tail_restores_actual_put_bytes(
                     _send(writer, done)
         puts = [
             op
-            for op in writer.next_execution_plan().storage
+            for op in storage_ops(writer.next_execution_plan())
             if op.kind == ts.StorageKind.Put
         ]
         assert puts
@@ -251,7 +252,7 @@ def test_cold_tail_restores_actual_put_bytes(
         _complete(reader, reader_io, query)
         get = next(
             op
-            for op in reader.next_execution_plan().storage
+            for op in storage_ops(reader.next_execution_plan())
             if op.kind == ts.StorageKind.Get
         )
         assert all(tuple(key) in expected for key in get.keys)

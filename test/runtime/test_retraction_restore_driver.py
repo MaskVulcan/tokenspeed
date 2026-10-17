@@ -145,8 +145,8 @@ class _Driver:
         self.acked += len(events)
         advance_scheduler(self.scheduler, events)
         plan = self.scheduler.next_execution_plan()
-        self.hooks.count_plan_ops(plan)
-        ops = cache_ops_from_plan(plan)
+        ops = cache_ops_from_plan(plan).device
+        self.hooks.count_ops(ops)
         self.tickets += sum(
             1 if isinstance(op, (SnapshotOp, RestoreOp)) else len(op.op_ids)
             for op in ops

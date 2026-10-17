@@ -1809,9 +1809,14 @@ TEST_F(ImageFollowsCanonicalHostEntrySuite, ARedirectedStoreAckRePointsTheImageT
     tick.With(cache::StorageTick{1, false, true, StoragePressure{0, 0, 0}});
     scheduler_->Advance(std::move(tick));
     const auto query_plan = PlanOnce();
-    ASSERT_EQ(query_plan.storage.size(), 1u);
-    const auto& query = query_plan.storage.front();
-    ASSERT_EQ(query.kind, StorageKind::kQuery);
+    std::vector<StorageOperation> query_operations;
+    for (const auto& operation : query_plan.Operations()) {
+        if (const auto* cache = std::get_if<CacheOperation>(&operation)) {
+            if (const auto* storage = std::get_if<StorageOperation>(cache)) query_operations.push_back(*storage);
+        }
+    }
+    ASSERT_EQ(query_operations.size(), 1u);
+    const auto& query = std::get<StorageQueryOperation>(query_operations.front());
     std::vector<std::uint8_t> present;
     for (const auto& key : query.keys) {
         // This race stores complete pages only, not r3's unrelated tail.
@@ -1821,9 +1826,14 @@ TEST_F(ImageFollowsCanonicalHostEntrySuite, ARedirectedStoreAckRePointsTheImageT
     query_done.With(cache::StorageDone{query.op_id, present, true, std::vector<std::uint8_t>(query.keys.size(), 0)});
     scheduler_->Advance(std::move(query_done));
     const auto get_plan = PlanOnce();
-    ASSERT_EQ(get_plan.storage.size(), 1u);
-    const auto& get = get_plan.storage.front();
-    ASSERT_EQ(get.kind, StorageKind::kGet);
+    std::vector<StorageOperation> get_operations;
+    for (const auto& operation : get_plan.Operations()) {
+        if (const auto* cache = std::get_if<CacheOperation>(&operation)) {
+            if (const auto* storage = std::get_if<StorageOperation>(cache)) get_operations.push_back(*storage);
+        }
+    }
+    ASSERT_EQ(get_operations.size(), 1u);
+    const auto& get = std::get<StorageGetOperation>(get_operations.front());
     ASSERT_EQ(get.keys.size(), 2u) << "[42 43] in both groups";
     ExecutionEvent resume;
     resume.With(cache::StorageTick{2, true, false, StoragePressure{0, 0, 0}});

@@ -102,7 +102,7 @@ Consequences:
   user does not join it — it gets its own name.
   L3 is a separate Host-only capability returned by the builder, held by
   the L3 hooks and request handler. Its CPU workers cannot reach the device
-  handle. The loop submits `plan.storage` independently from device work;
+  handle. The loop submits the storage subset of `plan.cache` independently from device work;
   completion facts enter the existing head feedback point. The
   retraction snapshot pool adds no operation at all: its stores ride
   `execute` with the write-backs, its restores with the load-backs, its ACKs
@@ -113,7 +113,7 @@ Consequences:
   `Cache.LoadBackOp`) pass through, and the scheduler's batched
   `Cache.SnapshotOp` / `Cache.RestoreOp` become one per-request `SnapshotOp`
   / `RestoreOp` (`cache/transfer/ops.py`) each -- the executor's unit of
-  work, one slot exported or imported, one ACK. `CacheOpHooks.count_plan_ops`
+  work, one slot exported or imported, one ACK. `CacheOpHooks.count_ops`
   counts through the same adapter, so what is counted is what is submitted;
   its return value — the plan's per-request `SnapshotOp` count, one per
   retraction victim — is the round's preemption count, exported as
@@ -407,7 +407,7 @@ Current inventory:
 | `_pause_hooks` | `PauseHooks` — `engine/pause.py`              | glue (PauseController is the state machine) | `apply_transitions`, `withhold_admissions`, `paused_idle_step` |
 | `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
-| `_cache_hooks` | `CacheOpHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries; counts the Host L2 write-backs/load-backs and the retraction image's snapshot stores/restores alike) | `count_plan_ops`, `poll_ready_events` |
+| `_cache_hooks` | `CacheOpHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries; counts the Host L2 write-backs/load-backs and the retraction image's snapshot stores/restores alike) | `count_ops`, `poll_ready_events` |
 | `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, Host-only `L3Executor`, static replica group; no loop reference) | `poll_ready_events`, `cancel_request`, `record_metrics` |
 | `_eplb_hooks` | `EplbHooks` — `engine/eplb_hooks.py` | glue (`ExpertRebalanceController` in `moe/expert_rebalance.py` is the state machine; handed the `DeviceHandle`, the request handler and the EP gloo group; no loop reference) | `note_round` |
 | `_gc_hooks` | `GcHooks` — `engine/gc_hooks.py` | self-contained (only its interval; no loop reference) | `note_round` |

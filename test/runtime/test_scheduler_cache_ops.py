@@ -24,6 +24,7 @@ rank-sync payload, and the retraction and prefetch fields of ``make_config``."""
 
 from __future__ import annotations
 
+from test.l3_test_utils import storage_ops, storage_scheduler
 from types import SimpleNamespace
 
 import pytest
@@ -74,6 +75,10 @@ def wire(monkeypatch):
             LoadBackOp=_LoadBackOp,
             SnapshotOp=_SnapshotBatch,
             RestoreOp=_RestoreBatch,
+            StorageQueryOp=ts.Cache.StorageQueryOp,
+            StorageGetOp=ts.Cache.StorageGetOp,
+            StoragePutOp=ts.Cache.StoragePutOp,
+            StorageCancelOp=ts.Cache.StorageCancelOp,
         ),
     )
 
@@ -120,7 +125,7 @@ def test_plan_adapter_passes_l2_batches_and_expands_snapshot_batches(wire):
         ]
     )
 
-    ops = cache_ops_from_plan(plan)
+    ops = cache_ops_from_plan(plan).device
 
     assert ops[0] is write_back and ops[3] is load_back
     assert ops[1] == SnapshotOp(
@@ -149,7 +154,7 @@ def test_plan_adapter_passes_l2_batches_and_expands_snapshot_batches(wire):
         ),
         source_tier=(HostTier.L2, HostTier.SNAPSHOT_POOL, HostTier.SNAPSHOT_POOL),
     )
-    assert cache_ops_from_plan(SimpleNamespace(cache=[])) == []
+    assert cache_ops_from_plan(SimpleNamespace(cache=[])).device == ()
 
 
 def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
@@ -274,4 +279,53 @@ def test_make_config_requires_storage_limits_exactly_with_l3():
     scheduler.advance(tick)
     plan = scheduler.next_execution_plan()
     assert all(not batch.request_ids for batch in plan.forward)
-    assert plan.storage[0].kind == ts.StorageKind.Query
+    assert storage_ops(plan)[0].kind == ts.StorageKind.Query
+
+
+def test_cache_plan_keeps_storage_cancel_before_the_next_query():
+    scheduler = storage_scheduler()
+    first = cache_ops_from_plan(scheduler.next_execution_plan())
+    assert first.device == () and len(first.storage) == 1
+    original = first.storage[0]
+    assert isinstance(original, ts.Cache.StorageQueryOp)
+    changes = ts.ExecutionEvent()
+    changes.add_event(ts.Cache.StorageDetach("waiting"))
+    changes.add_event(ts.Cache.StorageTick(2, False, True, ts.StoragePressure(0, 0, 0)))
+    scheduler.advance(changes)
+    request = ts.RequestSpec()
+    request.request_id = "next"
+    request.tokens = [5, 6, 7, 8]
+    scheduler.submit_requests([request])
+    prepared = cache_ops_from_plan(scheduler.next_execution_plan())
+    assert prepared.device == ()
+    assert [op.kind for op in prepared.storage] == [
+        ts.StorageKind.Cancel,
+        ts.StorageKind.Query,
+    ]
+    assert prepared.storage[0].op_id == original.op_id
+    assert prepared.storage[1].op_id > original.op_id
+
+
+def test_storage_commands_cannot_partially_enter_gpu_completion_accounting():
+    from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks
+
+    class Device:
+        def poll_cache_results(self):
+            raise AssertionError("there is no submitted GPU ticket")
+
+    scheduler = storage_scheduler()
+    storage = cache_ops_from_plan(scheduler.next_execution_plan()).storage
+    hooks = CacheOpHooks(
+        Device(),
+        speculative_algorithm=None,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_tp_cpu_group=None,
+        pp_size=1,
+        pp_cpu_group=None,
+        global_rank=0,
+    )
+    snapshot = SnapshotOp(42, "victim", 1, 1, ())
+    with pytest.raises(TypeError, match="Device-copy operations"):
+        hooks.count_ops((snapshot, *storage))
+    assert hooks.poll_ready_events() == []

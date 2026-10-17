@@ -68,7 +68,8 @@ public:
 
 private:
     struct Ticket {
-        StorageOperation operation;
+        StorageKind kind;
+        std::vector<CacheKey> keys;
         std::vector<CacheBlockRef> blocks;
         std::vector<CacheBlockRef> warm_blocks;
         std::vector<std::uint8_t> success;

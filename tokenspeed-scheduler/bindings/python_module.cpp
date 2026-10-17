@@ -248,21 +248,46 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("unavailable_dropped_backup_keys", &tokenspeed::StorageStats::unavailable_dropped_backup_keys)
         .def_ro("disabled_dropped_backup_keys", &tokenspeed::StorageStats::disabled_dropped_backup_keys)
         .def_ro("cleanup_dropped_backup_keys", &tokenspeed::StorageStats::cleanup_dropped_backup_keys);
-    nb::class_<tokenspeed::StorageOperation>(m, "StorageOperation")
-        .def_ro("op_id", &tokenspeed::StorageOperation::op_id)
-        .def_ro("kind", &tokenspeed::StorageOperation::kind)
-        .def_ro("host_blocks", &tokenspeed::StorageOperation::host_blocks)
-        .def_prop_ro("keys", [](const tokenspeed::StorageOperation& op) {
-            nb::list keys;
-            for (const auto& key : op.keys)
-                keys.append(nb::make_tuple(key.group_id, key.content_hash, key.page_offset));
-            return keys;
-        });
 
     // ─── ExecutionEvent ─────────────────────────────────────────────
 
     nb::module_ pd = m.def_submodule("PD");
     nb::module_ cache = m.def_submodule("Cache");
+
+    const auto storage_keys = [](const std::vector<tokenspeed::CacheKey>& values) {
+        nb::list keys;
+        for (const auto& key : values) keys.append(nb::make_tuple(key.group_id, key.content_hash, key.page_offset));
+        return keys;
+    };
+
+    nb::class_<tokenspeed::StorageQueryOperation>(cache, "StorageQueryOp")
+        .def_ro("op_id", &tokenspeed::StorageQueryOperation::op_id)
+        .def_prop_ro("kind",
+                     [](const tokenspeed::StorageQueryOperation&) { return tokenspeed::StorageQueryOperation::kKind; })
+        .def_prop_ro("keys",
+                     [storage_keys](const tokenspeed::StorageQueryOperation& op) { return storage_keys(op.keys); });
+
+    nb::class_<tokenspeed::StorageGetOperation>(cache, "StorageGetOp")
+        .def_ro("op_id", &tokenspeed::StorageGetOperation::op_id)
+        .def_prop_ro("kind",
+                     [](const tokenspeed::StorageGetOperation&) { return tokenspeed::StorageGetOperation::kKind; })
+        .def_prop_ro("keys",
+                     [storage_keys](const tokenspeed::StorageGetOperation& op) { return storage_keys(op.keys); })
+        .def_ro("host_blocks", &tokenspeed::StorageGetOperation::host_blocks);
+
+    nb::class_<tokenspeed::StoragePutOperation>(cache, "StoragePutOp")
+        .def_ro("op_id", &tokenspeed::StoragePutOperation::op_id)
+        .def_prop_ro("kind",
+                     [](const tokenspeed::StoragePutOperation&) { return tokenspeed::StoragePutOperation::kKind; })
+        .def_prop_ro("keys",
+                     [storage_keys](const tokenspeed::StoragePutOperation& op) { return storage_keys(op.keys); })
+        .def_ro("host_blocks", &tokenspeed::StoragePutOperation::host_blocks);
+
+    nb::class_<tokenspeed::StorageCancelOperation>(cache, "StorageCancelOp")
+        .def_ro("op_id", &tokenspeed::StorageCancelOperation::op_id)
+        .def_prop_ro("kind", [](const tokenspeed::StorageCancelOperation&) {
+            return tokenspeed::StorageCancelOperation::kKind;
+        });
 
     nb::class_<tokenspeed::cache::StorageTick>(cache, "StorageTick")
         .def(nb::init<std::int64_t, bool, bool, tokenspeed::StoragePressure>(), nb::arg("now_us"),
@@ -454,7 +479,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
         .def_ro("aborts", &tokenspeed::ExecutionPlan::aborts)
-        .def_ro("storage", &tokenspeed::ExecutionPlan::storage)
         .def_prop_ro("remote_decode",
                      [](const tokenspeed::ExecutionPlan& plan) -> nb::object {
                          if (!plan.remote_decode) {

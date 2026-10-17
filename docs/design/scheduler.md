@@ -1047,7 +1047,7 @@ default beside L2 that this model's `SingleRequestGroupPages` and
 
 **Runtime contract.** `num_snapshot_pages` is explicit (`1` without a pool).
 The runtime executes/counts snapshot and restore ops alongside L2 copies.
-Storage operations travel separately in `ExecutionPlan.storage`; their agreed
+Storage operations travel separately in `CacheOperation`; their agreed
 `StorageDone`, `StorageTick` and `StorageDetach` events enter the same scheduler
 head feedback point. `Prefetching` is a request waiting state; it does not
 add a second admission or forward path. There is no device `PrefetchOp` or

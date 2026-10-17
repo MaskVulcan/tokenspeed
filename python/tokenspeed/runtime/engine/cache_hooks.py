@@ -53,8 +53,8 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_from_payload,
     cache_event_key,
     cache_event_to_payload,
-    cache_ops_from_plan,
     cache_sync_debug_enabled,
+    is_device_cache_op,
     pop_common_cache_event_payloads,
 )
 
@@ -116,34 +116,22 @@ class CacheOpHooks:
             replica_groups.append((pp_size, pp_cpu_group))
         self._replica_groups = replica_groups
 
-    def count_plan_ops(self, execution_plan) -> int:
-        """Count the cache ops this plan will put in flight.
+    def count_ops(self, cache_ops) -> int:
+        """Count the prepared Device-copy operations submitted this round.
 
-        ``DeviceHandle.execute`` submits them, from the same plan (write-backs
-        and snapshot stores ahead of page zeroing, load-backs and restores
-        behind the zeroing), through the
-        same adapter (``scheduler_utils.cache_ops_from_plan``). An L2 batch
-        carries one ticket per ``op_ids`` entry; each request of a snapshot
-        store or restore batch is one ticket, acknowledged on its
-        own. Call this with the SAME plan and only when ``execute`` will run:
-        a plan counted but never submitted leaves ops in flight forever.
-
-        Returns:
-            The number of ``SnapshotOp`` requests in the plan — one per
-            request the scheduler retracted this round (a victim's image
-            store is the retraction signal; see docs/design/scheduler.md §2).
-            The event loop feeds it to the preemption counter. 0 when the
-            hooks are not armed: without cache ops there is no snapshot
-            pool, and without a pool a capacity block aborts instead of
-            retracting.
-
-        Raises:
-            TypeError: The plan carries a cache op kind the runtime cannot run.
+        The loop passes this same snapshot to DeviceHandle.execute. Storage
+        jobs have independent retirement facts and never consume these GPU
+        completion tickets. Returns the snapshot-store count for preemptions.
         """
         if self._device is None:
             return 0
+        cache_ops = tuple(cache_ops)
+        if not all(is_device_cache_op(op) for op in cache_ops):
+            raise TypeError(
+                "cache completion accounting requires Device-copy operations"
+            )
         num_snapshot_ops = 0
-        for op in cache_ops_from_plan(execution_plan):
+        for op in cache_ops:
             if isinstance(op, (SnapshotOp, RestoreOp)):
                 self._num_inflight += 1
                 self._num_open += 1

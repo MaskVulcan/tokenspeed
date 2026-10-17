@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import tokenspeed_scheduler as ts
-from conftest import _advance, _spec
+from conftest import _advance, _spec, storage_ops
 
 
 def scheduler(*, role, groups=1, host=32, timeout=100):
@@ -95,10 +95,10 @@ def read_pending(s, rid="r"):
     spec = _spec(rid, list(range(8)))
     spec.max_cached_prefix_tokens = 6
     s.submit_requests([spec])
-    q = s.next_execution_plan().storage[0]
+    q = storage_ops(s.next_execution_plan())[0]
     assert q.kind == ts.StorageKind.Query
     done(s, q, [1] * len(q.keys), retired=True)
-    read = s.next_execution_plan().storage[0]
+    read = storage_ops(s.next_execution_plan())[0]
     assert read.kind == ts.StorageKind.Get
     return read
 
@@ -128,7 +128,7 @@ def test_soft_timeout_does_not_free_native_destination():
     plan = s.next_execution_plan()
     assert requests(plan) == ["r"]
     assert list(plan.forward[0].extend_prefix_lens) == [0]
-    assert any(op.kind == ts.StorageKind.Cancel for op in plan.storage)
+    assert any(op.kind == ts.StorageKind.Cancel for op in storage_ops(plan))
     assert s.storage_held_blocks() == held
     done(s, read, [1] * len(read.keys), retired=True)
     assert s.storage_held_blocks() == 0
@@ -162,7 +162,7 @@ def test_short_read_is_not_published_and_negative_metadata_is_bounded():
 def test_later_query_can_progress_while_earlier_query_is_pending():
     s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     s.submit_requests([_spec("a", list(range(8))), _spec("b", list(range(10, 18)))])
-    queries = s.next_execution_plan().storage
+    queries = storage_ops(s.next_execution_plan())
     assert len(queries) == 2
     done(s, queries[1], [0] * len(queries[1].keys), retired=True)
     assert requests(s.next_execution_plan()) == ["b"]
@@ -176,17 +176,17 @@ def test_repeated_storage_wait_keeps_device_and_all_forward_slots_available(phas
     spec = _spec("waiting", list(range(8)))
     spec.max_cached_prefix_tokens = 6
     s.submit_requests([spec])
-    operation = s.next_execution_plan().storage[0]
+    operation = storage_ops(s.next_execution_plan())[0]
     if phase == ts.StorageKind.Get:
         done(s, operation, [1] * len(operation.keys), retired=True)
-        operation = s.next_execution_plan().storage[0]
+        operation = storage_ops(s.next_execution_plan())[0]
     assert operation.kind == phase
     held = s.storage_held_blocks()
 
     for now in range(2, 18):
         tick(s, now, forward=True, storage=True)
         plan = s.next_execution_plan()
-        assert not requests(plan) and not plan.cache and not plan.storage
+        assert not requests(plan) and not plan.cache and not storage_ops(plan)
         assert s.available_lcm_blocks() == before
         assert s.storage_held_blocks() == held
         assert s.storage_stats().operations == 1
@@ -198,7 +198,7 @@ def test_repeated_storage_wait_keeps_device_and_all_forward_slots_available(phas
     s.submit_requests(ready)
     plan = s.next_execution_plan()
     assert requests(plan) == [spec.request_id for spec in ready]
-    assert not plan.storage
+    assert not storage_ops(plan)
     assert s.storage_held_blocks() == held
     assert s.storage_stats().waiting_requests == 1
 
@@ -209,7 +209,7 @@ def test_zero_logprob_bound_never_queries_storage():
     spec.max_cached_prefix_tokens = 0
     s.submit_requests([spec])
     plan = s.next_execution_plan()
-    assert requests(plan) == ["r"] and not plan.storage
+    assert requests(plan) == ["r"] and not storage_ops(plan)
 
 
 def test_ready_result_is_protected_while_forward_is_frozen():
@@ -225,13 +225,13 @@ def test_ready_result_is_protected_while_forward_is_frozen():
     assert s.storage_held_blocks() == 0
     tick(s, 104, forward=True, storage=True)
     plan = s.next_execution_plan()
-    assert requests(plan) == ["r"] and not plan.storage
+    assert requests(plan) == ["r"] and not storage_ops(plan)
 
 
 def test_d2h_publishes_before_put_and_freeze_drops_unowned_candidates():
     s = scheduler(role=ts.SchedulerConfig.Role.Fused)
     s.submit_requests([_spec("r", list(range(8)))])
-    q = s.next_execution_plan().storage[0]
+    q = storage_ops(s.next_execution_plan())[0]
     done(s, q, [0] * len(q.keys), retired=True)
     s.next_execution_plan()
     _advance(s, "r", [99])
@@ -246,7 +246,7 @@ def test_d2h_publishes_before_put_and_freeze_drops_unowned_candidates():
     assert candidates > 0
     tick(s, 3, forward=False, storage=False)
     frozen = s.next_execution_plan()
-    assert not requests(frozen) and not frozen.storage
+    assert not requests(frozen) and not storage_ops(frozen)
     assert s.storage_held_blocks() == 0
     assert s.storage_stats().backup_candidates == 0
     assert s.storage_stats().cleanup_dropped_backup_keys == candidates
@@ -255,7 +255,7 @@ def test_d2h_publishes_before_put_and_freeze_drops_unowned_candidates():
 def test_query_credits_never_split_a_prefix_boundary_across_groups():
     s = scheduler(role=ts.SchedulerConfig.Role.Fused, groups=6)
     s.submit_requests([_spec("bounded", list(range(16)))])
-    op = s.next_execution_plan().storage[0]
+    op = storage_ops(s.next_execution_plan())[0]
     assert op.kind == ts.StorageKind.Query
     # 32 keys fit five whole six-group boundaries. A partial sixth boundary
     # cannot establish a usable prefix and must not consume query credits.
@@ -318,7 +318,7 @@ def test_pressure_bypasses_new_requests_and_reopens_only_below_low_watermarks():
     s.submit_requests([_spec("bypass", list(range(8)))])
     plan = s.next_execution_plan()
     assert requests(plan) == ["bypass"]
-    assert not plan.storage and s.storage_stats().pressure_bypasses == 1
+    assert not storage_ops(plan) and s.storage_stats().pressure_bypasses == 1
     assert s.storage_stats().pressure_gate_closed
     pressure_tick(s, 3, queued=5, byte_count=0, age=0)
     assert s.storage_stats().pressure_gate_closed
@@ -326,27 +326,28 @@ def test_pressure_bypasses_new_requests_and_reopens_only_below_low_watermarks():
     assert not s.storage_stats().pressure_gate_closed
     s.submit_requests([_spec("recovered", list(range(40, 48)))])
     plan = s.next_execution_plan()
-    assert any(op.kind == ts.StorageKind.Query for op in plan.storage)
+    assert any(op.kind == ts.StorageKind.Query for op in storage_ops(plan))
 
 
 def test_pressure_detaches_query_without_waiting_for_deadline_or_issuing_get():
     for completed in (False, True):
         s = scheduler(role=ts.SchedulerConfig.Role.Fused, timeout=10000)
         s.submit_requests([_spec("r", list(range(8)))])
-        query = s.next_execution_plan().storage[0]
+        query = storage_ops(s.next_execution_plan())[0]
         pressure_tick(s, 2, queued=0, byte_count=0, age=1000)
         if completed:
             done(s, query, [1] * len(query.keys), retired=True)
         plan = s.next_execution_plan()
         assert requests(plan) == ["r"]
         assert not any(
-            op.kind in (ts.StorageKind.Query, ts.StorageKind.Get) for op in plan.storage
+            op.kind in (ts.StorageKind.Query, ts.StorageKind.Get)
+            for op in storage_ops(plan)
         )
         assert s.storage_stats().pressure_bypasses == 1
         assert s.storage_stats().wait_timeouts == 0
         assert s.storage_held_blocks() == 0
         if not completed:
-            assert any(op.kind == ts.StorageKind.Cancel for op in plan.storage)
+            assert any(op.kind == ts.StorageKind.Cancel for op in storage_ops(plan))
             done(s, query, [1] * len(query.keys), retired=True)
         assert not s.storage_pending()
 
@@ -359,7 +360,7 @@ def test_active_get_and_ready_data_progress_while_pressure_blocks_new_work():
     s.submit_requests([_spec("other", list(range(40, 48)))])
     plan = s.next_execution_plan()
     assert requests(plan) == ["other"]
-    assert not plan.storage
+    assert not storage_ops(plan)
     assert s.storage_held_blocks() == held
     done(s, read, [1] * len(read.keys), retired=True)
     plan = s.next_execution_plan()
@@ -393,22 +394,27 @@ def test_prefill_storage_preparation_survives_bootstrap(bootstrap_before_get):
     s.submit_requests([_spec("p", list(range(8)))])
     plan = s.next_execution_plan()
     assert not requests(plan)
-    assert len(plan.storage) == 1 and plan.storage[0].kind == ts.StorageKind.Query
+    assert (
+        len(storage_ops(plan)) == 1
+        and storage_ops(plan)[0].kind == ts.StorageKind.Query
+    )
     assert s.bootstrapping_size() == 1 and s.waiting_size() == 0
-    query = plan.storage[0]
+    query = storage_ops(plan)[0]
     if bootstrap_before_get:
         event(s, ts.PD.BootstrappedEvent("p"))
         assert s.bootstrapping_size() == 0 and s.waiting_size() == 1
     done(s, query, [1] * len(query.keys), retired=True)
     plan = s.next_execution_plan()
     assert not requests(plan)
-    assert len(plan.storage) == 1 and plan.storage[0].kind == ts.StorageKind.Get
-    read = plan.storage[0]
+    assert (
+        len(storage_ops(plan)) == 1 and storage_ops(plan)[0].kind == ts.StorageKind.Get
+    )
+    read = storage_ops(plan)[0]
     assert s.available_lcm_blocks() == before
     done(s, read, [1] * len(read.keys), retired=True)
     if not bootstrap_before_get:
         plan = s.next_execution_plan()
-        assert not requests(plan) and not plan.storage
+        assert not requests(plan) and not storage_ops(plan)
         assert s.available_lcm_blocks() == before
         event(s, ts.PD.BootstrappedEvent("p"))
     plan = s.next_execution_plan()
@@ -474,13 +480,13 @@ def test_storage_wait_never_reserves_mixed_prefill_tokens(phase):
     plan = s.next_execution_plan()
     assert requests(plan) == ["decode"]
     _advance(s, "decode", [103])
-    operation = plan.storage[0]
+    operation = storage_ops(plan)[0]
     if phase == ts.StorageKind.Get:
         done(s, operation, [1] * len(operation.keys), retired=True)
         plan = s.next_execution_plan()
         assert requests(plan) == ["decode"]
         _advance(s, "decode", [104])
-        operation = plan.storage[0]
+        operation = storage_ops(plan)[0]
     assert operation.kind == phase
     for now in range(2, 6):
         tick(s, now, forward=True, storage=True)
@@ -493,17 +499,17 @@ def test_storage_wait_never_reserves_mixed_prefill_tokens(phase):
 def test_prefill_timeout_preserves_bootstrap_and_native_retirement(phase):
     s = scheduler(role=ts.SchedulerConfig.Role.P)
     s.submit_requests([_spec("p", list(range(8)))])
-    operation = s.next_execution_plan().storage[0]
+    operation = storage_ops(s.next_execution_plan())[0]
     if phase == ts.StorageKind.Get:
         tick(s, 50, forward=True, storage=True)
         done(s, operation, [1] * len(operation.keys), retired=True)
-        operation = s.next_execution_plan().storage[0]
+        operation = storage_ops(s.next_execution_plan())[0]
     assert operation.kind == phase
     held = s.storage_held_blocks()
     tick(s, 102, forward=True, storage=True)
     plan = s.next_execution_plan()
     assert not requests(plan)
-    assert any(op.kind == ts.StorageKind.Cancel for op in plan.storage)
+    assert any(op.kind == ts.StorageKind.Cancel for op in storage_ops(plan))
     assert s.bootstrapping_size() == 1
     assert s.waiting_size() == 0
     assert s.storage_stats().wait_timeouts == 1
@@ -513,7 +519,7 @@ def test_prefill_timeout_preserves_bootstrap_and_native_retirement(phase):
     assert s.host_pool_cached_blocks() == 0
     event(s, ts.PD.BootstrappedEvent("p"))
     plan = s.next_execution_plan()
-    assert requests(plan) == ["p"] and not plan.storage
+    assert requests(plan) == ["p"] and not storage_ops(plan)
     assert list(plan.forward[0].extend_prefix_lens) == [0]
 
 
@@ -532,7 +538,7 @@ def test_ready_hold_expires_while_prefill_still_waits_for_bootstrap():
     assert s.storage_held_blocks() == 0
     event(s, ts.PD.BootstrappedEvent("r"))
     plan = s.next_execution_plan()
-    assert requests(plan) == ["r"] and not plan.storage
+    assert requests(plan) == ["r"] and not storage_ops(plan)
 
 
 @pytest.mark.parametrize(
@@ -551,7 +557,7 @@ def test_abort_prefetching_keeps_native_pins_and_never_restarts(role):
         event(s, abort)
     plan = s.next_execution_plan()
     assert not requests(plan)
-    assert any(op.kind == ts.StorageKind.Cancel for op in plan.storage)
+    assert any(op.kind == ts.StorageKind.Cancel for op in storage_ops(plan))
     assert s.storage_held_blocks() == held
     done(s, read, [1] * len(read.keys), retired=True)
     assert s.storage_held_blocks() == 0 and s.host_pool_cached_blocks() == 0

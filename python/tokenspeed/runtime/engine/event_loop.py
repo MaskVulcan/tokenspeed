@@ -61,6 +61,7 @@ from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     RequestHistoryRows,
     advance_scheduler,
+    cache_ops_from_plan,
     engram_context_len,
     input_logprob_plan_for_forward,
     make_config,
@@ -1209,9 +1210,12 @@ class EventLoop:
                     request_changes.extend(self._drain_in_flight(in_flight))
                     if self._l3 is not None:
                         execution_plan = self.scheduler.next_execution_plan()
-                        self._cache_hooks.count_plan_ops(execution_plan)
-                        self._l3.submit_operations(execution_plan.storage)
-                        self._device.execute(execution_plan, None)
+                        cache_ops = cache_ops_from_plan(execution_plan)
+                        self._cache_hooks.count_ops(cache_ops.device)
+                        self._l3.submit_operations(cache_ops.storage)
+                        self._device.execute(
+                            execution_plan, None, cache_ops=cache_ops.device
+                        )
                     self._pause_hooks.paused_idle_step()
                     paused_round = True
                 else:
@@ -1223,7 +1227,12 @@ class EventLoop:
                     # read that drives the in-flight accounting also yields
                     # the round's preemption count (0 on rounds without
                     # retraction, which are the overwhelming majority).
-                    num_retracted = self._cache_hooks.count_plan_ops(execution_plan)
+                    cache_ops = cache_ops_from_plan(execution_plan)
+                    if cache_ops.storage and self._l3 is None:
+                        raise RuntimeError(
+                            "cache storage operations require an L3 executor"
+                        )
+                    num_retracted = self._cache_hooks.count_ops(cache_ops.device)
                     if num_retracted:
                         self.metrics.record_preemptions(num_retracted)
                     # A capacity retraction whose victim could not be imaged
@@ -1233,8 +1242,8 @@ class EventLoop:
                     self.output_processor.finish_scheduler_aborted_requests(
                         execution_plan.aborts
                     )
-                    if self._l3 is not None:
-                        self._l3.submit_operations(execution_plan.storage)
+                    if cache_ops.storage:
+                        self._l3.submit_operations(cache_ops.storage)
 
                     forward_op = self._get_forward_op(execution_plan)
                     stats = self._get_scheduler_stats()
@@ -1326,7 +1335,9 @@ class EventLoop:
                     # transfers ride the FIFO first, then the batch the role
                     # routes. ``planned`` is None on idle/empty rounds — the
                     # plan hygiene still runs.
-                    pending = self._device.execute(execution_plan, planned)
+                    pending = self._device.execute(
+                        execution_plan, planned, cache_ops=cache_ops.device
+                    )
                     if need_idle_forward:
                         self._device.run_idle_forward(dp_metadata)
                     if pending is not None:

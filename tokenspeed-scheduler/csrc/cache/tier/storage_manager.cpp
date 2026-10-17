@@ -107,9 +107,9 @@ std::uint64_t StorageTransferManager::StartQuery(std::vector<CacheKey> keys) {
         keys.size() > static_cast<std::size_t>(config_.max_keys_per_operation)) {
         return 0;
     }
-    StorageOperation op{nextId(), StorageKind::kQuery, std::move(keys), {}};
+    StorageQueryOperation op{nextId(), std::move(keys)};
     const auto id = op.op_id;
-    operations_.emplace(id, Ticket{op, {}, {}, {}});
+    operations_.emplace(id, Ticket{decltype(op)::kKind, op.keys, {}, {}, {}});
     commands_.push_back(std::move(op));
     return id;
 }
@@ -121,14 +121,14 @@ bool StorageTransferManager::Completed(std::uint64_t id) const {
 
 bool StorageTransferManager::IsQuery(std::uint64_t id) const {
     const auto it = operations_.find(id);
-    return it != operations_.end() && it->second.operation.kind == StorageKind::kQuery;
+    return it != operations_.end() && it->second.kind == StorageKind::kQuery;
 }
 
 std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) const {
     const Ticket& ticket = operations_.at(id);
     std::vector<CacheKey> keys;
     for (std::size_t i = 0; i < ticket.success.size(); ++i) {
-        if (ticket.success[i] && !IsNegative(ticket.operation.keys[i])) keys.push_back(ticket.operation.keys[i]);
+        if (ticket.success[i] && !IsNegative(ticket.keys[i])) keys.push_back(ticket.keys[i]);
     }
     return keys;
 }
@@ -138,13 +138,14 @@ std::uint64_t StorageTransferManager::StartRead(const CacheCoordinator::PromptPr
     if (!CanStart() || hits.empty()) return 0;
     auto reservation = coordinator_.ReserveStoragePrefix(prompt, hits, availableHostCredits());
     if (reservation.keys.empty()) return 0;
-    StorageOperation op{nextId(), StorageKind::kGet, reservation.keys, {}};
+    StorageGetOperation op{nextId(), reservation.keys, {}};
     for (std::size_t i = 0; i < reservation.blocks.size(); ++i) {
         op.host_blocks.push_back(coordinator_.Allocator(static_cast<std::int32_t>(op.keys[i].group_id))
                                      .ResolveCacheBlockId(reservation.blocks[i]->Location()));
     }
     const auto id = op.op_id;
-    operations_.emplace(id, Ticket{op,
+    operations_.emplace(id, Ticket{decltype(op)::kKind,
+                                   op.keys,
                                    std::move(reservation.blocks),
                                    std::move(reservation.warm_blocks),
                                    {},
@@ -167,26 +168,26 @@ void StorageTransferManager::Complete(const cache::StorageDone& event) {
     const auto it = operations_.find(event.op_id);
     if (it == operations_.end() || it->second.completed) return;
     Ticket& ticket = it->second;
-    if (event.success.size() != ticket.operation.keys.size() || event.object_failures.size() != event.success.size()) {
+    if (event.success.size() != ticket.keys.size() || event.object_failures.size() != event.success.size()) {
         throw std::invalid_argument("L3 completion size differs from its immutable operation");
     }
     for (std::size_t i = 0; i < event.success.size(); ++i) {
         if (event.success[i] > 1 || event.object_failures[i] > 1 || (event.success[i] && event.object_failures[i]) ||
-            (ticket.operation.kind != StorageKind::kGet && event.object_failures[i])) {
+            (ticket.kind != StorageKind::kGet && event.object_failures[i])) {
             throw std::invalid_argument("Invalid L3 object completion facts");
         }
     }
     ticket.success = event.success;
     ticket.completed = true;
     ticket.quarantined = !event.retired;
-    const auto kind = ticket.operation.kind;
+    const auto kind = ticket.kind;
     if (kind == StorageKind::kGet) {
         for (std::size_t i = 0; i < ticket.success.size(); ++i) {
             if (!ticket.detached && event.object_failures[i]) {
-                rememberNegative(ticket.operation.keys[i]);
+                rememberNegative(ticket.keys[i]);
             }
             if (event.retired && !ticket.detached && ticket.success[i]) {
-                coordinator_.CacheHostBlock(ticket.blocks[i], ticket.operation.keys[i]);
+                coordinator_.CacheHostBlock(ticket.blocks[i], ticket.keys[i]);
             }
         }
         if (event.retired && !ticket.detached && ticket.tail) {
@@ -209,13 +210,15 @@ void StorageTransferManager::Detach(std::uint64_t id) {
         return;
     }
     // Nothing has seen a command still in this scheduler-owned outbox.
-    const auto queued = std::ranges::find_if(
-        commands_, [id](const auto& op) { return op.op_id == id && op.kind != StorageKind::kCancel; });
+    const auto queued = std::ranges::find_if(commands_, [id](const auto& operation) {
+        return !std::holds_alternative<StorageCancelOperation>(operation) &&
+               std::visit([id](const auto& op) { return op.op_id == id; }, operation);
+    });
     if (queued != commands_.end()) {
         commands_.erase(queued);
         operations_.erase(it);
     } else {
-        commands_.push_back(StorageOperation{id, StorageKind::kCancel, {}, {}});
+        commands_.push_back(StorageCancelOperation{id});
     }
 }
 
@@ -244,10 +247,10 @@ void StorageTransferManager::StartBackups() {
     std::size_t backup_blocks = 0;
     std::unordered_set<CacheKey, CacheKeyHash> pending;
     for (const auto& [id, ticket] : operations_) {
-        if (ticket.operation.kind == StorageKind::kPut) {
+        if (ticket.kind == StorageKind::kPut) {
             ++backup_operations;
             backup_blocks += ticket.blocks.size();
-            pending.insert(ticket.operation.keys.begin(), ticket.operation.keys.end());
+            pending.insert(ticket.keys.begin(), ticket.keys.end());
         }
     }
     // Backups are best-effort. Even a blocked PUT must leave capacity for
@@ -260,7 +263,7 @@ void StorageTransferManager::StartBackups() {
     // Credits held by other tickets are temporary. Candidates own no Host
     // references; retain them within the queue bound and recheck residency later.
     if (limit == 0) return;
-    StorageOperation op{0, StorageKind::kPut, {}, {}};
+    StoragePutOperation op{0, {}, {}};
     std::vector<CacheBlockRef> refs;
     while (!backup_candidates_.empty() && refs.size() < limit) {
         CacheKey key = std::move(backup_candidates_.front());
@@ -278,7 +281,7 @@ void StorageTransferManager::StartBackups() {
     }
     if (refs.empty()) return;
     op.op_id = nextId();
-    operations_.emplace(op.op_id, Ticket{op, std::move(refs), {}, {}});
+    operations_.emplace(op.op_id, Ticket{decltype(op)::kKind, op.keys, std::move(refs), {}, {}});
     commands_.push_back(std::move(op));
 }
 

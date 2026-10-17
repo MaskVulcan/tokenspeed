@@ -518,3 +518,16 @@ def test_close_never_deregisters_unknown_native_access():
         with pytest.raises(RuntimeError, match="retirement is unproven"):
             e.close(timeout_s=2)
         close.assert_not_called()
+
+
+@pytest.mark.parametrize("offsets,sizes", [((0,), ()), ((), (4,)), ((0,), (4,))])
+def test_query_rejects_host_ranges_without_consuming_an_operation_id(offsets, sizes):
+    e = executor(MemoryKvStore(), cfg=config())
+    try:
+        with pytest.raises(ValueError, match="queries cannot carry"):
+            e.submit(StorageJob(1, "query", ("missing",), offsets, sizes))
+        e.submit(StorageJob(1, "query", ("missing",), (), ()))
+        result = wait_results(e, 1)[0]
+        assert result.op_id == 1 and result.retired and result.success == (False,)
+    finally:
+        e.close(timeout_s=2)

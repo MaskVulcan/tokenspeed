@@ -89,7 +89,7 @@ from tokenspeed.runtime.cache.l2.sizing import (
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
 )
-from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
+from tokenspeed.runtime.engine.scheduler_utils import is_device_cache_op
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -374,6 +374,8 @@ class DeviceHandle:
         self,
         execution_plan,
         planned: "PlannedForward | None",
+        *,
+        cache_ops: Sequence,
     ) -> PendingExecution | None:
         """Execute one scheduler plan; never blocks on the per-round path.
 
@@ -406,9 +408,8 @@ class DeviceHandle:
 
         Args:
             execution_plan: The round's plan, a per-round value copy out of
-                C++. Its cache ops are adapted here, once, on the control
-                plane (``cache_ops_from_plan``: the binding's batched snapshot
-                ops become per-request ops) and read on the data plane.
+                C++. The control plane captures its cache operations once
+                and passes the Device-copy subset explicitly below.
             planned: The control plane's half of the round — the gathered
                 per-batch state only it can produce (sampling params, live
                 grammar matchers, the multimodal snapshot, DP metadata).
@@ -419,11 +420,21 @@ class DeviceHandle:
                 transfers — retraction writebacks, load-back destinations —
                 still run; they do not depend on a forward.
 
+            cache_ops: The validated Device-copy snapshot counted by the
+                cache hooks. Host storage operations belong to L3Executor.
+
         Returns:
             The submitted forward's ``PendingExecution``, or None on rounds
             that run no batch — DP-idle, an empty plan, or a D-role round
             whose only work was the peer's.
         """
+        cache_ops = tuple(cache_ops)
+        for operation in cache_ops:
+            if not is_device_cache_op(operation):
+                raise TypeError(
+                    f"unsupported Device cache op: {type(operation).__name__}"
+                )
+
         # See ``_settle``: a submission that raised produces no transfer event.
         _settle(
             self._transfer_submissions,
@@ -437,7 +448,6 @@ class DeviceHandle:
         )
 
         executor = self._executor
-        cache_ops = cache_ops_from_plan(execution_plan)
         l2 = self._l2 if cache_ops else None
         if l2 is not None:
             # Ahead of the zeroing: a stream-ordered store's sources may be

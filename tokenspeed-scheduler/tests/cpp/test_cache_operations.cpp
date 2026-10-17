@@ -854,7 +854,7 @@ TEST_F(AsyncStorageTailTest, RetiredGetPublishesTailForOrdinaryMatching) {
     ASSERT_NE(id, 0u);
     const auto commands = storage.TakeCommands();
     ASSERT_EQ(commands.size(), 1u);
-    const auto& op = commands[0];
+    const auto& op = std::get<StorageGetOperation>(commands[0]);
     // Six full-history blocks, the two SWA lookback blocks and one state.
     ASSERT_EQ(op.keys.size(), 9u);
     EXPECT_EQ(coordinator.ProbePromptPrefix(prompt(11, false)).host.num_common_tokens, 0);
@@ -882,7 +882,7 @@ TEST_F(AsyncStorageTailTest, FirstPageTailNeedsNoFullPageHash) {
     ASSERT_TRUE(prefix.prefix_hashes.empty());
     const auto id = storage.StartRead(prefix, query.keys);
     ASSERT_NE(id, 0u);
-    const auto op = storage.TakeCommands()[0];
+    const auto op = std::get<StorageGetOperation>(storage.TakeCommands()[0]);
     storage.Complete(cache::StorageDone{id, std::vector<std::uint8_t>(op.keys.size(), 1), true,
                                         std::vector<std::uint8_t>(op.keys.size(), 0)});
     EXPECT_EQ(coordinator.ProbePromptPrefix(prompt(3, false)).host.num_common_tokens, 3);
@@ -915,7 +915,7 @@ TEST_F(AsyncStorageTailTest, PartialGetCannotResumeWithoutItsExactState) {
     const auto query = coordinator.MissingStorageKeys(prefix, 64);
     const auto id = storage.StartRead(prefix, query.keys);
     ASSERT_NE(id, 0u);
-    const auto op = storage.TakeCommands()[0];
+    const auto op = std::get<StorageGetOperation>(storage.TakeCommands()[0]);
     std::vector<std::uint8_t> success, failures;
     for (const auto& key : op.keys) {
         success.push_back(key.group_id != 2);
@@ -931,7 +931,7 @@ TEST_F(AsyncStorageTailTest, DetachedGetNeverPublishesTail) {
     const auto query = coordinator.MissingStorageKeys(prefix, 64);
     const auto id = storage.StartRead(prefix, query.keys);
     ASSERT_NE(id, 0u);
-    const auto op = storage.TakeCommands()[0];
+    const auto op = std::get<StorageGetOperation>(storage.TakeCommands()[0]);
     storage.Detach(id);
     storage.Complete(cache::StorageDone{id, std::vector<std::uint8_t>(op.keys.size(), 1), true,
                                         std::vector<std::uint8_t>(op.keys.size(), 0)});
@@ -957,7 +957,7 @@ TEST_F(AsyncStorageTailTest, KnownTailBelowTheRequestBoundCanBeRestored) {
     }
     const auto id = storage.StartRead(longer, hits);
     ASSERT_NE(id, 0u);
-    const auto op = storage.TakeCommands()[0];
+    const auto op = std::get<StorageGetOperation>(storage.TakeCommands()[0]);
     ASSERT_EQ(op.keys.size(), 6u);
     EXPECT_EQ(storage.NumHeldBlocks(), 7u) << "the exact state is a pinned warm dependency";
     storage.Complete(cache::StorageDone{id, std::vector<std::uint8_t>(6, 1), true, std::vector<std::uint8_t>(6, 0)});
@@ -981,7 +981,7 @@ TEST_F(AsyncStorageTailTest, UnknownRetirementDoesNotPublishTailMetadata) {
     const auto query = coordinator.MissingStorageKeys(prefix, 64);
     const auto id = storage.StartRead(prefix, query.keys);
     ASSERT_NE(id, 0u);
-    const auto op = storage.TakeCommands()[0];
+    const auto op = std::get<StorageGetOperation>(storage.TakeCommands()[0]);
     storage.Complete(cache::StorageDone{id, std::vector<std::uint8_t>(op.keys.size(), 1), false,
                                         std::vector<std::uint8_t>(op.keys.size(), 0)});
     EXPECT_EQ(coordinator.NumTailEntries(), 0u);
@@ -1050,9 +1050,9 @@ TEST_F(AsyncStorageTransactionTest, PutPinsOnlyAtDispatchAndFailureKeepsL2) {
     storage.StartBackups();
     auto commands = storage.TakeCommands();
     ASSERT_EQ(commands.size(), 1u);
-    EXPECT_EQ(commands[0].kind, StorageKind::kPut);
+    EXPECT_TRUE(std::holds_alternative<StoragePutOperation>(commands[0]));
     EXPECT_EQ(storage.NumHeldBlocks(), 1u);
-    storage.Complete(cache::StorageDone{commands[0].op_id, {0}, true, {0}});
+    storage.Complete(cache::StorageDone{std::get<StoragePutOperation>(commands[0]).op_id, {0}, true, {0}});
     EXPECT_EQ(storage.NumHeldBlocks(), 0u);
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key("h0")));
 }
@@ -1071,20 +1071,22 @@ TEST_F(AsyncStorageTransactionTest, SlowBackupsLeaveHostCreditsForAnUnrelatedRea
     transfers.StartBackups();
     const auto puts = transfers.TakeCommands();
     ASSERT_EQ(puts.size(), 1u);
-    ASSERT_EQ(puts[0].kind, StorageKind::kPut);
+    ASSERT_TRUE(std::holds_alternative<StoragePutOperation>(puts[0]));
     // The PUT remains in flight while a different prefix needs Host targets.
     const auto read = transfers.StartRead(StoragePrompt(hashes, 2), coordinator.ExpandPrefixKeys(hashes));
     ASSERT_NE(read, 0u);
     const auto gets = transfers.TakeCommands();
     ASSERT_EQ(gets.size(), 1u);
-    EXPECT_EQ(gets[0].keys.size(), 2u);
+    EXPECT_EQ(std::get<StorageGetOperation>(gets[0]).keys.size(), 2u);
     EXPECT_EQ(transfers.NumHeldBlocks(), 4u);
     transfers.Complete(cache::StorageDone{read, {1, 1}, true, {0, 0}});
     transfers.Detach(read);
     EXPECT_EQ(coordinator.ProbePrefix(hashes).host.num_common_tokens, 4);
-    EXPECT_EQ(transfers.NumHeldBlocks(), puts[0].keys.size());
-    transfers.Complete(cache::StorageDone{puts[0].op_id, std::vector<std::uint8_t>(puts[0].keys.size(), 1), true,
-                                          std::vector<std::uint8_t>(puts[0].keys.size(), 0)});
+    EXPECT_EQ(transfers.NumHeldBlocks(), std::get<StoragePutOperation>(puts[0]).keys.size());
+    transfers.Complete(
+        cache::StorageDone{std::get<StoragePutOperation>(puts[0]).op_id,
+                           std::vector<std::uint8_t>(std::get<StoragePutOperation>(puts[0]).keys.size(), 1), true,
+                           std::vector<std::uint8_t>(std::get<StoragePutOperation>(puts[0]).keys.size(), 0)});
     EXPECT_EQ(transfers.NumHeldBlocks(), 0u);
     transfers.StartBackups();
     EXPECT_TRUE(transfers.TakeCommands().empty());
@@ -1102,8 +1104,8 @@ TEST_F(AsyncStorageTransactionTest, TemporaryWriteCreditExhaustionRetainsResiden
     storage.StartBackups();
     auto commands = storage.TakeCommands();
     ASSERT_EQ(commands.size(), 1u);
-    ASSERT_EQ(commands[0].keys.size(), 2u);
-    const auto first = commands[0].op_id;
+    ASSERT_EQ(std::get<StoragePutOperation>(commands[0]).keys.size(), 2u);
+    const auto first = std::get<StoragePutOperation>(commands[0]).op_id;
     for (int round = 0; round < 3; ++round) {
         storage.StartBackups();
         EXPECT_TRUE(storage.TakeCommands().empty());
@@ -1114,9 +1116,9 @@ TEST_F(AsyncStorageTransactionTest, TemporaryWriteCreditExhaustionRetainsResiden
     storage.StartBackups();
     commands = storage.TakeCommands();
     ASSERT_EQ(commands.size(), 1u);
-    EXPECT_EQ(commands[0].keys, std::vector<CacheKey>{key("h2")});
+    EXPECT_EQ(std::get<StoragePutOperation>(commands[0]).keys, std::vector<CacheKey>{key("h2")});
     EXPECT_EQ(storage.NumBackupCandidates(), 0u);
-    storage.Complete(cache::StorageDone{commands[0].op_id, {1}, true, {0}});
+    storage.Complete(cache::StorageDone{std::get<StoragePutOperation>(commands[0]).op_id, {1}, true, {0}});
     EXPECT_EQ(storage.NumHeldBlocks(), 0u);
     EXPECT_EQ(coordinator.ProbePrefix(hashes).host.num_common_tokens, 6);
 }
@@ -1129,16 +1131,16 @@ TEST_F(AsyncStorageTransactionTest, ReadCreditsDelayBackupsWithoutDroppingCandid
     storage.StartBackups();
     auto commands = storage.TakeCommands();
     ASSERT_EQ(commands.size(), 1u);
-    ASSERT_EQ(commands[0].keys.size(), 1u);
+    ASSERT_EQ(std::get<StoragePutOperation>(commands[0]).keys.size(), 1u);
     storage.StartBackups();
     EXPECT_EQ(storage.NumBackupCandidates(), 2u);
     EXPECT_EQ(storage.NumHeldBlocks(), 4u);
-    storage.Complete(cache::StorageDone{commands[0].op_id, {1}, true, {0}});
+    storage.Complete(cache::StorageDone{std::get<StoragePutOperation>(commands[0]).op_id, {1}, true, {0}});
     storage.Detach(read);
     storage.StartBackups();
     commands = storage.TakeCommands();
     ASSERT_EQ(commands.size(), 1u);
-    EXPECT_EQ(commands[0].keys.size(), 2u);
+    EXPECT_EQ(std::get<StoragePutOperation>(commands[0]).keys.size(), 2u);
     EXPECT_EQ(storage.NumBackupCandidates(), 0u);
 }
 

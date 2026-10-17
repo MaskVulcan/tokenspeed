@@ -54,10 +54,10 @@ class _DeviceHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
 
-    def execute(self, execution_plan, planned):
+    def execute(self, execution_plan, planned, *, cache_ops):
         # The harness plans no device work and no batch; trace anything that
         # does appear rather than fail on a missing attr.
-        if execution_plan.pages_to_zero or execution_plan.cache or planned:
+        if execution_plan.pages_to_zero or cache_ops or planned:
             self._trace.append("execute")
         return None
 
@@ -95,7 +95,7 @@ class _EventLoopHarness:
         )
         self._cache_hooks = SimpleNamespace(
             poll_ready_events=lambda: (self.trace.append("poll_cache"), [])[1],
-            count_plan_ops=lambda _plan: self.trace.append("count_cache"),
+            count_ops=lambda _plan: self.trace.append("count_cache"),
         )
         self._pd_hooks = SimpleNamespace(
             poll_transfer_events=lambda: (self.trace.append("poll_pd"), [])[1]

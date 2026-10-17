@@ -55,6 +55,7 @@ from tokenspeed.runtime.cache.transfer.ops import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.engine import scheduler_utils as scheduler_utils_module
+from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.execution.device import DeviceHandle, EncoderModelFacts
 from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
@@ -66,6 +67,10 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 from tokenspeed.runtime.pd.transfer_hooks import PdTransferHooks
+
+
+def _execute(handle, plan, planned):
+    return handle.execute(plan, planned, cache_ops=cache_ops_from_plan(plan).device)
 
 
 class _ForwardThread:
@@ -243,6 +248,10 @@ def wire_ops(monkeypatch):
             LoadBackOp=_LoadBackOp,
             SnapshotOp=_SnapshotBatch,
             RestoreOp=_RestoreBatch,
+            StorageQueryOp=scheduler_utils_module.Cache.StorageQueryOp,
+            StorageGetOp=scheduler_utils_module.Cache.StorageGetOp,
+            StoragePutOp=scheduler_utils_module.Cache.StoragePutOp,
+            StorageCancelOp=scheduler_utils_module.Cache.StorageCancelOp,
         ),
     )
 
@@ -369,7 +378,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
         ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
-    handle.execute(plan, None)
+    _execute(handle, plan, None)
 
     assert trace == [
         "submit",
@@ -415,7 +424,7 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
         ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
-    handle.execute(plan, None)
+    _execute(handle, plan, None)
 
     assert trace == [
         "submit",
@@ -430,7 +439,7 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
 
     # A plan with no pairs submits no copy at all.
     trace.clear()
-    handle.execute(_plan(pages_to_zero=[2], pages_to_copy={"kv": []}), None)
+    _execute(handle, _plan(pages_to_zero=[2], pages_to_copy={"kv": []}), None)
     assert trace == ["submit", ("zero", {"kv": (2,)})]
 
 
@@ -445,9 +454,9 @@ def test_a_failed_page_copy_surfaces_at_the_next_round(wire_ops):
         raise IndexError("local block ID 99 outside [0, 8)")
 
     handle._executor.copy_cache_pages = failing_copy
-    handle.execute(_plan(pages_to_copy={"kv": [(1, 99)]}), None)
+    _execute(handle, _plan(pages_to_copy={"kv": [(1, 99)]}), None)
     with pytest.raises(RuntimeError, match="page copy submission failed"):
-        handle.execute(_plan(), None)
+        _execute(handle, _plan(), None)
 
 
 def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
@@ -485,7 +494,7 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
         ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
-    handle.execute(plan, None)
+    _execute(handle, plan, None)
 
     kinds = [entry[0] if isinstance(entry, tuple) else entry for entry in trace]
     assert kinds == ["submit", "write_backs", "submit", "zero", "submit", "load_backs"]
@@ -542,7 +551,7 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
     planned = _planned(num_extends=1)
     planned.forward_op.request_pool_indices = [6]  # the slot just freed
 
-    handle.execute(plan, planned)
+    _execute(handle, plan, planned)
 
     order = [entry for entry in trace if entry != "submit"]
     assert order == [("store", [6]), "zero", "load_backs", ("forward", [6])]
@@ -555,7 +564,7 @@ def test_page_zeroing_without_l2_submits_only_zeroing():
         ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
-    handle.execute(_plan(pages_to_zero=[3, 4]), None)
+    _execute(handle, _plan(pages_to_zero=[3, 4]), None)
 
     assert trace == ["submit", ("zero", {"kv": (3, 4)})]
 
@@ -564,7 +573,7 @@ def test_a_plan_with_no_device_work_submits_nothing():
     trace: list = []
     handle = _handle(trace, host_cache_executor=SimpleNamespace())
 
-    handle.execute(_plan(), None)
+    _execute(handle, _plan(), None)
 
     assert trace == []
 
@@ -587,7 +596,7 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll(wire_ops):
     )
 
     # Submission itself never raises (fire-and-forget)...
-    handle.execute(_plan(cache=[_WriteBackOp("op")]), None)
+    _execute(handle, _plan(cache=[_WriteBackOp("op")]), None)
     # ...the failure re-raises at the round head, data-plane cause chained.
     with pytest.raises(RuntimeError, match="cache-plan submission failed") as info:
         handle.poll_cache_results()
@@ -667,8 +676,8 @@ def test_the_remote_decode_and_the_arming_ride_the_fifo():
     chunk = _planned(num_extends=1, label="CHUNK")
     remote_decode = SimpleNamespace(request_ids=["done"])
 
-    handle.execute(_plan(), chunk)
-    handle.execute(_plan(remote_decode=remote_decode), None)
+    _execute(handle, _plan(), chunk)
+    _execute(handle, _plan(remote_decode=remote_decode), None)
 
     # Arming is enqueued before the forward it arms; the send follows the
     # forwards whose KV it reads (the scheduler emits a remote decode only
@@ -1203,3 +1212,40 @@ def test_expert_placement_chunk_applies_then_synchronizes_the_execution_stream()
     )
     with pytest.raises(RuntimeError, match="--enable-eplb"):
         handle.apply_expert_placement((0,), rows, moves)
+
+
+def test_device_rejects_storage_commands_before_submitting_any_work():
+    from test.l3_test_utils import storage_ops, storage_scheduler
+
+    plan = storage_scheduler().next_execution_plan()
+    trace = []
+    handle = _handle(trace)
+    with pytest.raises(TypeError, match="unsupported Device cache op"):
+        handle.execute(plan, None, cache_ops=storage_ops(plan))
+    assert trace == []
+
+
+def test_device_consumes_the_explicit_snapshot_without_reading_plan_cache():
+    class Plan:
+        def __init__(self):
+            self.pages_to_zero = {}
+            self.remote_decode = None
+            self.remote_prefill = None
+            self.reads = 0
+
+        def pages_to_copy_arrays(self):
+            return {}
+
+        @property
+        def cache(self):
+            self.reads += 1
+            if self.reads > 1:
+                raise AssertionError("plan.cache was already captured")
+            return ()
+
+    plan = Plan()
+    prepared = cache_ops_from_plan(plan)
+    trace = []
+    handle = _handle(trace)
+    handle.execute(plan, None, cache_ops=prepared.device)
+    assert plan.reads == 1 and trace == []
