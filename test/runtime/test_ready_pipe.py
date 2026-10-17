@@ -21,6 +21,7 @@
 """Tests for the scheduler ready pipe when a child dies before it reports."""
 
 import contextlib
+import multiprocessing as mp
 import os
 import signal
 import sys
@@ -63,17 +64,25 @@ def _never_ready(writer):
     time.sleep(_TIMEOUT_S * 10)
 
 
-def _fail_with_background_peer(exit_kind, writer):
+def _report_close_and_wait(finish_cleanup, writer):
+    writer.send({"status": "ready"})
+    writer.close()
+    finish_cleanup.wait(_TIMEOUT_S * 10)
+
+
+def _fail_with_background_peer(exit_kind, finish_cleanup, writer):
     from tokenspeed.runtime.engine import event_loop as event_loop_module
     from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
     class FailedDeviceBuild:
         def __init__(self, *_args):
             # Stand in for model/device startup, which needs real GPU weights.
-            threading.Thread(target=threading.Event().wait, daemon=False).start()
+            threading.Thread(target=finish_cleanup.wait, daemon=False).start()
             if exit_kind == "system_exit":
                 raise SystemExit(1)
-            raise ValueError("L3 construction failed after starting the PD peer")
+            raise ValueError(
+                "Device construction failed after starting a transport thread"
+            )
 
     class Parent:
         def parent(self):
@@ -98,6 +107,48 @@ def _fail_with_background_peer(exit_kind, writer):
         patch.setattr(event_loop_module, "EventLoop", FailedDeviceBuild)
         patch.setattr(event_loop_module.psutil, "Process", Parent)
         event_loop_module.run_event_loop(args, ports, writer)
+
+
+def _engine_owns_failed_startup_cleanup(writer):
+    from tokenspeed.runtime.entrypoints.engine import Engine
+
+    finish_cleanup = mp.Event()
+    started = [
+        start_process_with_ready_pipe(_never_ready, (), contextlib.nullcontext()),
+        start_process_with_ready_pipe(
+            _fail_with_background_peer,
+            ("exception", finish_cleanup),
+            contextlib.nullcontext(),
+        ),
+    ]
+    # The constructor's existing failure handler calls shutdown before its
+    # frontend has been installed. Bypass only model/network construction.
+    engine = Engine.__new__(Engine)
+    engine.llm = None
+    engine.tokenizer_manager = None
+    try:
+        try:
+            receive_ready_messages(
+                [reader for _, reader in started], [proc for proc, _ in started]
+            )
+        except RuntimeError as exc:
+            engine.shutdown()
+            for proc, _ in started:
+                proc.join(_TIMEOUT_S)
+            writer.send(
+                {
+                    "error": str(exc),
+                    "alive": [proc.is_alive() for proc, _ in started],
+                    "exitcodes": [proc.exitcode for proc, _ in started],
+                }
+            )
+    finally:
+        for proc, reader in started:
+            if proc.is_alive():
+                proc.kill()
+            proc.join(_TIMEOUT_S)
+            reader.close()
+        writer.close()
 
 
 class TestReadyPipe:
@@ -141,7 +192,14 @@ class TestReadyPipe:
             proc, reader = start_process_with_ready_pipe(
                 target, args, contextlib.nullcontext()
             )
-            request.addfinalizer(proc.kill)
+
+            def cleanup():
+                if proc.is_alive():
+                    proc.kill()
+                proc.join(_TIMEOUT_S)
+                reader.close()
+
+            request.addfinalizer(cleanup)
             return proc, reader
 
         return start
@@ -163,18 +221,49 @@ class TestReadyPipe:
         started = [start_process(_never_ready), start_process(_report_then_die)]
         assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
 
-    @pytest.mark.parametrize("exit_kind", ["exception", "system_exit"])
-    def test_failed_startup_reaps_background_peer_without_waiting_for_other_ranks(
-        self, start_process, exit_kind
+    def test_receive_fails_when_reported_rank_closes_pipe_while_alive(
+        self, start_process
     ) -> None:
+        finish_cleanup = mp.Event()
         started = [
             start_process(_never_ready),
-            start_process(_fail_with_background_peer, (exit_kind,)),
+            start_process(_report_close_and_wait, (finish_cleanup,)),
         ]
         failed, _ = started[1]
         assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
+        # Detecting EOF must neither wait for nor terminate the worker's cleanup.
+        assert failed.is_alive()
+        assert failed.exitcode is None
+        finish_cleanup.set()
+        failed.join(_TIMEOUT_S)
+        assert failed.exitcode == 0
+
+    @pytest.mark.parametrize("exit_kind", ["exception", "system_exit"])
+    def test_failed_startup_reports_without_killing_worker_cleanup(
+        self, start_process, exit_kind
+    ) -> None:
+        finish_cleanup = mp.Event()
+        started = [
+            start_process(_never_ready),
+            start_process(_fail_with_background_peer, (exit_kind, finish_cleanup)),
+        ]
+        failed, _ = started[1]
+        assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
+        assert failed.is_alive()
+        finish_cleanup.set()
+        failed.join(_TIMEOUT_S)
         assert not failed.is_alive()
-        assert failed.exitcode == -signal.SIGKILL
+        assert failed.exitcode == (1 if exit_kind == "system_exit" else 0)
+
+    def test_engine_failure_cleanup_reaps_workers(self, start_process) -> None:
+        supervisor, reader = start_process(_engine_owns_failed_startup_cleanup)
+        assert reader.poll(_TIMEOUT_S), "launcher failed to unwind startup"
+        result = reader.recv()
+        assert "Scheduler process 1" in result["error"]
+        assert result["alive"] == [False, False]
+        assert result["exitcodes"] == [-signal.SIGKILL, -signal.SIGKILL]
+        supervisor.join(_TIMEOUT_S)
+        assert supervisor.exitcode == 0
 
 
 if __name__ == "__main__":

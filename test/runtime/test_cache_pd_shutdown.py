@@ -39,6 +39,58 @@ class _PauseHarness:
         self._trace.append("pause_finish")
 
 
+def test_device_shutdown_failure_still_retires_l3_resources() -> None:
+    from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
+    from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+    from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
+    from tokenspeed.runtime.cache.l3.host_store import L3HostStore
+
+    class HostAllocation:
+        """Substitute only the GPU-pinned allocation, not storage I/O."""
+
+        def __init__(self) -> None:
+            self.host_buffer = bytearray(b"data")
+
+    class FailedDevice:
+        def shutdown_transfers(self) -> None:
+            pass
+
+        def shutdown_cache(self) -> None:
+            raise RuntimeError("Device copy failed")
+
+    class ControlResource:
+        def close(self) -> None:
+            pass
+
+    host = HostAllocation()
+    backend = MemoryKvStore()
+    backend.batch_put_from(("live",), host.host_buffer, (0,), (4,))
+    executor = L3Executor(
+        L3HostStore(backend, host, key_prefix="close", rank=0, ownership=None),
+        config=StorageRuntimeConfig.from_extra_config(
+            None, host_blocks=16, prefix_granularity=2
+        ),
+        prefix_for_weight_version=None,
+    )
+    workers = tuple(executor._threads)
+    executor.submit(StorageJob(1, "query", ("live",), (), ()))
+    # Model/device and network construction are the only substituted owners.
+    loop = EventLoop.__new__(EventLoop)
+    loop.load_reporter = ControlResource()
+    loop._eplb_hooks = ControlResource()
+    loop.send_to_tokenizer = None
+    loop.kv_transfer = None
+    loop._device = FailedDevice()
+    loop._l3 = executor
+    try:
+        with pytest.raises(RuntimeError, match="Device copy failed"):
+            loop.close()
+        assert all(not worker.is_alive() for worker in workers)
+        assert backend.batch_exists(("live",)) == [False]
+    finally:
+        executor.close(timeout_s=5)
+
+
 class _SchedulerHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
@@ -282,9 +334,13 @@ def test_run_event_loop_reports_exit_and_finally_closes(
         def __init__(self) -> None:
             self.messages: list[object] = []
             self.closed = False
+            self.closed = False
 
         def send(self, message: object) -> None:
             self.messages.append(message)
+
+        def close(self) -> None:
+            self.closed = True
 
         def close(self) -> None:
             self.closed = True
@@ -357,6 +413,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
         else "shutdown_requested=False signal=None"
     ) in exit_logs[0][0]
     assert parent_signals == []
+    assert pipe_writer.closed
     assert len(pipe_writer.messages) == 1
     assert pipe_writer.closed
     assert pipe_writer.messages[0]["status"] == "ready"

@@ -94,8 +94,10 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.launcher import interface_for_host
 from tokenspeed.runtime.utils.process import (
+    begin_process_shutdown,
     kill_process_tree,
     receive_ready_messages,
+    register_child_failure_signals,
     start_process_with_ready_pipe,
 )
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
@@ -150,7 +152,10 @@ class Engine(EngineBase):
                 port_args=self.port_args,
             )
         except BaseException:
-            self.shutdown()
+            try:
+                begin_process_shutdown()
+            finally:
+                self.shutdown()
             raise
         self.tokenizer_manager = tokenizer_manager
         self.scheduler_info = scheduler_info
@@ -603,17 +608,9 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set ulimit
     set_ulimit()
 
-    # Install a launch-phase SIGQUIT handler so a failing child tears down the
-    # whole local process tree instead of leaving orphaned workers behind.
-    # TokenizerManager may replace this handler later during steady-state
-    # serving.
-    def launch_phase_sigquit_handler(signum, frame):
-        logger.error(
-            "Received sigquit from a child process. It usually means the child failed."
-        )
-        kill_process_tree(os.getpid())
-
-    signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+    # Let Engine.__init__ or the headless supervisor own process-tree cleanup.
+    # A signal callback must not log or acquire locks during an interrupted call.
+    register_child_failure_signals()
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
