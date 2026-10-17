@@ -1615,6 +1615,10 @@ def run_event_loop(
         logger.error(f"Scheduler hit an exception: {traceback!s}")
         parent_process.send_signal(signal.SIGUSR1)
     finally:
+        # A partial constructor can leave non-daemon transport threads alive.
+        # Multiprocessing still owns our argument tuple while joining them;
+        # close explicitly so the parent observes failed startup through EOF.
+        pipe_writer.close()
         # SystemExit/KeyboardInterrupt bypass the Exception handler above;
         # report their traceback without swallowing or changing the exit status.
         exception_info = sys.exc_info()

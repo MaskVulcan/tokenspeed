@@ -63,13 +63,41 @@ def _never_ready(writer):
     time.sleep(_TIMEOUT_S * 10)
 
 
-def _fail_with_background_peer(writer):
-    # Like a late L3 construction failure after PD started its peer threads.
-    # The normal loop-owned SIGTERM handler cannot stop a partial constructor.
-    shutdown = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_args: shutdown.set())
-    threading.Thread(target=threading.Event().wait, daemon=False).start()
-    writer.close()
+def _fail_with_background_peer(exit_kind, writer):
+    from tokenspeed.runtime.engine import event_loop as event_loop_module
+    from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+
+    class FailedDeviceBuild:
+        def __init__(self, *_args):
+            # Stand in for model/device startup, which needs real GPU weights.
+            threading.Thread(target=threading.Event().wait, daemon=False).start()
+            if exit_kind == "system_exit":
+                raise SystemExit(1)
+            raise ValueError("L3 construction failed after starting the PD peer")
+
+    class Parent:
+        def parent(self):
+            return self
+
+        def send_signal(self, _signum):
+            # Do not deliver the scheduler's failure signal to pytest itself.
+            pass
+
+    args = ServerArgs(model="unused", device="cpu", world_size=1, nprocs_per_node=1)
+    args.mapping.rank = 0
+    ports = PortArgs(
+        tokenizer_ipc_name="unused",
+        scheduler_input_ipc_name="unused",
+        nccl_port=0,
+        dist_init_addr="localhost:0",
+        rpc_ipc_name="unused",
+        metrics_ipc_name="unused",
+        tokenizer_worker_ipc_name=None,
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(event_loop_module, "EventLoop", FailedDeviceBuild)
+        patch.setattr(event_loop_module.psutil, "Process", Parent)
+        event_loop_module.run_event_loop(args, ports, writer)
 
 
 class TestReadyPipe:
@@ -135,12 +163,13 @@ class TestReadyPipe:
         started = [start_process(_never_ready), start_process(_report_then_die)]
         assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
 
+    @pytest.mark.parametrize("exit_kind", ["exception", "system_exit"])
     def test_failed_startup_reaps_background_peer_without_waiting_for_other_ranks(
-        self, start_process
+        self, start_process, exit_kind
     ) -> None:
         started = [
             start_process(_never_ready),
-            start_process(_fail_with_background_peer),
+            start_process(_fail_with_background_peer, (exit_kind,)),
         ]
         failed, _ = started[1]
         assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
