@@ -2043,14 +2043,15 @@ class ModelExecutor:
             self.token_to_kv_pool.arena.copy_blocks(local_pairs)
 
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
-        """Clear newly owned pages and return a CUDA completion event when needed.
+        """Sanitize newly owned pages when needed and return their GPU reuse fence.
 
         Runs on ``default_stream``, ordered behind the forwards in flight on
         ``execution_stream``: the pages' previous owner may still be writing
         them. The plan's later work on the default stream (the load-backs'
         start event, the remote prefill's fence) inherits the order; the next
         forward's prologue waits on the default stream and so runs after the
-        zeroing.
+        zeroing. External RDMA writes cannot inherit a CUDA stream dependency:
+        they need this event even when a pure-attention pool skips sanitization.
         """
         if not pages:
             return None
@@ -2065,12 +2066,12 @@ class ModelExecutor:
                 rank=self._cache_kvp_rank,
             )
 
-        def sanitize(pool, pool_pages) -> bool:
+        def sanitize(pool, pool_pages) -> None:
             zero_new_blocks = getattr(pool, "zero_new_blocks", None)
             zero_pages = getattr(pool, "zero_pages", None)
             if isinstance(pool_pages, Mapping) and callable(zero_new_blocks):
                 zero_new_blocks(pool_pages)
-                return True
+                return
             if callable(zero_pages):
                 page_ids = (
                     sorted(
@@ -2084,16 +2085,15 @@ class ModelExecutor:
                     else pool_pages
                 )
                 zero_pages(page_ids)
-                return True
+                return
             if getattr(pool, "requires_page_zeroing", False):
                 raise RuntimeError(
                     "scheduler emitted pages to zero but an active KV "
                     "pool does not implement physical-page sanitization"
                 )
-            return False
 
         with nvtx_range("zero_cache_pages", color="purple"):
-            sanitized = sanitize(self.token_to_kv_pool, pages)
+            sanitize(self.token_to_kv_pool, pages)
             draft_pool = self.draft_token_to_kv_pool
             if draft_pool is not None and getattr(
                 draft_pool,
@@ -2114,9 +2114,7 @@ class ModelExecutor:
                         if group_id in draft_group_ids
                     }
                 if draft_pages:
-                    sanitized = sanitize(draft_pool, draft_pages) or sanitized
-        if not sanitized:
-            return None
+                    sanitize(draft_pool, draft_pages)
         if torch.device(self.device).type not in {"cuda", "npu"}:
             return None
         done = self.device_module.Event()

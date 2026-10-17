@@ -57,7 +57,11 @@ def compute_host_lcm_block_bytes(layout: CacheTransferLayout) -> int:
 
 
 class HostCacheStorage:
-    """One compact Host allocation indexed by scheduler CacheBlock IDs."""
+    """Shared Host allocation indexed by scheduler CacheBlock IDs.
+
+    L2 and L3 retain this resource independently. Construction consumes the
+    transfer layout but never retains its device buffers.
+    """
 
     def __init__(
         self,
@@ -67,7 +71,10 @@ class HostCacheStorage:
     ):
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
-        self.layout = layout
+        self.group_ids = tuple(group.group_id for group in layout.groups)
+        self.group_packing = tuple(
+            group.cache_blocks_per_lcm_block for group in layout.groups
+        )
         (
             self.host_cache_block_bytes,
             self.host_field_offsets,
@@ -87,16 +94,15 @@ class HostCacheStorage:
         """Return the packed byte offset for one non-null CacheBlock."""
 
         try:
-            group = self.layout.groups[group_index]
+            packing = self.group_packing[group_index]
             host_cache_block_bytes = self.host_cache_block_bytes[group_index]
         except IndexError as exc:
             raise IndexError(f"unknown cache group index {group_index}") from exc
-        packing = group.cache_blocks_per_lcm_block
         max_block_id = self.num_host_lcm_blocks * packing
         if block_id <= 0 or block_id > max_block_id:
             raise IndexError(
                 f"block_id {block_id} outside [1, {max_block_id}] for "
-                f"group {group.group_id!r}"
+                f"group {self.group_ids[group_index]!r}"
             )
         zero_based = block_id - 1
         parent_index, child_index = divmod(zero_based, packing)

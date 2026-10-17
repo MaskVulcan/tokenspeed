@@ -82,21 +82,6 @@ class _FakeRestoreBatch(_FakeSnapshotBatch):
         self.source_tiers = [[1]] * len(op_ids)
 
 
-class _FakePrefetchBatch:
-    """The wire face of ``Cache.PrefetchOp``: one row per waiting request."""
-
-    def __init__(self, op_ids) -> None:
-        self.op_ids = list(op_ids)
-        self.request_ids = [f"r{op_id}" for op_id in op_ids]
-        self.first_pages = [0] * len(op_ids)
-        self.num_pages = [1] * len(op_ids)
-        self.group_ids = [[0]] * len(op_ids)
-        self.host_pages = [[1]] * len(op_ids)
-        self.content_hashes = [["h"]] * len(op_ids)
-        self.page_offsets = [[0]] * len(op_ids)
-        self.page_indices = [[0]] * len(op_ids)
-
-
 class _Device:
     """The DeviceHandle surface the hooks use. Submission rides
     ``DeviceHandle.execute`` with the rest of the round's plan-derived device
@@ -167,29 +152,6 @@ def _install_collectives(
     monkeypatch.setattr(cache_hooks_module.dist, "all_gather_object", all_gather_object)
 
 
-def test_collective_doubles_require_op_and_group() -> None:
-    tree = ast.parse(Path(__file__).read_text())
-    found_reduce = False
-    found_gather = False
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef):
-            continue
-        defaults = dict(
-            zip((arg.arg for arg in node.args.kwonlyargs), node.args.kw_defaults)
-        )
-        if node.name == "_all_reduce":
-            found_reduce = True
-            assert node.args.defaults == []
-            assert defaults["op"] is None
-            assert defaults["group"] is None
-        elif node.name == "_all_gather_object":
-            found_gather = True
-            assert node.args.defaults == []
-            assert defaults["group"] is None
-    assert found_reduce
-    assert found_gather
-
-
 @pytest.fixture()
 def fake_cache_ops(monkeypatch: pytest.MonkeyPatch):
     # The C++ op bindings (Cache.WriteBackOp, Cache.SnapshotOp, ...) expose no
@@ -203,7 +165,6 @@ def fake_cache_ops(monkeypatch: pytest.MonkeyPatch):
             LoadBackOp=(),
             SnapshotOp=_FakeSnapshotBatch,
             RestoreOp=_FakeRestoreBatch,
-            PrefetchOp=_FakePrefetchBatch,
         ),
     )
 
@@ -250,7 +211,7 @@ def test_snapshot_and_restore_batches_count_one_ticket_per_request(
             _FakeWriteBackOp(op_ids=[1]),
             _FakeSnapshotBatch(op_ids=[2, 3]),
             _FakeRestoreBatch(op_ids=[4]),
-            _FakePrefetchBatch(op_ids=[5, 6]),
+            _FakeSnapshotBatch(op_ids=[5, 6]),
         ]
     )
 
@@ -260,13 +221,12 @@ def test_snapshot_and_restore_batches_count_one_ticket_per_request(
     for event in (
         _cache_event("SnapshotDoneEvent", 2),
         _cache_event("RestoreDoneEvent", 4),
-        Cache.PrefetchDoneEvent(5, 3),
+        _cache_event("SnapshotDoneEvent", 5),
     ):
         device.results = [event]
         (ready,) = hooks.poll_ready_events()
         assert type(ready).__name__ == type(event).__name__
         assert ready.op_id == event.op_id
-    assert ready.landed_pages == 3
     assert hooks._num_inflight == 3
 
 
@@ -529,42 +489,22 @@ def test_tickets_stay_open_until_the_replica_commits_them(
     assert hooks.poll_ready_events() == [] and collectives == []
 
 
-def test_replica_backup_failure_raises_after_poll_all_reduce(
-    fake_cache_ops, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_d2h_ack_is_independent_of_backend_health(fake_cache_ops):
     device = _Device()
-    device.backup_failed = True
-    pp_group = object()
     hooks = _hooks(
         device,
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
-        pp_size=2,
-        pp_cpu_group=pp_group,
+        pp_size=1,
+        pp_cpu_group=None,
     )
     hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
-
-    reduce_groups: list = []
-    gather_groups: list = []
-
-    def _all_reduce(tensor, *, op, group) -> None:
-        del op
-        reduce_groups.append(group)
-        tensor[1] = max(int(tensor[1].item()), 1)
-
-    def _all_gather_object(output, obj, *, group) -> None:
-        gather_groups.append(group)
-        del output, obj
-
-    _install_collectives(
-        monkeypatch, all_reduce=_all_reduce, all_gather_object=_all_gather_object
-    )
-
-    with pytest.raises(RuntimeError, match="L3 backup failed on a replica rank"):
-        hooks.poll_ready_events()
-    assert reduce_groups == [pp_group]
-    assert gather_groups == []
+    event = Cache.WriteBackDoneEvent()
+    event.op_id = 7
+    device.results = [event]
+    device.backup_failed = True
+    assert [x.op_id for x in hooks.poll_ready_events()] == [7]
 
 
 if __name__ == "__main__":
