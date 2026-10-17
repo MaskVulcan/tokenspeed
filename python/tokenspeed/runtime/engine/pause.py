@@ -102,7 +102,7 @@ def scheduler_drained(scheduler) -> bool:
     """True when the scheduler holds no requests that need a forward pass.
 
     Covers every state that still needs a forward pass. Submitted,
-    Retracted and Restoring requests are all included in
+    Prefetching, Retracted and Restoring requests are all included in
     waiting_size, so a request suspended with a retraction image holds the
     drain until it is restored and finishes (a weight update therefore never
     flushes an image of old-weight KV that a later restore would resume under

@@ -20,10 +20,10 @@
 
 """The runtime's side of a retraction, driven against the real C++ scheduler.
 
-No engine: the scheduler is built through ``make_config`` exactly as the event
-loop builds it, its plans are adapted by ``cache_ops_from_plan`` exactly as
-The shared cache adapter prepares them for ``DeviceHandle.execute``, and the ACKs the Host cache executor
-would produce are fed back through ``CacheOpHooks`` and ``advance_scheduler``
+No engine: the scheduler is built through ``make_config`` as in the event
+loop. ``cache_ops_from_plan`` prepares one Device-copy tuple for the hooks
+to count and ``DeviceHandle.execute`` to consume. The Host cache executor's
+ACKs are fed back through ``CacheOpHooks`` and ``advance_scheduler``
 exactly as the loop feeds them. The forced-retraction knob
 (``debug_force_retraction_interval``) stands in for capacity pressure, so a
 decoding request is retracted, imaged, restored and resumes ``Decoding`` with
