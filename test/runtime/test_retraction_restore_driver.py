@@ -22,7 +22,7 @@
 
 No engine: the scheduler is built through ``make_config`` exactly as the event
 loop builds it, its plans are adapted by ``cache_ops_from_plan`` exactly as
-``DeviceHandle.execute`` adapts them, and the ACKs the Host cache executor
+The shared cache adapter prepares them for ``DeviceHandle.execute``, and the ACKs the Host cache executor
 would produce are fed back through ``CacheOpHooks`` and ``advance_scheduler``
 exactly as the loop feeds them. The forced-retraction knob
 (``debug_force_retraction_interval``) stands in for capacity pressure, so a
@@ -251,11 +251,11 @@ def test_forced_retraction_images_restores_and_resumes_decoding(l2: bool) -> Non
 
     # Until every store's ACK lands the image is not landed: no restore.
     rnd = driver.round()
-    assert rnd.ops == [] and rnd.forwards == []
+    assert rnd.ops == () and rnd.forwards == []
     driver.complete([store])
     if l2:
         rnd = driver.round()
-        assert rnd.ops == [] and rnd.forwards == []
+        assert rnd.ops == () and rnd.forwards == []
         driver.complete([tail_store])
 
     # The ACKs make the image eligible; the next plan restores: one op whose
@@ -279,7 +279,7 @@ def test_forced_retraction_images_restores_and_resumes_decoding(l2: bool) -> Non
         assert all(t.content_hash == "" for t in restore.transfers)
     assert scheduler.retracted_size() == 1 and scheduler.decoding_size() == 0
     rnd = driver.round()
-    assert rnd.ops == [] and rnd.forwards == []
+    assert rnd.ops == () and rnd.forwards == []
     driver.complete([restore])
 
     # RestoreDone: Decoding again, same token count, nothing left in the pool
@@ -318,7 +318,7 @@ def test_an_aborted_victims_store_is_still_acknowledged_and_frees_its_image() ->
     assert scheduler.retracted_size() == 0 and scheduler.waiting_size() == 0
     driver.complete([store])
     rnd = driver.round()
-    assert rnd.ops == [] and rnd.forwards == []
+    assert rnd.ops == () and rnd.forwards == []
     assert scheduler.snapshot_pool_free_blocks() == pool_free
     assert driver.acked == driver.tickets
 
@@ -330,7 +330,7 @@ def test_the_knob_is_off_by_default() -> None:
     _prefill_and_decode_once(driver)
     for _ in range(4):
         rnd = driver.round()
-        assert rnd.ops == [] and len(rnd.forwards) == 1
+        assert rnd.ops == () and len(rnd.forwards) == 1
         driver.land(rnd.forwards[0])
     assert scheduler.retracted_size() == 0
 

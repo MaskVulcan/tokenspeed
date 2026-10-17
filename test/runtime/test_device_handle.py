@@ -358,7 +358,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
     named: the copies are told which stream wrote the pages and which one
     the fence lands on; the loads are told which stream zeroed their
     destinations. The executor sees the plan's cache ops once, adapted, and
-    the same list on both submissions."""
+    the same tuple on both submissions."""
     trace: list = []
     store, load = _WriteBackOp("store"), _LoadBackOp("load")
     plan = _plan(pages_to_zero=[3, 4], cache=[store, load])
@@ -382,11 +382,11 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
 
     assert trace == [
         "submit",
-        ("write_backs", [store, load], "execution-stream", "default-stream"),
+        ("write_backs", (store, load), "execution-stream", "default-stream"),
         "submit",
         ("zero", {"kv": (3, 4)}),
         "submit",
-        ("load_backs", [store, load], "default-stream"),
+        ("load_backs", (store, load), "default-stream"),
     ]
     # Polling never touches the FIFO — the round head must not wait on it.
     assert handle.poll_cache_results() == ["done"]
@@ -428,13 +428,13 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
 
     assert trace == [
         "submit",
-        ("write_backs", [store]),
+        ("write_backs", (store,)),
         "submit",
         ("copy", {"kv": [[3, 8], [5, 9]]}),
         "submit",
         ("zero", {"kv": (3,)}),
         "submit",
-        ("load_backs", [store]),
+        ("load_backs", (store,)),
     ]
 
     # A plan with no pairs submits no copy at all.
