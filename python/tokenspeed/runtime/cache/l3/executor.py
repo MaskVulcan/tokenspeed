@@ -619,7 +619,9 @@ class L3Executor:
             )
 
     def _shutdown_workers(self, *, timeout_s: float) -> None:
-        self._stopping.set()
+        # A submit must enqueue before workers can observe stop and an empty queue.
+        with self._lock:
+            self._stopping.set()
         deadline = time.monotonic() + timeout_s
         for thread in self._threads:
             thread.join(max(0, deadline - time.monotonic()))

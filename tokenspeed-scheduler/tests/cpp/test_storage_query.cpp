@@ -124,6 +124,37 @@ bool Has(std::span<const CacheKey> keys, const CacheKey& key) {
 
 class StorageQueryHighestTest : public ::testing::TestWithParam<std::size_t> {};
 
+TEST(StorageQueryTest, QueryBoundsFollowTheAvailableHashes) {
+    QueryCache cache(4, FullAndStates(4, 2, 1), 64);
+    QueryPrompt prompt(24, 4);
+    auto prefix = prompt.Prefix(24, false);
+    prefix.prefix_hashes = std::span{prompt.hashes}.first(2);
+
+    const auto query = cache.coordinator.MissingStorageKeys(prefix, 64);
+    EXPECT_EQ(query.max_tokens, 8);
+    EXPECT_EQ(query.keys.size(), 6u);
+    for (const auto& key : query.keys) {
+        EXPECT_TRUE(key.content_hash == prompt.hashes[0] || key.content_hash == prompt.hashes[1]);
+    }
+    EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), 0);
+}
+
+TEST(StorageQueryTest, AvailableHashesStillAllowATailInTheFollowingPage) {
+    QueryCache cache(4, FullAndStates(4, 2, 1), 64);
+    QueryPrompt prompt(24, 4);
+    const auto tail_prefix = prompt.Prefix(10, true);
+    const CacheKey warm_state{.group_id = 1, .content_hash = tail_prefix.tail->hash};
+    cache.Warm(std::array{warm_state});
+    cache.coordinator.CacheHostTail(prompt.hashes[1], *tail_prefix.tail);
+    auto prefix = prompt.Prefix(24, false);
+    prefix.prefix_hashes = std::span{prompt.hashes}.first(2);
+
+    const auto query = cache.coordinator.MissingStorageKeys(prefix, 64);
+    EXPECT_EQ(query.max_tokens, 10);
+    EXPECT_TRUE(Has(query.keys, {.group_id = 0, .content_hash = tail_prefix.tail->hash, .page_offset = 0}));
+    EXPECT_FALSE(Has(query.keys, warm_state));
+}
+
 TEST_P(StorageQueryHighestTest, RestoresTheHighestCheckpointWithinTheActualKeyBudget) {
     QueryCache cache(128, FullAndStates(128, 128, 7), 256);
     QueryPrompt prompt(4097, 128);

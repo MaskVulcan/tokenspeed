@@ -89,7 +89,9 @@ completion protocol; storage completion never substitutes for an H2D fence.
    minimum, bypasses L3. Otherwise it considers a bounded extension of that
    prefix, respecting replay/logprob limits and group geometry. It expands
    full prefix boundaries and matching tails from the local `TailTable`, plus
-   the exact reusable request bound. Query credits first cover the longest
+   the exact reusable request bound. Complete boundaries are limited to the
+   supplied prefix hashes; those hashes can also verify tails in the following
+   page. Query credits first cover the longest
    boundary whose complete missing dependencies fit: Full history, the SWA
    window and each State checkpoint at that boundary. Shorter fallback
    boundaries contribute their distinct missing keys only when the whole
@@ -369,6 +371,9 @@ Shutdown attempts device-copy cleanup and L3 retirement independently from the
 control plane. L3 joins its workers with a deadline and then closes its backend;
 if native retirement remains unknown it refuses backend close/Host deregistration
 and retains the backend and Host allocation even if the runtime owner is collected.
+Stopping workers is serialized with submission so every accepted job completes
+or is rejected before the backend closes. Waiting for worker exit holds no
+submission lock.
 
 ## Initial scope and validation
 
@@ -383,6 +388,8 @@ Ready expiration are different counters; client detachment increments neither.
 Pressure bypasses and dropped backup candidate keys have separate counters;
 the admission gate is a mirrored scheduler gauge. These do not count unique
 remote objects or saved prefill tokens.
+Pressure bypasses count storage-eligible requests that skip or stop preparation
+because the gate is closed; decode and prefix-cache-disabled requests are excluded.
 
 Health state/epoch and unproven native retirement are separate gauges. Reading
 health never consumes a recovery probe. Snapshots carry no request IDs or object

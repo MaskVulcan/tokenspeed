@@ -1647,6 +1647,30 @@ class TestFactoryTest:
 
 
 class TestMooncakeConfigTest:
+    @pytest.mark.parametrize("unknown", ["protocal", "asnyc", "master_server_adress"])
+    def test_unknown_options_are_rejected(self, unknown):
+        with pytest.raises(
+            ValueError, match=f"Unsupported Mooncake options:.*{unknown}"
+        ):
+            MooncakeStoreConfig.from_mapping(
+                {"master_server_address": "127.0.0.1:50051", unknown: "rdma"}
+            )
+
+    def test_shared_async_options_preserve_explicit_connection_settings(self):
+        config = MooncakeStoreConfig.from_mapping(
+            {
+                "master_server_address": "127.0.0.1:50051",
+                "client_server_address": "127.0.0.1:50052",
+                "protocol": "rdma",
+                "global_segment_size": 0,
+                "async": {"read_workers": 3},
+            }
+        )
+        assert config.master_server_address == "127.0.0.1:50051"
+        assert config.client_server_address == "127.0.0.1:50052"
+        assert config.protocol == "rdma"
+        assert config.global_segment_size == 0
+
     def test_from_mapping_and_size_suffixes(self):
         saved = {
             key: os.environ.pop(key)

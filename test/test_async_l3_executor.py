@@ -548,6 +548,54 @@ def test_malformed_object_failure_facts_cannot_publish(object_failures):
         e.close(timeout_s=2)
 
 
+def test_close_completes_queued_and_concurrent_submissions_without_backend_access():
+    started, release, stopped = threading.Event(), threading.Event(), threading.Event()
+    close_errors = []
+
+    class Backend(MemoryKvStore):
+        def batch_get_into_result(self, *args):
+            started.set()
+            assert release.wait(3)
+            return super().batch_get_into_result(*args)
+
+    backend = Backend()
+    backend.batch_put_from(("a",), bytearray(b"data"), (0,), (4,))
+    e = executor(backend, cfg=replace(config(), read_workers=1))
+
+    def close():
+        try:
+            e.close(timeout_s=2)
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            stopped.set()
+
+    closer = threading.Thread(target=close)
+    try:
+        e.submit(StorageJob(1, "get", ("a",), (0,), (4,)))
+        assert started.wait(1)
+        e.submit(StorageJob(2, "get", ("a",), (4,), (4,)))
+        closer.start()
+        assert e._stopping.wait(1)
+        e.submit(StorageJob(3, "get", ("a",), (8,), (4,)))
+        assert not stopped.is_set()
+        release.set()
+        assert stopped.wait(3)
+        assert not close_errors
+        completions = {item.op_id: item for item in wait_results(e, 3)}
+        assert completions[1].success == (True,)
+        assert completions[2].success == completions[3].success == (False,)
+        assert all(item.retired for item in completions.values())
+        assert e.host_storage.host_buffer[:12] == b"data" + bytes(8)
+        assert backend.batch_exists(("a",)) == [False]
+        assert e.is_idle()
+    finally:
+        release.set()
+        if closer.ident is not None:
+            closer.join(3)
+        e.close(timeout_s=2)
+
+
 def test_close_waits_for_native_retirement_and_preserves_host_owner():
     started, release = threading.Event(), threading.Event()
 

@@ -25,7 +25,7 @@ import tokenspeed_scheduler as ts
 from conftest import _advance, _spec, storage_ops
 
 
-def scheduler(*, role, groups=1, host=32, timeout=100):
+def scheduler_config(*, role, groups, host, timeout):
     cfg = ts.SchedulerConfig()
     cfg.role = role
     cfg.prefix_granularity = 2
@@ -57,7 +57,13 @@ def scheduler(*, role, groups=1, host=32, timeout=100):
         )
         for i in range(groups)
     ]
-    result = ts.Scheduler(cfg)
+    return cfg
+
+
+def scheduler(*, role, groups=1, host=32, timeout=100):
+    result = ts.Scheduler(
+        scheduler_config(role=role, groups=groups, host=host, timeout=timeout)
+    )
     tick(result, 1, forward=True, storage=True)
     return result
 
@@ -327,6 +333,23 @@ def test_pressure_bypasses_new_requests_and_reopens_only_below_low_watermarks():
     s.submit_requests([_spec("recovered", list(range(40, 48)))])
     plan = s.next_execution_plan()
     assert any(op.kind == ts.StorageKind.Query for op in storage_ops(plan))
+
+
+@pytest.mark.parametrize(
+    "role,disable_prefix_cache",
+    [(ts.SchedulerConfig.Role.D, False), (ts.SchedulerConfig.Role.Fused, True)],
+)
+def test_pressure_does_not_count_requests_that_cannot_use_l3(
+    role, disable_prefix_cache
+):
+    cfg = scheduler_config(role=role, groups=1, host=32, timeout=10000)
+    cfg.disable_prefix_cache = disable_prefix_cache
+    s = ts.Scheduler(cfg)
+    pressure_tick(s, 1, queued=8, byte_count=0, age=0)
+    s.submit_requests([_spec("ineligible", list(range(8)))])
+    assert not storage_ops(s.next_execution_plan())
+    assert s.storage_stats().pressure_gate_closed
+    assert s.storage_stats().pressure_bypasses == 0
 
 
 def test_pressure_detaches_query_without_waiting_for_deadline_or_issuing_get():

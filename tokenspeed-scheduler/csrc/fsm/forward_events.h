@@ -162,8 +162,6 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(Bootstrapping&&);
     Finished operator()(Submitted&&);
     Finished operator()(Prefetching&&);
-    // The op in flight keeps the Host blocks until its ACK; only the
-    // request's own pins drop here.
     Finished operator()(Prefilling&& state);
     Finished operator()(RemotePrefilling&& state);
     Finished operator()(PrefillDone&& state);

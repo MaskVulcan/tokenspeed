@@ -1200,6 +1200,7 @@ explicitly. Without JSON connection settings, the client reads
 `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other Mooncake environment
 settings. `global_segment_size` defaults to 4 GiB, so explicitly set `0` for
 clients that must not mount storage. The default tenant is `default`.
+Unknown Mooncake connection keys are rejected at startup.
 
 **Asynchronous preparation before admission.** Queries and GETs hold no
 Device pages or request-pool slots. Once a GET has retired on every owner,
