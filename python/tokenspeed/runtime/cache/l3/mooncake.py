@@ -31,7 +31,7 @@ import logging
 import os
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 from tokenspeed.runtime.cache.l3.backend import host_buffer_ptr
@@ -93,6 +93,13 @@ class MooncakeStoreConfig:
     @staticmethod
     def from_mapping(extra_config: dict[str, Any] | None) -> MooncakeStoreConfig:
         extra_config = extra_config or {}
+        unknown = (
+            extra_config.keys()
+            - {field.name for field in fields(MooncakeStoreConfig)}
+            - {"async"}
+        )
+        if unknown:
+            raise ValueError(f"Unsupported Mooncake options: {sorted(unknown)}")
         master = extra_config.get("master_server_address") or os.environ.get(
             "MOONCAKE_MASTER", ""
         )

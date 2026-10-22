@@ -1757,13 +1757,18 @@ CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const Prompt
     const auto floor = std::max(local.device.full_page_tokens, local.host.full_page_tokens);
     query.max_tokens = local_tokens;
     if (max_keys == 0 || prompt.max_tokens <= local_tokens) return query;
+    const auto full_pages =
+        std::min(static_cast<std::int32_t>(prompt.prefix_hashes.size()), prompt.max_tokens / prefix_granularity_);
+    // Known hashes cover these full pages and can verify a tail in the next one.
+    const auto max_candidate_tokens = static_cast<std::int32_t>(std::min<std::int64_t>(
+        prompt.max_tokens, (static_cast<std::int64_t>(full_pages) + 1) * prefix_granularity_ - 1));
     struct Candidate {
         std::int32_t full_tokens;
         std::int32_t tail_tokens;
         ContentHash hash;
     };
     std::vector<Candidate> candidates;
-    forEachCandidateBoundary(prompt, floor, prompt.max_tokens,
+    forEachCandidateBoundary(prompt, floor, max_candidate_tokens,
                              [&](std::int32_t full_tokens, std::int32_t tail_tokens, const ContentHash& hash) {
                                  if (full_tokens + tail_tokens <= local_tokens) return true;
                                  if (tail_tokens > 0) {
@@ -1784,7 +1789,7 @@ CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const Prompt
     for (const std::size_t i : match_order_) {
         const auto per_prefix = BlocksPerBoundary(static_cast<std::int32_t>(i));
         const auto begin = static_cast<std::size_t>(floor / prefix_granularity_ * per_prefix);
-        const auto end = static_cast<std::size_t>(prompt.max_tokens / prefix_granularity_ * per_prefix);
+        const auto end = static_cast<std::size_t>(full_pages) * per_prefix;
         for (std::size_t j = begin; j < end; ++j) possible.insert(local.group_keys[i][j]);
         for (const auto& candidate : candidates) {
             if (candidate.tail_tokens > 0) {
@@ -1838,19 +1843,21 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
         auto probe = probeTier<CacheTier::kHost>(candidate, local.group_keys, match_order_, floor, true, &remote);
         if (probe.num_common_tokens <= local.device.num_common_tokens) return {};
         StorageReservation result;
+        std::vector<CacheBlockRef> warm_blocks;
         std::vector<std::uint32_t> groups;
         std::vector<std::int32_t> buckets;
         const auto pin = [&](const CacheKey& key, std::int32_t logical_block) {
             auto ref = AcquireHostCachedBlock(key);
             if (ref) {
-                result.warm_blocks.push_back(std::move(ref));
+                warm_blocks.push_back(std::move(ref));
             } else {
                 result.keys.push_back(key);
                 groups.push_back(key.group_id);
                 buckets.push_back(logical_block % groups_[key.group_id].Spec().shard_count);
             }
         };
-        // Pin every warm dependency before any allocation can evict another hit.
+        // Protect warm dependencies only while allocating destinations. They
+        // stay evictable during I/O; ordinary admission matches the cache again.
         forEachStorageDependency(probe, local.group_keys, floor, pin);
         if (probe.tail) {
             result.tail_prior = probe.full_page_tokens == 0
@@ -1859,7 +1866,7 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
             result.tail = TailPublication{.tail_tokens = probe.tail->tail_tokens, .hash = probe.tail->hash};
         }
         if (result.keys.empty()) return {};
-        if (result.keys.size() + result.warm_blocks.size() <= max_blocks) {
+        if (result.keys.size() + warm_blocks.size() <= max_blocks) {
             auto allocation = AcquireHostBlocks(groups, buckets);
             if (allocation.stats.allocated == groups.size()) {
                 result.blocks = std::move(allocation.blocks);

@@ -121,7 +121,9 @@ adds no ordering between the two executors: tickets express the dependencies.
    minimum, bypasses L3. Otherwise it considers a bounded extension of that
    prefix, respecting replay/logprob limits and group geometry. It expands
    full prefix boundaries and matching tails from the local `TailTable`, plus
-   the exact reusable request bound. Query credits first cover the longest
+   the exact reusable request bound. Complete boundaries are limited to the
+   supplied prefix hashes; those hashes can also verify tails in the following
+   page. Query credits first cover the longest
    boundary whose complete missing dependencies fit: Full history, the SWA
    window and each State checkpoint at that boundary. Shorter fallback
    boundaries contribute their distinct missing keys only when the whole
@@ -130,8 +132,9 @@ adds no ordering between the two executors: tickets express the dependencies.
 2. the storage subset of `plan.cache` carries a query with a monotonically increasing operation
    ID and immutable keys. Querying reserves no Device pages or batch slots.
 3. After all owners report existence, C++ runs the existing group matcher
-   with these temporary hints. It pins all warm dependencies before allocating
-   Host destinations. Under shortage it shortens the boundary and re-runs the
+   with these temporary hints. It pins warm dependencies only while allocating
+   Host destinations, releasing those temporary references before returning
+   the reservation. Under shortage it shortens the boundary and re-runs the
    matcher, including sliding-window and snapshot-state requirements.
 4. A GET job receives fixed backend keys, Host offsets and lengths. No worker
    reads a mutable namespace or a later scheduler plan.
@@ -139,9 +142,12 @@ adds no ordering between the two executors: tickets express the dependencies.
    and an operation-wide retirement fact. Only all-owner, full-length, retired successes publish Host entries.
    Partial success may populate a shorter legal prefix; ordinary matching
    determines what is actually reusable.
-6. A short Ready hold protects the result until ordinary admission transfers
-   ownership to the existing H2D ticket. Ready expiry releases the hold. H2D
-   and the forward use the same execution path as every Host hit.
+6. A short Ready hold protects the newly read blocks until ordinary admission
+   transfers ownership to the existing H2D ticket. Existing Device and Host
+   dependencies remain evictable while GET is queued/running and while Ready
+   waits. Admission matches the real cache again; lost dependencies can shorten
+   reuse or require recomputation. Ready expiry releases the hold. H2D and the
+   forward use the same execution path as every Host hit.
 
 Tail candidates carry their exact token count and hash through reservation.
 A retired, attached GET records a local tail hint only after publishing Host
@@ -169,6 +175,9 @@ byte budget nor a quota per worker. Page sharding changes the transferred bytes,
 not this logical count. A read with no legal prefix within the remaining budget
 uses ordinary local admission; deployments must budget for the prefix lengths
 and concurrency they intend to restore together.
+The reservation still checks new destinations plus temporary warm references
+against available credits. Once it returns, GET tickets and Ready holds charge
+only their destination references; warm dependencies hold no I/O credits.
 
 Retraction restores exact images through `HostCacheExecutor`; it never starts
 a fresh L3 preparation. State groups use the current fixed two-slot checkpoint
@@ -224,8 +233,9 @@ Query, GET and PUT have separate bounded queues and workers. The total
 outstanding-operation limit includes queued jobs, native work and undelivered
 results. C++ separately limits key count, Host references, lookahead tokens,
 negative metadata and backup candidates. Each held CacheBlock is charged
-conservatively as one potentially pinned LCM parent, including warm
-requirements and quarantine. This can underuse packed Host capacity but cannot
+conservatively as one potentially pinned LCM parent. Warm references participate
+only in the reservation check; quarantine retains the actual I/O references.
+This can underuse packed Host capacity but cannot
 oversubscribe it.
 
 Backups may occupy at most half of the operation credits and half of the Host
@@ -392,6 +402,9 @@ Shutdown attempts device-copy cleanup and L3 retirement independently from the
 control plane. L3 joins its workers with a deadline and then closes its backend;
 if native retirement remains unknown it refuses backend close/Host deregistration
 and retains the backend and Host allocation even if the runtime owner is collected.
+Stopping workers is serialized with submission so every accepted job completes
+or is rejected before the backend closes. Waiting for worker exit holds no
+submission lock.
 
 ## Initial scope and validation
 
@@ -406,6 +419,8 @@ are different counters; client detachment increments neither.
 Pressure bypasses and dropped backup candidate keys have separate counters;
 the admission gate is a mirrored scheduler gauge. These do not count unique
 remote objects or saved prefill tokens.
+Pressure bypasses count storage-eligible requests that skip or stop preparation
+because the gate is closed; decode and prefix-cache-disabled requests are excluded.
 
 Health state/epoch and unproven native retirement are separate gauges. Reading
 health never consumes a recovery probe. Snapshots carry no request IDs or object

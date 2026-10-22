@@ -1212,6 +1212,7 @@ in `--kvstore-storage-backend-extra-config`, for example:
 
 Constructing `MooncakeKvStore` requires `extra_config`. Pass `None` to
 use `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other env defaults.
+Unknown Mooncake connection keys are rejected at startup.
 
 **Asynchronous preparation before admission.** Queries and GETs hold no Device
 pages. All-owner retired GET successes become ordinary Host hits; a soft

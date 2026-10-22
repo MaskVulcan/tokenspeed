@@ -2564,8 +2564,10 @@ class ServerArgs:
             type=str,
             default=ServerArgs.kvstore_storage_backend_extra_config,
             help="JSON object of extra L3 backend settings. For mooncake: "
-            "master_server_address, local_hostname, metadata_server, "
-            "global_segment_size, protocol, device_name, tenant_id.",
+            "master_server_address, client_server_address, local_hostname, "
+            "metadata_server, global_segment_size, protocol, device_name, tenant_id. "
+            "The async object tunes L3 workers, budgets, timeouts and pressure "
+            "watermarks. See docs/configuration/server.md.",
         )
         # Retraction snapshot pool
         parser.add_argument(
