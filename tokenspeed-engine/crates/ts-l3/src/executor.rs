@@ -31,6 +31,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -41,7 +42,7 @@ use ts_metrics::{L3ExecutorSnapshot, L3OperationSnapshot};
 use crate::{
     keys,
     layout::{HostLayout, LayoutError, Range},
-    store::{HostBuffer, IoResult, Store},
+    store::{HostBuffer, IoResult, Store, StoreError},
 };
 
 /// The executor's limits: the scheduler's storage credits and the workers.
@@ -382,6 +383,25 @@ struct Shared {
     prefix: Mutex<String>,
 }
 
+/// Account for a worker even if it unwinds. Drop must not panic while unwinding.
+struct WorkerExit<'a>(&'a Shared);
+
+impl Drop for WorkerExit<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if std::thread::panicking() {
+            state.unsafe_io = true;
+        }
+        state.running_workers -= 1;
+        drop(state);
+        self.0.exited.notify_all();
+    }
+}
+
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("L3 executor lock")
@@ -429,6 +449,7 @@ impl Shared {
     /// A retired failure of every key: the job never ran.
     fn rejected(keys: usize) -> IoResult {
         IoResult {
+            backend_healthy: true,
             success: vec![false; keys],
             retired: true,
             object_failures: vec![false; keys],
@@ -463,8 +484,7 @@ impl Shared {
                 completed: false,
             },
         );
-        let queue = &state.queues[kind.index()];
-        if state.stopping || state.unsafe_io || queue.len() >= self.config.max_operations {
+        if state.stopping || state.unsafe_io {
             state.counters[kind.index()].rejected += 1;
             self.finish(&mut state, op_id, Self::rejected(num_keys));
             return Ok(());
@@ -491,15 +511,16 @@ impl Shared {
             counters.cancelled_running += 1;
         } else {
             counters.cancelled_queued += 1;
-            // Retire at once, even with every worker blocked in native I/O:
-            // the queue entry cannot start after this, and its worker skips
-            // it.
+            // Return the queue slot too: a blocked worker must not leave
+            // cancelled ids occupying capacity after their completions drain.
+            state.queues[kind.index()].retain(|&queued| queued != op_id);
             self.finish(&mut state, op_id, Self::rejected(keys));
         }
     }
 
     /// One worker of `kind`'s queue, until shutdown drains it.
     fn work(&self, kind: Kind) {
+        let _exit = WorkerExit(self);
         loop {
             let mut state = self.lock();
             let op_id = loop {
@@ -514,9 +535,6 @@ impl Shared {
                     .expect("L3 executor lock");
             };
             let Some(op_id) = op_id else {
-                state.running_workers -= 1;
-                drop(state);
-                self.exited.notify_all();
                 return;
             };
             let (stopping, unsafe_io) = (state.stopping, state.unsafe_io);
@@ -551,6 +569,7 @@ impl Shared {
             // No native work on this owner: it neither probes the backend's
             // health nor charges bytes it did not move.
             return IoResult {
+                backend_healthy: true,
                 success: vec![true; keys],
                 retired: true,
                 object_failures: vec![false; keys],
@@ -572,8 +591,9 @@ impl Shared {
             Some(token) => {
                 self.lock().counters[job.kind.index()].backend_calls += 1;
                 let started = (self.clock)();
-                let called = match job.kind {
+                let called = catch_unwind(AssertUnwindSafe(|| match job.kind {
                     Kind::Query => self.store.batch_exists(&local_keys).map(|flags| IoResult {
+                        backend_healthy: true,
                         object_failures: vec![false; flags.len()],
                         success: flags,
                         retired: true,
@@ -584,6 +604,10 @@ impl Shared {
                     Kind::Put => self
                         .store
                         .batch_put_from(&local_keys, self.host, &local_ranges),
+                }));
+                let (called, panicked) = match called {
+                    Ok(result) => (result, false),
+                    Err(_) => (Err(StoreError("the L3 backend panicked".to_owned())), true),
                 };
                 let checked = called.map_err(|error| error.0).and_then(|result| {
                     let valid = result.success.len() == local.len()
@@ -602,9 +626,9 @@ impl Shared {
                 });
                 let result = match checked {
                     Ok(result) => {
-                        // A retired failure is an object or capacity fact,
-                        // never backend unavailability.
-                        if job.kind == Kind::Query || result.retired {
+                        // Retirement protects Host memory; availability
+                        // determines whether another backend call can run.
+                        if result.backend_healthy && result.retired {
                             self.health.success(token);
                         } else {
                             self.health.failure(token);
@@ -620,8 +644,10 @@ impl Shared {
                         );
                         self.health.failure(token);
                         IoResult {
+                            backend_healthy: false,
                             success: vec![false; local.len()],
-                            retired: job.kind == Kind::Query || self.store.failures_retire(),
+                            retired: job.kind == Kind::Query
+                                || (!panicked && self.store.failures_retire()),
                             object_failures: vec![false; local.len()],
                         }
                     }
@@ -638,6 +664,7 @@ impl Shared {
             object_failures[position] = result.object_failures[k];
         }
         IoResult {
+            backend_healthy: result.backend_healthy,
             success,
             retired: result.retired,
             object_failures,
@@ -912,13 +939,18 @@ impl Executor {
         self.shared.store.remove_by_prefix(&prefix)
     }
 
-    /// Stop the workers within `timeout` and release the store; a later
-    /// call does nothing. If a worker is still in native I/O, or some I/O
+    /// Stop the workers within `timeout` and release the store; later calls
+    /// preserve the first shutdown's retirement result. If a worker is still
+    /// in native I/O, or some I/O
     /// never proved its retirement, the store stays connected for the rest
     /// of the process and the caller must keep the Host pool alive too.
     pub fn close(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
         if self.closed {
-            return Ok(());
+            return if self.shared.lock().unsafe_io {
+                Err(ExecutorError::Unretired)
+            } else {
+                Ok(())
+            };
         }
         self.closed = true;
         let deadline = Instant::now() + timeout;
@@ -940,6 +972,9 @@ impl Executor {
                 .0;
         }
         let retired = state.running_workers == 0 && !state.unsafe_io;
+        if !retired {
+            state.unsafe_io = true;
+        }
         drop(state);
         if !retired {
             // Only process exit releases an unretired native transport: the
@@ -1311,6 +1346,7 @@ mod tests {
                 s.set();
                 assert!(r.wait(Duration::from_secs(3)));
                 Ok(IoResult {
+                    backend_healthy: true,
                     success: vec![true; keys.len()],
                     retired: true,
                     object_failures: vec![false; keys.len()],
@@ -1345,6 +1381,52 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_jobs_return_queue_capacity_before_the_worker_is_free() {
+        let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
+        let (s, r) = (Arc::clone(&started), Arc::clone(&release));
+        let store = TestStore {
+            get: Some(Box::new(move |keys, _, _| {
+                s.set();
+                assert!(r.wait(Duration::from_secs(3)));
+                Ok(IoResult {
+                    backend_healthy: true,
+                    success: vec![true; keys.len()],
+                    retired: true,
+                    object_failures: vec![false; keys.len()],
+                })
+            })),
+            ..TestStore::new()
+        };
+        let calls = Arc::clone(&store.calls);
+        let harness = Harness::new(
+            store,
+            ExecutorConfig {
+                max_operations: 2,
+                read_workers: 1,
+                ..CONFIG
+            },
+        );
+        harness.executor().submit(&[get(1, "running", 1)]).unwrap();
+        assert!(started.wait(Duration::from_secs(1)));
+        for op_id in 2..6 {
+            harness
+                .executor()
+                .submit(&[get(op_id, "cancelled", 2), Operation::Cancel { op_id }])
+                .unwrap();
+            let done = harness.wait(1).remove(0);
+            assert!(done.retired);
+            assert_eq!(done.success, [false]);
+        }
+        harness.executor().submit(&[get(6, "live", 2)]).unwrap();
+        release.set();
+        let done = harness.wait(2);
+        assert!(done
+            .iter()
+            .all(|done| done.retired && done.success == [true]));
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
     fn a_failing_query_degrades_without_killing_its_worker() {
         let store = TestStore {
             exists: Some(Box::new(|_| Err(StoreError("unavailable".to_owned())))),
@@ -1360,11 +1442,49 @@ mod tests {
     }
 
     #[test]
+    fn a_backend_panic_reports_failure_without_losing_the_operation() {
+        for kind in KINDS {
+            let store = TestStore {
+                exists: Some(Box::new(|_| panic!("metadata fault"))),
+                get: Some(Box::new(|_, _, _| panic!("read fault"))),
+                put: Some(Box::new(|_, _, _| panic!("write fault"))),
+                ..TestStore::new()
+            };
+            let closes = Arc::clone(&store.closes);
+            let mut harness = Harness::new(store, CONFIG);
+            let operation = match kind {
+                Kind::Query => query(1, &["a"]),
+                Kind::Get => get(1, "a", 1),
+                Kind::Put => put(1, "a", 1),
+            };
+            harness.executor().submit(&[operation]).unwrap();
+            let done = harness.wait(1).remove(0);
+            assert_eq!(done.success, [false]);
+            assert_eq!(done.object_failures, [false]);
+            // A panic bypasses the store's normal error-return contract.
+            assert_eq!(done.retired, kind == Kind::Query);
+            let snapshot = harness.executor().snapshot();
+            assert_eq!(snapshot.health_state, "open");
+            assert_eq!(snapshot.unsafe_io, kind != Kind::Query);
+            let closed = harness.close(Duration::from_secs(1));
+            if kind == Kind::Query {
+                closed.unwrap();
+                assert_eq!(closes.load(Ordering::SeqCst), 1);
+            } else {
+                assert!(matches!(closed, Err(ExecutorError::Unretired)));
+                assert_eq!(closes.load(Ordering::SeqCst), 0);
+                std::mem::forget(std::mem::take(&mut harness.pool));
+            }
+        }
+    }
+
+    #[test]
     fn unproven_retirement_disables_io_and_refuses_a_clean_close() {
         for success in [false, true] {
             let store = TestStore {
                 get: Some(Box::new(move |_, _, _| {
                     Ok(IoResult {
+                        backend_healthy: true,
                         success: vec![success],
                         retired: false,
                         object_failures: vec![false],
@@ -1487,6 +1607,7 @@ mod tests {
                 s.set();
                 assert!(r.wait(Duration::from_secs(3)));
                 Ok(IoResult {
+                    backend_healthy: true,
                     success: vec![true; keys.len()],
                     retired: true,
                     object_failures: vec![false; keys.len()],
@@ -1581,6 +1702,7 @@ mod tests {
                 s.set();
                 assert!(r.wait(Duration::from_secs(5)));
                 Ok(IoResult {
+                    backend_healthy: true,
                     success: vec![true; keys.len()],
                     retired: true,
                     object_failures: vec![false; keys.len()],
@@ -1678,75 +1800,31 @@ mod tests {
 
     #[test]
     fn a_rejected_or_failed_get_reports_no_object_failure() {
-        // Through the open backend, a full queue and a failing store.
-        for failure in ["health", "queue", "error"] {
-            let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
-            let (s, r) = (Arc::clone(&started), Arc::clone(&release));
-            let blocking = failure == "queue";
+        for unavailable in [false, true] {
             let store = TestStore {
-                get: (failure != "health").then(|| {
-                    Box::new(move |keys: &[String], _: HostBuffer, _: &[Range]| {
-                        if blocking && keys[0].contains("_blocker") {
-                            s.set();
-                            assert!(r.wait(Duration::from_secs(3)));
-                        }
-                        if blocking {
-                            Ok(IoResult {
-                                success: vec![true; keys.len()],
-                                retired: true,
-                                object_failures: vec![false; keys.len()],
-                            })
-                        } else {
-                            Err(StoreError("unavailable".to_owned()))
-                        }
-                    }) as Box<IoFn>
-                }),
+                get: Some(Box::new(|_, _, _| {
+                    Err(StoreError("unavailable".to_owned()))
+                })),
                 ..TestStore::new()
             };
-            let harness = Harness::new(
-                store,
-                ExecutorConfig {
-                    max_operations: 2,
-                    read_workers: 1,
-                    ..CONFIG
-                },
-            );
+            let harness = Harness::new(store, CONFIG);
             let executor = harness.executor();
-            let target = match failure {
-                "health" => {
-                    let shared = &executor.shared;
-                    shared.health.failure(shared.health.begin().unwrap());
-                    1
-                }
-                "queue" => {
-                    // A stale entry of a cancelled job keeps its queue slot
-                    // until a worker passes it.
-                    executor.submit(&[get(1, "blocker", 1)]).unwrap();
-                    assert!(started.wait(Duration::from_secs(1)));
-                    executor
-                        .submit(&[get(2, "stale", 2), Operation::Cancel { op_id: 2 }])
-                        .unwrap();
-                    harness.wait(1);
-                    executor
-                        .submit(&[get(3, "stale", 3), Operation::Cancel { op_id: 3 }])
-                        .unwrap();
-                    harness.wait(1);
-                    4
-                }
-                _ => 1,
-            };
-            executor.submit(&[get(target, "present", 4)]).unwrap();
-            let result = &harness.wait(1)[0];
-            assert_eq!(result.op_id, target);
+            if unavailable {
+                executor
+                    .shared
+                    .health
+                    .failure(executor.shared.health.begin().unwrap());
+            }
+            executor.submit(&[get(1, "present", 1)]).unwrap();
+            let result = harness.wait(1).remove(0);
             assert!(result.retired);
             assert_eq!(result.success, [false]);
             assert_eq!(result.object_failures, [false]);
-            if failure != "error" {
-                let get_row = row(&executor.snapshot(), "get");
-                let calls = if failure == "queue" { 1.0 } else { 0.0 };
-                assert_eq!(value(&get_row.events, "backend_calls"), calls);
-            }
-            release.set();
+            let calls = if unavailable { 0.0 } else { 1.0 };
+            assert_eq!(
+                value(&row(&executor.snapshot(), "get").events, "backend_calls"),
+                calls
+            );
         }
     }
 
@@ -1760,6 +1838,7 @@ mod tests {
             let store = TestStore {
                 get: Some(Box::new(move |_, _, _| {
                     Ok(IoResult {
+                        backend_healthy: true,
                         success: success.clone(),
                         retired: true,
                         object_failures: object_failures.clone(),
@@ -1843,6 +1922,7 @@ mod tests {
                 s.set();
                 assert!(r.wait(Duration::from_secs(3)));
                 Ok(IoResult {
+                    backend_healthy: true,
                     success: vec![true; keys.len()],
                     retired: true,
                     object_failures: vec![false; keys.len()],
@@ -1862,6 +1942,46 @@ mod tests {
         // The worker still writes the pool after the close.
         std::mem::forget(std::mem::take(&mut harness.pool));
         release.set();
+    }
+
+    #[test]
+    fn a_failed_close_never_later_reports_safe_retirement() {
+        let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
+        let (s, r) = (Arc::clone(&started), Arc::clone(&release));
+        let store = TestStore {
+            get: Some(Box::new(move |keys, _, _| {
+                s.set();
+                assert!(r.wait(Duration::from_secs(3)));
+                Ok(IoResult {
+                    backend_healthy: true,
+                    success: vec![true; keys.len()],
+                    retired: true,
+                    object_failures: vec![false; keys.len()],
+                })
+            })),
+            ..TestStore::new()
+        };
+        let closes = Arc::clone(&store.closes);
+        let mut harness = Harness::new(store, CONFIG);
+        harness.executor().submit(&[get(1, "a", 1)]).unwrap();
+        assert!(started.wait(Duration::from_secs(1)));
+        let mut executor = harness.executor.take().unwrap();
+        let first = executor.close(Duration::ZERO);
+        let second = executor.close(Duration::ZERO);
+        release.set();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while executor.shared.lock().running_workers != 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(matches!(first, Err(ExecutorError::Unretired)));
+        assert!(matches!(second, Err(ExecutorError::Unretired)));
+        assert!(matches!(
+            executor.close(Duration::ZERO),
+            Err(ExecutorError::Unretired)
+        ));
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        std::mem::forget(std::mem::take(&mut harness.pool));
     }
 
     #[test]
@@ -1948,6 +2068,47 @@ mod tests {
     }
 
     #[test]
+    fn a_retired_metadata_failure_opens_health_without_quarantining_buffers() {
+        let now = Arc::new(Mutex::new(0.0));
+        let store = TestStore {
+            put: Some(Box::new(|keys, _, _| {
+                Ok(IoResult {
+                    backend_healthy: false,
+                    success: vec![false; keys.len()],
+                    retired: true,
+                    object_failures: vec![false; keys.len()],
+                })
+            })),
+            ..TestStore::new()
+        };
+        let harness = Harness::start(store, CONFIG, layout(1, 0, 0), fake_clock(&now));
+        let executor = harness.executor();
+        executor.submit(&[put(1, "outage", 1)]).unwrap();
+        let done = harness.wait(1).remove(0);
+        assert!(done.retired);
+        assert_eq!(done.success, [false]);
+        assert_eq!(done.object_failures, [false]);
+        let snapshot = executor.snapshot();
+        assert_eq!(snapshot.health_state, "open");
+        assert!(!snapshot.unsafe_io);
+        assert!(executor.is_idle());
+        executor.submit(&[put(2, "cooldown", 1)]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [false]);
+        assert_eq!(
+            value(&row(&executor.snapshot(), "put").events, "backend_calls"),
+            1.0
+        );
+        *now.lock().unwrap() = 31.0;
+        // A normal metadata miss can recover the backend. It is no evidence
+        // that either failed PUT published an object.
+        executor
+            .submit(&[query(3, &["outage", "cooldown"])])
+            .unwrap();
+        assert_eq!(harness.wait(1)[0].success, [false, false]);
+        assert_eq!(executor.snapshot().health_state, "healthy");
+    }
+
+    #[test]
     fn a_rejected_put_retires_and_keeps_the_backend_in_service() {
         let store = TestStore::new();
         let memory = Arc::clone(&store.memory);
@@ -1977,6 +2138,7 @@ mod tests {
                     );
                 }
                 Ok(IoResult {
+                    backend_healthy: true,
                     object_failures: vec![false; keys.len()],
                     success,
                     retired: true,

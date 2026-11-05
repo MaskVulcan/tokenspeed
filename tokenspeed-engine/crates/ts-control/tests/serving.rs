@@ -945,6 +945,7 @@ impl Gate {
 /// everything. It counts the queries and gets it ran.
 struct ScriptedStore {
     landed: Option<usize>,
+    retired: bool,
     gate: Arc<Gate>,
     queries: Arc<Mutex<usize>>,
     gets: Arc<Mutex<usize>>,
@@ -970,8 +971,9 @@ impl Store for ScriptedStore {
         *self.gets.lock().unwrap() += 1;
         let landed = self.landed.unwrap_or(keys.len());
         Ok(IoResult {
+            backend_healthy: self.retired,
             success: (0..keys.len()).map(|key| key < landed).collect(),
-            retired: true,
+            retired: self.retired,
             object_failures: vec![false; keys.len()],
         })
     }
@@ -983,6 +985,7 @@ impl Store for ScriptedStore {
         _: &[Range],
     ) -> Result<IoResult, StoreError> {
         Ok(IoResult {
+            backend_healthy: true,
             success: vec![true; keys.len()],
             retired: true,
             object_failures: vec![false; keys.len()],
@@ -1229,6 +1232,8 @@ struct Setup {
     l3_landed_keys: Option<fn(usize) -> usize>,
     /// L3: the stores' queries wait until the test opens their gates.
     l3_held_queries: bool,
+    /// L3: this owner's GET cannot prove retirement.
+    l3_unretired_owner: Option<usize>,
     /// The polls each rank's cache ops wait after the first before they are
     /// acknowledged; none when unset.
     cache_ack_polls: Option<fn(usize) -> usize>,
@@ -1498,6 +1503,7 @@ async fn start_ranks_with(
             };
             let store = matches!(tiers, Tiers::L3).then(|| ScriptedStore {
                 landed: setup.l3_landed_keys.map(|landed| landed(rank)),
+                retired: setup.l3_unretired_owner != Some(rank),
                 gate: storage_gate.clone(),
                 queries: Arc::new(Mutex::new(0)),
                 gets: Arc::new(Mutex::new(0)),
@@ -2843,6 +2849,46 @@ async fn an_l3_get_admits_the_prefix_every_owner_landed() {
     assert_eq!(engine.storage_gets(), 1);
     assert!(engine.cache_ops(CacheOpKind::LoadBack) > 0);
     engine.settle().await;
+    assert_eq!(engine.released_on(1), engine.released_on(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unretired_owner_quarantines_l3_while_every_rank_keeps_serving() {
+    let engine = start_ranks_with(
+        Layout::Tp(2),
+        1,
+        Tiers::L3,
+        Setup {
+            l3_unretired_owner: Some(1),
+            ..Setup::default()
+        },
+    )
+    .await;
+    for (rid, start) in [("unretired", 1), ("bypass", 101)] {
+        let chunks = run_all(
+            &engine.client,
+            vec![TokenizedGenerateReqInput {
+                input_ids: Some((start..start + 65).collect()),
+                ..request(rid, 1, budget(4))
+            }],
+        )
+        .await;
+        assert_eq!(tokens(&chunks[0]), [1000, 1001, 1002, 1003]);
+        assert_eq!(chunks[0].last().unwrap().cached_tokens, 0);
+    }
+    assert_eq!(engine.storage_queries(), 1);
+    assert_eq!(engine.storage_gets(), 1);
+    assert_eq!(engine.cache_ops(CacheOpKind::LoadBack), 0);
+    engine.settle().await;
+    // An empty runtime queue cannot release the quarantined addresses.
+    let flush = ControlRequest::FlushCache(FlushCacheReqInput {
+        rid: None,
+        http_worker_ipc: None,
+    });
+    assert_eq!(
+        control(&engine, flush).await,
+        [("FlushCacheReqOutput", false)]
+    );
     assert_eq!(engine.released_on(1), engine.released_on(0));
 }
 
