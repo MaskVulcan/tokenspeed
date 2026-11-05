@@ -141,6 +141,9 @@ Tail discovery is local and bounded. A cold instance can probe the reusable
 request bound, but cannot discover an arbitrary older nonaligned checkpoint
 in a longer prompt without a local hint. There is no shared tail directory
 or scan of every token position. These misses use ordinary computation.
+Full-page queries are bounded by the supplied prefix hashes as well as the
+request's reusable bound. Those hashes can also verify a known tail in the
+following page; an unhashed full page never supplies query dependencies.
 
 Query planning uses the same matcher masks and key traversal as reservation
 and admission, with temporary existence assumptions standing in for Host
