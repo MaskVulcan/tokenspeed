@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -211,6 +211,10 @@ class MooncakeStoreConfig:
     @staticmethod
     def from_mapping(extra_config: dict[str, Any] | None) -> MooncakeStoreConfig:
         extra_config = extra_config or {}
+        supported = {field.name for field in fields(MooncakeStoreConfig)} | {"async"}
+        unknown = extra_config.keys() - supported
+        if unknown:
+            raise ValueError(f"Unsupported Mooncake options: {sorted(unknown)}")
         master = extra_config.get("master_server_address") or os.environ.get(
             "MOONCAKE_MASTER", ""
         )

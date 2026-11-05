@@ -2822,8 +2822,10 @@ class ServerArgs:
             type=str,
             default=ServerArgs.kvstore_storage_backend_extra_config,
             help="JSON object of extra L3 backend settings. For mooncake: "
-            "master_server_address, local_hostname, metadata_server, "
-            "global_segment_size, protocol, device_name, tenant_id.",
+            "master_server_address, client_server_address, local_hostname, "
+            "metadata_server, global_segment_size, protocol, device_name, tenant_id. "
+            "The async object tunes L3 workers, budgets, timeouts and pressure "
+            "watermarks. See docs/configuration/server.md.",
         )
         # Retraction snapshot pool
         parser.add_argument(
@@ -3918,8 +3920,8 @@ class ServerArgs:
             "the PD prefill role writes the shards and "
             "may split its query rows over them with "
             "--query-context-parallel-size. Works with the Host KVStore and the "
-            "retraction snapshot pool; not with L3 storage "
-            "(--kvstore-storage-backend).",
+            "retraction snapshot pool. L3 storage requires replicated payloads "
+            "within each page-sharded group and pipeline parallelism of 1.",
         )
         parser.add_argument(
             "--decode-context-parallel-size",
