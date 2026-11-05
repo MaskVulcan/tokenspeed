@@ -1336,6 +1336,9 @@ ordinary computation can continue. D2H publication and Device-source release
 wait for replica copy agreement, independently of L3 PUT. The PD prefill role
 can prepare L3 hits; decode receives its missing cache from the prefill peer.
 
+Unknown Mooncake connection options are rejected at startup. The shared
+`async` object is accepted alongside the connection settings.
+
 The `async` object tunes this single execution path. Unspecified settings use
 the following defaults; unknown options are rejected:
 

@@ -24,8 +24,12 @@
 
 use std::{sync::Mutex, time::Duration};
 
-use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyList};
-use ts_l3::{Executor, Operation, Settings, StorageKey};
+use pyo3::{
+    exceptions::{PyRuntimeError, PyValueError},
+    prelude::*,
+    types::PyList,
+};
+use ts_l3::{Executor, ExecutorError, Operation, Settings, StorageKey};
 
 fn runtime_error(error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(error.to_string())
@@ -34,13 +38,19 @@ fn runtime_error(error: impl std::fmt::Display) -> PyErr {
 /// One rank's L3 executor, started from an ``L3Settings``.
 #[pyclass(module = "tokenspeed_engine._native")]
 pub struct L3Executor {
-    executor: Mutex<Option<Executor>>,
+    state: Mutex<ExecutorState>,
+}
+
+struct ExecutorState {
+    executor: Option<Executor>,
+    unretired: bool,
 }
 
 impl L3Executor {
     fn with<R>(&self, run: impl FnOnce(&Executor) -> PyResult<R>) -> PyResult<R> {
-        let executor = self.executor.lock().expect("L3 executor lock");
-        run(executor
+        let state = self.state.lock().expect("L3 executor lock");
+        run(state
+            .executor
             .as_ref()
             .ok_or_else(|| runtime_error("the L3 executor is closed"))?)
     }
@@ -90,7 +100,10 @@ impl L3Executor {
         let settings = Settings::from_python(settings)?;
         let executor = settings.start().map_err(runtime_error)?;
         Ok(Self {
-            executor: Mutex::new(Some(executor)),
+            state: Mutex::new(ExecutorState {
+                executor: Some(executor),
+                unretired: false,
+            }),
         })
     }
 
@@ -205,11 +218,19 @@ impl L3Executor {
     /// when native I/O could not prove its retirement (the store and the
     /// Host pool's registration then stay for the process).
     fn close(&self, py: Python<'_>, timeout_s: f64) -> PyResult<()> {
-        let executor = self.executor.lock().expect("L3 executor lock").take();
-        let Some(mut executor) = executor else {
-            return Ok(());
-        };
-        py.detach(|| executor.close(Duration::from_secs_f64(timeout_s)))
-            .map_err(runtime_error)
+        let timeout = Duration::try_from_secs_f64(timeout_s)
+            .map_err(|_| PyValueError::new_err("timeout_s must be finite and nonnegative"))?;
+        py.detach(|| {
+            let mut state = self.state.lock().expect("L3 executor lock");
+            if state.unretired {
+                return Err(runtime_error(ExecutorError::Unretired));
+            }
+            let Some(mut executor) = state.executor.take() else {
+                return Ok(());
+            };
+            let result = executor.close(timeout);
+            state.unretired = result.is_err();
+            result.map_err(runtime_error)
+        })
     }
 }

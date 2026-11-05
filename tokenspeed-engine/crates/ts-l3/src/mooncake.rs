@@ -83,15 +83,17 @@ fn failed(error: ts_mooncake::Error) -> StoreError {
 /// error may leave writes into the pool in flight.
 fn get_outcome(results: &[i64], sizes: &[usize]) -> IoResult {
     let full = |result: i64, size: usize| u64::try_from(result).is_ok_and(|n| n == size as u64);
+    let retired = results
+        .iter()
+        .all(|&result| result >= 0 || result == OBJECT_NOT_FOUND);
     IoResult {
+        backend_healthy: retired,
         success: results
             .iter()
             .zip(sizes)
             .map(|(&result, &size)| full(result, size))
             .collect(),
-        retired: results
-            .iter()
-            .all(|&result| result >= 0 || result == OBJECT_NOT_FOUND),
+        retired,
         object_failures: results
             .iter()
             .zip(sizes)
@@ -105,19 +107,21 @@ fn get_outcome(results: &[i64], sizes: &[usize]) -> IoResult {
 /// A PUT's outcome: the objects that already `exist` succeed without a
 /// write, and each `missing` key takes its write's result. An existing
 /// object (another writer's) is a success; an allocation rejection retires
-/// as a failure the scheduler offers again; other errors do not prove that
+/// as a best-effort failure; other errors do not prove that
 /// the source bytes are no longer read.
 fn put_outcome(exists: Vec<bool>, missing: &[usize], results: &[i32]) -> IoResult {
     let mut success = exists;
     for (&index, &result) in missing.iter().zip(results) {
         success[index] = result == 0 || result == OBJECT_ALREADY_EXISTS;
     }
+    let retired = results
+        .iter()
+        .all(|&result| [0, OBJECT_ALREADY_EXISTS, NO_AVAILABLE_HANDLE].contains(&result));
     IoResult {
+        backend_healthy: retired,
         object_failures: vec![false; success.len()],
         success,
-        retired: results
-            .iter()
-            .all(|&result| [0, OBJECT_ALREADY_EXISTS, NO_AVAILABLE_HANDLE].contains(&result)),
+        retired,
     }
 }
 
@@ -157,6 +161,7 @@ impl Store for MooncakeStore {
         }
         if keys.is_empty() {
             return Ok(IoResult {
+                backend_healthy: true,
                 success: Vec::new(),
                 retired: true,
                 object_failures: Vec::new(),
@@ -186,6 +191,7 @@ impl Store for MooncakeStore {
             Err(error) => {
                 tracing::error!(%error, "Mooncake existence query before PUT failed");
                 return Ok(IoResult {
+                    backend_healthy: false,
                     success: vec![false; keys.len()],
                     retired: true,
                     object_failures: vec![false; keys.len()],

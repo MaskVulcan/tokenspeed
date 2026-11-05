@@ -509,8 +509,7 @@ fn a_tenant_sees_only_its_own_objects() {
     assert!(a.executor().delete_namespace());
 }
 
-#[test]
-fn the_backend_recovers_once_a_restarted_master_serves() {
+fn check_master_recovery(failed_put: bool) {
     let _serial = serial();
     let Some(library) = library() else {
         return;
@@ -533,7 +532,19 @@ fn the_backend_recovers_once_a_restarted_master_serves() {
     };
     // A metadata outage opens the circuit.
     master.stop();
-    assert_eq!(client.run(query(1)).success, [false]);
+    let failed = client.run(if failed_put {
+        Operation::Put {
+            op_id: 1,
+            keys: vec![key("recovered", 0)],
+            host_blocks: vec![1],
+        }
+    } else {
+        query(1)
+    });
+    assert_eq!(failed.success, [false]);
+    assert_eq!(failed.object_failures, [false]);
+    assert!(failed.retired);
+    assert!(!client.executor().snapshot().unsafe_io);
     assert_eq!(client.executor().snapshot().health_state, "open");
     master.restart();
     // The restarted master's objects live in a new segment owner.
@@ -568,4 +579,84 @@ fn the_backend_recovers_once_a_restarted_master_serves() {
     assert!(client.executor().delete_namespace());
     drop(client);
     drop(owner);
+}
+
+#[test]
+fn a_capacity_rejection_allows_a_later_publication_without_quarantine() {
+    let _serial = serial();
+    let Some(library) = library() else {
+        return;
+    };
+    let master = own_master(&library, &[]);
+    let deployment = unique("capacity");
+    // No client mounts storage yet, so allocation must fail before reading
+    // any source bytes. The same client can publish once an owner arrives.
+    let client = Client::start(&library, &setup(&master, 0), layout(1, 0), &deployment);
+    let object = || vec![key("capacity", 0)];
+    let rejected = client.run(Operation::Put {
+        op_id: 1,
+        keys: object(),
+        host_blocks: vec![1],
+    });
+    assert_eq!(rejected.success, [false]);
+    assert_eq!(rejected.object_failures, [false]);
+    assert!(client.executor().is_idle());
+    let snapshot = client.executor().snapshot();
+    assert_eq!(snapshot.health_state, "healthy");
+    assert!(!snapshot.unsafe_io);
+    let owner = Client::start(
+        &library,
+        &setup(&master, 64 << 20),
+        layout(1, 0),
+        &deployment,
+    );
+    assert_eq!(
+        client
+            .run(Operation::Query {
+                op_id: 2,
+                keys: object()
+            })
+            .success,
+        [false]
+    );
+    let payload: Vec<u8> = (1..=64).collect();
+    // SAFETY: the pool is live and the executor is idle.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), client.pool.as_ptr() as *mut u8, 64);
+    }
+    assert_eq!(
+        client
+            .run(Operation::Put {
+                op_id: 3,
+                keys: object(),
+                host_blocks: vec![1],
+            })
+            .success,
+        [true]
+    );
+    assert_eq!(
+        client
+            .run(Operation::Get {
+                op_id: 4,
+                keys: object(),
+                host_blocks: vec![3],
+            })
+            .success,
+        [true]
+    );
+    assert_eq!(&client.pool[128..192], payload.as_slice());
+    assert!(client.executor().delete_namespace());
+    drop(client);
+    drop(owner);
+}
+
+#[test]
+fn the_backend_recovers_once_a_restarted_master_serves() {
+    check_master_recovery(false);
+}
+
+#[test]
+fn a_failed_put_metadata_lookup_retires_and_recovers_after_master_restart() {
+    check_master_recovery(true);
 }

@@ -56,6 +56,10 @@ impl HostBuffer {
 /// to the Host bytes has ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IoResult {
+    /// The backend answered normally. An availability failure can retire
+    /// safely (for example, a failed metadata lookup before PUT submission).
+    /// Object misses and capacity rejections leave this true.
+    pub backend_healthy: bool,
     /// Per key: a full read, or a published (or already present) object.
     pub success: Vec<bool>,
     /// Native retirement: nothing still touches the batch's Host bytes.
@@ -226,6 +230,7 @@ impl Store for MemoryStore {
             .collect();
         let object_failures = success.iter().map(|ok| !ok).collect();
         Ok(IoResult {
+            backend_healthy: true,
             success,
             retired: true,
             object_failures,
@@ -260,6 +265,7 @@ impl Store for MemoryStore {
             objects.insert(key.clone(), payload);
         }
         Ok(IoResult {
+            backend_healthy: true,
             success: vec![true; keys.len()],
             retired: true,
             object_failures: vec![false; keys.len()],

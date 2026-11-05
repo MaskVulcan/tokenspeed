@@ -141,6 +141,9 @@ Tail discovery is local and bounded. A cold instance can probe the reusable
 request bound, but cannot discover an arbitrary older nonaligned checkpoint
 in a longer prompt without a local hint. There is no shared tail directory
 or scan of every token position. These misses use ordinary computation.
+Full-page queries are bounded by the supplied prefix hashes as well as the
+request's reusable bound. Those hashes can also verify a known tail in the
+following page; an unhashed full page never supplies query dependencies.
 
 Query planning uses the same matcher masks and key traversal as reservation
 and admission, with temporary existence assumptions standing in for Host
@@ -195,6 +198,9 @@ acquires source references; evicted candidates are skipped. Queued candidates
 therefore cannot pin Host memory indefinitely.
 
 PUT is create-only. A retired failure leaves the local Host entry usable.
+Remote publication is best effort: a failed PUT is not automatically retried.
+A later independent Host publication may offer the key again, subject to the
+same credits and pressure gate; backend health recovery does not replay writes.
 An in-flight PUT retains its source references independently of the request,
 and source ownership ends only after all owners report retirement. Local Host
 publication does not imply that a shared object exists. Different compatible
@@ -280,7 +286,9 @@ Per-operation block tables still use pinned, asynchronous uploads and their
 existing lifetime fences.
 
 Queued cancellation is acknowledged without waiting for an occupied worker.
-A cancelled queue item becomes inert. Started I/O has a separate lifetime:
+A cancelled queue item is removed immediately, so its queue capacity does not
+depend on a worker becoming free. Its completion still occupies an operation
+credit until polled. Started I/O has a separate lifetime:
 request cancellation is not native retirement. Operation IDs never reuse a
 request slot or an earlier operation's ID.
 
@@ -294,6 +302,11 @@ only a scheduling decision. The first version uses fixed deadlines and
 credits and explicit pressure watermarks; it does not estimate per-request
 transfer benefit or auto-tune limits. Pressure does not report a backend fault,
 and a successful backend call does not override C++ pressure admission.
+Backend availability is an explicit store result, separate from retirement
+and per-key success. In particular, a failed metadata lookup before PUT opens
+health cooldown while retiring safely: no source transfer started. A backend
+panic becomes a failed completion; a GET/PUT panic cannot use the store's
+normal error-return guarantee to prove retirement.
 
 ## Completion agreement and ordering
 
@@ -347,8 +360,8 @@ short reads are retired failures. `OBJECT_NOT_FOUND` (`-704`) is a metadata
 miss before destination transfer submission. PUT `OBJECT_ALREADY_EXISTS`
 (`-705`) is a create-only rejection before source transfer and is idempotent
 success. PUT `NO_AVAILABLE_HANDLE` (`-200`) is the master's allocation
-rejection before any source transfer: a retired per-page failure that leaves
-the page unacknowledged for the scheduler to re-offer, never a quarantine.
+rejection before any source transfer: a retired best-effort write failure,
+never a quarantine or backend outage.
 Other negative transfer errors, exceptions after native submission,
 and malformed transfer results do not prove retirement.
 
@@ -391,7 +404,9 @@ Shutdown closes the L3 executor when the host's event loop ends, before the
 data plane's device-copy cleanup. L3 joins its workers with a deadline and then
 closes its store; if native retirement remains unknown it refuses store
 close/Host deregistration and keeps the store client for the process, as the
-data plane keeps the Host allocation.
+data plane keeps the Host allocation. A failed shutdown remains failed on
+later close calls, even if its workers subsequently exit. Queue drain cannot
+retroactively authorize releasing the retained allocation or registration.
 
 ## Initial scope and validation
 

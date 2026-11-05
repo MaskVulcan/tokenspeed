@@ -33,8 +33,10 @@ import hashlib
 import uuid
 from contextlib import ExitStack
 from test.l3_test_utils import (
+    StorageOp,
     mooncake_client,
     mooncake_master,
+    run_storage,
     start_l3_executor,
     storage_ops,
 )
@@ -53,6 +55,31 @@ _HOST_BLOCKS = 31
 
 def _host():
     return torch.zeros(_HOST_BLOCKS * _BLOCK_BYTES, dtype=torch.uint8)
+
+
+def test_invalid_close_timeout_keeps_the_executor_usable():
+    host = _host()
+    executor = start_l3_executor(
+        host,
+        groups=((1, _BLOCK_BYTES, 1),),
+        lcm_block_bytes=_BLOCK_BYTES,
+        owner_rank=0,
+        tp_rank=0,
+        deployment_id=f"close-{uuid.uuid4().hex}",
+        mooncake=None,
+    )
+    try:
+        for timeout in (-1.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="timeout_s"):
+                executor.close(timeout)
+        _, success, retired, failures = run_storage(
+            executor,
+            StorageOp(1, ts.StorageKind.Query, [(0, "absent", 0)], []),
+        )
+        assert retired and success == [False] and failures == [False]
+    finally:
+        executor.close(5.0)
+    executor.close(5.0)
 
 
 def _block(host, block):
