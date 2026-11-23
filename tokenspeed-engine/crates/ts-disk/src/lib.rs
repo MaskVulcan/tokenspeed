@@ -48,6 +48,7 @@ pub mod memory;
 mod psync;
 mod uring;
 
+pub use dispatch::{ReadLatencyAimd, AIMD_HIGH_US, AIMD_LOW_US, AIMD_MIN_SAMPLES, AIMD_WINDOW};
 pub use executor::{
     Backend, Direction, Executor, ExecutorConfig, Io, IoError, Job, JobId, JobReport, Pressure,
     StartError, Stats, SubmitError,

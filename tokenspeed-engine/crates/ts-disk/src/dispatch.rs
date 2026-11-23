@@ -29,6 +29,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     os::fd::{AsRawFd, OwnedFd},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -42,13 +43,15 @@ use crate::{
 /// Consecutive OS-level I/O errors before tripping the disk circuit breaker.
 pub(crate) const MAX_CONSECUTIVE_DISK_ERRORS: u32 = 8;
 
-/// Read-latency AIMD window and thresholds (microseconds) for adaptive write
-/// concurrency throttling.
-const AIMD_WINDOW: Duration = Duration::from_millis(100);
-const AIMD_MIN_SAMPLES: usize = 8;
+/// Read-latency AIMD sampling window duration.
+pub const AIMD_WINDOW: Duration = Duration::from_millis(100);
+/// Minimum read chunk samples required before an AIMD window adjustment.
+pub const AIMD_MIN_SAMPLES: usize = 8;
 const AIMD_MAX_SAMPLES: usize = 64;
-const AIMD_HIGH_US: u32 = 2_000;
-const AIMD_LOW_US: u32 = 1_000;
+/// Read p99 threshold (microseconds) above which AIMD halves write concurrency.
+pub const AIMD_HIGH_US: u32 = 2_000;
+/// Read p99 threshold (microseconds) below which AIMD increments write concurrency.
+pub const AIMD_LOW_US: u32 = 1_000;
 
 /// What a job runs once it ended: its report.
 pub(crate) type Done = Box<dyn FnOnce(JobReport) + Send>;
@@ -159,7 +162,7 @@ pub(crate) struct Limits {
 /// Closed-loop AIMD controller that halves background write concurrency when
 /// foreground read p99 exceeds [`AIMD_HIGH_US`] and recovers additively once
 /// read p99 drops below [`AIMD_LOW_US`].
-struct ReadLatencyAimd {
+pub struct ReadLatencyAimd {
     samples_us: [u32; AIMD_MAX_SAMPLES],
     len: usize,
     cursor: usize,
@@ -180,21 +183,32 @@ impl Default for ReadLatencyAimd {
 }
 
 impl ReadLatencyAimd {
-    fn effective_write_depth(&self, limits: Limits, reads_pending: bool) -> usize {
+    /// Construct a fresh AIMD controller starting at full configured write depth.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Effective background write concurrency for `max_write_depth`.
+    /// When foreground reads are completely idle (`reads_pending == false`),
+    /// keeps at least 1 write slot open so background cleaning never deadlocks.
+    pub fn effective_write_depth_for(&self, max_write_depth: usize, reads_pending: bool) -> usize {
         let current = self
             .effective_write_depth
-            .unwrap_or(limits.write_depth)
-            .min(limits.write_depth);
-        // When foreground reads are completely idle, keep at least 1 write slot
-        // open so background cleaning does not stall permanently after a burst.
+            .unwrap_or(max_write_depth)
+            .min(max_write_depth);
         if reads_pending {
             current
         } else {
-            current.max(1).min(limits.write_depth)
+            current.max(1).min(max_write_depth)
         }
     }
 
-    fn record_read(&mut self, latency: Duration, now: Instant, max_write_depth: usize) {
+    pub(crate) fn effective_write_depth(&self, limits: Limits, reads_pending: bool) -> usize {
+        self.effective_write_depth_for(limits.write_depth, reads_pending)
+    }
+
+    /// Record one completed read chunk latency sample at timestamp `now`.
+    pub fn record_read(&mut self, latency: Duration, now: Instant, max_write_depth: usize) {
         let window_start = *self.window_start.get_or_insert(now);
         let us = u32::try_from(latency.as_micros()).unwrap_or(u32::MAX);
         if self.len < AIMD_MAX_SAMPLES {
@@ -546,6 +560,10 @@ impl Queues {
         self.stats
     }
 
+    pub(crate) fn effective_write_depth(&self, limits: Limits, reads_pending: bool) -> usize {
+        self.aimd.effective_write_depth(limits, reads_pending)
+    }
+
     fn drop_queued(&mut self, job: u64) {
         for queue in [&mut self.reads, &mut self.writes, &mut self.backlog] {
             queue.retain(|chunk| chunk.job != job);
@@ -594,6 +612,8 @@ pub(crate) struct Shared {
     pub(crate) eventfd: Option<OwnedFd>,
     /// In-memory CRC32C table for end-to-end chunk integrity verification.
     pub(crate) checksums: ChecksumTable,
+    /// Whether the active backend is staging O_DIRECT through an anonymous mmap bounce pool.
+    pub(crate) bounce_active: AtomicBool,
 }
 
 impl Shared {
@@ -604,7 +624,16 @@ impl Shared {
             limits,
             eventfd,
             checksums: ChecksumTable::new(),
+            bounce_active: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn set_bounce_active(&self) {
+        self.bounce_active.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_bounce_active(&self) -> bool {
+        self.bounce_active.load(Ordering::Acquire)
     }
 
     /// Tell every thread the queues changed.

@@ -264,6 +264,7 @@ impl Message {
 
 /// The ring's free slots.
 struct Slots {
+    total: usize,
     free: Mutex<Vec<usize>>,
     returned: Condvar,
 }
@@ -498,6 +499,7 @@ impl Holder {
         let state = Arc::new(HolderState {
             source,
             slots: Slots {
+                total: slots,
                 free: Mutex::new((0..slots).collect()),
                 returned: Condvar::new(),
             },
@@ -938,6 +940,21 @@ impl PushEndpoint {
             prev.shutdown();
         }
         Ok(())
+    }
+
+    /// `(free, total)` staging-ring slot counts on the active holder, if serving.
+    pub fn push_ring_slot_counts(&self) -> Option<(usize, usize)> {
+        let holder = self.holder.lock().clone()?;
+        let free = holder.state.slots.free.lock().len();
+        Some((free, holder.state.slots.total))
+    }
+
+    /// Number of currently registered active push jobs on the holder.
+    pub fn active_push_jobs(&self) -> usize {
+        self.holder
+            .lock()
+            .as_ref()
+            .map_or(0, |holder| holder.state.running.lock().len())
     }
 }
 

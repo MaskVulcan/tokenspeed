@@ -166,62 +166,77 @@ fn build_ring(entries: u32) -> io::Result<(IoUring, bool)> {
 }
 
 impl Ring {
+    #[cfg(test)]
     pub(crate) fn new(
         file: &DiskFile,
         pieces: &Pieces,
         depth: usize,
         max_io_bytes: usize,
     ) -> io::Result<Self> {
+        Self::new_with_mode(file, pieces, depth, max_io_bytes, false)
+    }
+
+    pub(crate) fn new_with_mode(
+        file: &DiskFile,
+        pieces: &Pieces,
+        depth: usize,
+        max_io_bytes: usize,
+        force_bounce: bool,
+    ) -> io::Result<Self> {
         // One entry beyond the requests for the armed wake-up read.
         let entries = u32::try_from((depth + 1).next_power_of_two())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         let (ring, r_disabled) = build_ring(entries)?;
-        let buffers: Vec<libc::iovec> = pieces
-            .iter()
-            .map(|(start, end)| libc::iovec {
-                iov_base: start as *mut libc::c_void,
-                iov_len: end - start,
-            })
-            .collect();
-        // SAFETY: the executor's caller keeps the memory mapped until close
-        // succeeds (`Executor::start`), and a failed close leaks this ring.
-        // - `EFAULT` signals VM_PFNMAP/VM_IO device-pinned memory (e.g. Ascend
-        //   `torch_npu` `/dev/davinci_manager`), which Linux `O_DIRECT` also
-        //   rejects on non-fixed Read/Write -> stage through an anonymous mmap
-        //   bounce pool (registered as fixed buffers when possible).
-        // - `ENOMEM`/`EINVAL`/`E2BIG`/`EPERM` fall back to non-fixed O_DIRECT
-        //   on the caller's memory (with lazy promotion to a bounce pool if a
-        //   runtime CQE still returns `-EFAULT`).
-        let mode = match unsafe { ring.submitter().register_buffers(&buffers) } {
-            Ok(()) => BufferMode::FixedCaller,
-            Err(error) if error.raw_os_error() == Some(libc::EFAULT) => {
-                let bounce = allocate_bounce_mode(&ring, depth, max_io_bytes)?;
-                let bounce_fixed = matches!(bounce, BufferMode::Bounce { fixed: true, .. });
-                tracing::warn!(
-                    %error,
-                    pieces = buffers.len(),
-                    bounce_bytes = depth * max_io_bytes,
-                    bounce_fixed,
-                    "io_uring register_buffers failed with EFAULT (device-pinned VM_PFNMAP/VM_IO memory); \
-                     staging O_DIRECT through anonymous mmap bounce pool"
-                );
-                bounce
+        let mode = if force_bounce {
+            allocate_bounce_mode(&ring, depth, max_io_bytes)?
+        } else {
+            let buffers: Vec<libc::iovec> = pieces
+                .iter()
+                .map(|(start, end)| libc::iovec {
+                    iov_base: start as *mut libc::c_void,
+                    iov_len: end - start,
+                })
+                .collect();
+            // SAFETY: the executor's caller keeps the memory mapped until close
+            // succeeds (`Executor::start`), and a failed close leaks this ring.
+            // - `EFAULT` signals VM_PFNMAP/VM_IO device-pinned memory (e.g. Ascend
+            //   `torch_npu` `/dev/davinci_manager`), which Linux `O_DIRECT` also
+            //   rejects on non-fixed Read/Write -> stage through an anonymous mmap
+            //   bounce pool (registered as fixed buffers when possible).
+            // - `ENOMEM`/`EINVAL`/`E2BIG`/`EPERM` fall back to non-fixed O_DIRECT
+            //   on the caller's memory (with lazy promotion to a bounce pool if a
+            //   runtime CQE still returns `-EFAULT`).
+            match unsafe { ring.submitter().register_buffers(&buffers) } {
+                Ok(()) => BufferMode::FixedCaller,
+                Err(error) if error.raw_os_error() == Some(libc::EFAULT) => {
+                    let bounce = allocate_bounce_mode(&ring, depth, max_io_bytes)?;
+                    let bounce_fixed = matches!(bounce, BufferMode::Bounce { fixed: true, .. });
+                    tracing::warn!(
+                        %error,
+                        pieces = buffers.len(),
+                        bounce_bytes = depth * max_io_bytes,
+                        bounce_fixed,
+                        "io_uring register_buffers failed with EFAULT (device-pinned VM_PFNMAP/VM_IO memory); \
+                         staging O_DIRECT through anonymous mmap bounce pool"
+                    );
+                    bounce
+                }
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENOMEM | libc::EINVAL | libc::E2BIG | libc::EPERM)
+                    ) =>
+                {
+                    tracing::warn!(
+                        %error,
+                        pieces = buffers.len(),
+                        "io_uring register_buffers failed (check RLIMIT_MEMLOCK / THP); \
+                         falling back to non-fixed O_DIRECT ops"
+                    );
+                    BufferMode::NonFixedCaller
+                }
+                Err(error) => return Err(error),
             }
-            Err(error)
-                if matches!(
-                    error.raw_os_error(),
-                    Some(libc::ENOMEM | libc::EINVAL | libc::E2BIG | libc::EPERM)
-                ) =>
-            {
-                tracing::warn!(
-                    %error,
-                    pieces = buffers.len(),
-                    "io_uring register_buffers failed (check RLIMIT_MEMLOCK / THP); \
-                     falling back to non-fixed O_DIRECT ops"
-                );
-                BufferMode::NonFixedCaller
-            }
-            Err(error) => return Err(error),
         };
         Ok(Self {
             ring,
@@ -231,6 +246,10 @@ impl Ring {
             mode,
             r_disabled,
         })
+    }
+
+    pub(crate) fn is_bounce(&self) -> bool {
+        self.mode.is_bounce()
     }
 
     #[cfg(test)]
@@ -558,6 +577,7 @@ impl Ring {
                             slot_size: self.max_io_bytes,
                             fixed: false,
                         };
+                        shared.set_bounce_active();
                     }
                     Err(error) => {
                         tracing::error!(%error, "failed to allocate io_uring runtime bounce pool");
