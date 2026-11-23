@@ -332,7 +332,7 @@ class TestStorageKeyTest:
             second = os.path.join(second_root, "models", "snapshots", commit)
             os.makedirs(first)
             os.makedirs(second)
-            for directory, payload in ((first, b"aaa"), (second, b"bbb")):
+            for directory, payload in ((first, b"aaa"), (second, b"bbbb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
@@ -354,39 +354,58 @@ class TestStorageKeyTest:
             assert (first_id) != (second_id)
             assert (first_id) != (f"{commit}:auto")
 
-    def test_checkpoint_id_fingerprints_local_weight_bytes(self):
+    def test_checkpoint_id_fingerprints_local_weight_sizes_without_scanning_bytes(self):
+        from tokenspeed.runtime.cache.l3 import identity as l3_identity
+
         with (
             tempfile.TemporaryDirectory() as first,
             tempfile.TemporaryDirectory() as second,
+            tempfile.TemporaryDirectory() as third,
         ):
-            for directory, payload in ((first, b"aaa"), (second, b"bbb")):
+            for directory, payload in (
+                (first, b"aaa"),
+                (second, b"bbbb"),
+                (third, b"ccc"),
+            ):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(payload)
-            assert (os.path.getsize(os.path.join(first, "model.safetensors"))) == (3)
-            assert (os.path.getsize(os.path.join(second, "model.safetensors"))) == (3)
-            assert (
-                self._checkpoint_id(
+            # Differing mtimes with identical (name, size) must keep the same deployment_id.
+            os.utime(os.path.join(first, "model.safetensors"), (1_700_000_000, 1_700_000_000))
+            os.utime(os.path.join(third, "model.safetensors"), (1_700_009_999, 1_700_009_999))
+            with mock.patch.object(
+                l3_identity,
+                "_update_file_digest",
+                wraps=l3_identity._update_file_digest,
+            ) as digest:
+                first_id = self._checkpoint_id(
                     first,
                     load_format="auto",
                     hf_config=SimpleNamespace(),
                     revision="",
                 )
-            ) != (
-                self._checkpoint_id(
+                second_id = self._checkpoint_id(
                     second,
                     load_format="auto",
                     hf_config=SimpleNamespace(),
                     revision="",
                 )
-            )
-            assert self._checkpoint_id(
-                first,
-                load_format="auto",
-                hf_config=SimpleNamespace(),
-                revision="",
-            ).startswith("local-")
+                third_id = self._checkpoint_id(
+                    third,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                )
+            # Only config.json (metadata) was byte-hashed; model.safetensors was stat-only.
+            assert [call.args[1] for call in digest.call_args_list] == [
+                os.path.join(first, "config.json"),
+                os.path.join(second, "config.json"),
+                os.path.join(third, "config.json"),
+            ]
+            assert first_id != second_id
+            assert first_id == third_id
+            assert first_id.startswith("local-")
 
     def test_checkpoint_id_does_not_trust_hex_basename_outside_hf_snapshots(self):
         commit = "d" * 40
@@ -398,7 +417,7 @@ class TestStorageKeyTest:
             second = os.path.join(second_root, commit)
             os.makedirs(first)
             os.makedirs(second)
-            for directory, payload in ((first, b"aaa"), (second, b"bbb")):
+            for directory, payload in ((first, b"aaa"), (second, b"bbbb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
@@ -426,7 +445,7 @@ class TestStorageKeyTest:
             tempfile.TemporaryDirectory() as first,
             tempfile.TemporaryDirectory() as second,
         ):
-            for directory, payload in ((first, b"aaa"), (second, b"bbb")):
+            for directory, payload in ((first, b"aaa"), (second, b"bbbb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
@@ -656,7 +675,7 @@ class TestStorageKeyTest:
             tempfile.TemporaryDirectory() as first,
             tempfile.TemporaryDirectory() as second,
         ):
-            for directory, leftover in ((first, b"aaa"), (second, b"bbb")):
+            for directory, leftover in ((first, b"aaa"), (second, b"bbbb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write("{}")
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
@@ -699,7 +718,7 @@ class TestStorageKeyTest:
             tempfile.TemporaryDirectory() as first,
             tempfile.TemporaryDirectory() as second,
         ):
-            for directory, payload in ((first, b"rank0-a"), (second, b"rank0-b")):
+            for directory, payload in ((first, b"rank0-a"), (second, b"rank0-bb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write("{}")
                 with open(
@@ -769,7 +788,7 @@ class TestStorageKeyTest:
                 )
             )
             with open(alt_shard, "wb") as handle:
-                handle.write(b"alt-shard-b")
+                handle.write(b"alt-shard-bb")
             l3_identity._local_checkpoint_fingerprint.cache_clear()
             assert (alt_id) != (
                 l3_checkpoint_id(
@@ -789,7 +808,7 @@ class TestStorageKeyTest:
             tempfile.TemporaryDirectory() as first,
             tempfile.TemporaryDirectory() as second,
         ):
-            for directory, np_payload in ((first, b"np-a"), (second, b"np-b")):
+            for directory, np_payload in ((first, b"np-a"), (second, b"np-bb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write("{}")
                 with open(os.path.join(directory, "pytorch_model.bin"), "wb") as handle:
@@ -1008,7 +1027,7 @@ class TestStorageKeyTest:
                 handle.write("PROCESSOR = 'shared'\n")
             with open(yaml_path, "w", encoding="utf-8") as handle:
                 handle.write(f"ext_def_file: {ext_def}\n")
-            for directory, payload in ((first, b"weights-a"), (second, b"weights-b")):
+            for directory, payload in ((first, b"weights-a"), (second, b"weights-bb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write("{}")
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
@@ -1262,7 +1281,8 @@ class TestStorageKeyTest:
                     revision="",
                 )
             assert (first) == (second)
-            assert (digest.call_count) == (2)
+            # Only config.json is byte-digested; model.safetensors hashes (name, size).
+            assert (digest.call_count) == (1)
 
     def test_share_l3_checkpoint_ids_combines_rank_local_digests(self):
         seen = []

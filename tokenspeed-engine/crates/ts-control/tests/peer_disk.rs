@@ -180,6 +180,7 @@ fn geometry(base: u64, push: &str) -> RankGeometry {
                 block_bytes: BLOCK_BYTES as u64,
                 field_offsets: vec![("layer.0.kv".into(), 0)],
             }],
+            region_lengths: Vec::new(),
         }),
         push: Some(push.to_owned()),
     }

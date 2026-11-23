@@ -122,8 +122,25 @@ impl Settings {
             })
             .collect::<PyResult<Vec<_>>>()?;
         let host = geometry.getattr("host")?;
+        let host_address: u64 = host.getattr("address")?.extract()?;
+        let regions: Vec<(usize, usize)> = geometry.getattr("regions")?.extract()?;
+        let mut region_lengths: Vec<u64> = host
+            .getattr("region_lengths")
+            .and_then(|attr| attr.extract())
+            .unwrap_or_default();
+        if region_lengths.is_empty() {
+            // Backward-compatible fallback: reconstruct contiguous registered
+            // Host MR segments starting at `host_address` from `regions`.
+            let mut cursor = host_address;
+            for &(addr, len) in &regions {
+                if addr as u64 == cursor && len > 0 {
+                    region_lengths.push(len as u64);
+                    cursor = cursor.saturating_add(len as u64);
+                }
+            }
+        }
         let host = HostPool {
-            address: host.getattr("address")?.extract()?,
+            address: host_address,
             groups: host
                 .getattr("groups")?
                 .try_iter()?
@@ -137,6 +154,7 @@ impl Settings {
                     })
                 })
                 .collect::<PyResult<Vec<_>>>()?,
+            region_lengths,
         };
         Ok(Some(Self {
             peer: PeerSettings {
@@ -164,7 +182,7 @@ impl Settings {
             local_ip: settings.getattr("local_ip")?.extract()?,
             protocol: settings.getattr("protocol")?.extract()?,
             ib_device: settings.getattr("ib_device")?.extract()?,
-            regions: geometry.getattr("regions")?.extract()?,
+            regions,
             device,
             host,
         }))

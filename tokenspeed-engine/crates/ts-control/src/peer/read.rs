@@ -56,17 +56,31 @@ impl PageReader for EngineReader {
     }
 }
 
-/// One read to run: the landing it serves, the holder's session and the
-/// spans, and the push of the holder's Disk pages, if any.
+/// One read to run: the landing it serves, the holder's session, the
+/// MR-homogeneous span batches to copy, and the push of the holder's Disk
+/// pages, if any.
 pub struct ReadJob {
     /// The landing request.
     pub request_id: String,
     /// The holder rank's transfer session.
     pub session: String,
-    /// What to copy.
-    pub spans: Spans,
+    /// MR-homogeneous batches of spans; every batch stays within one source MR
+    /// and one destination MR so `TransferSync` never mixes MRs in a single op.
+    pub batches: Vec<Spans>,
     /// The Disk pages the holder rank pushes into this member's pages.
     pub push: Option<PushJob>,
+}
+
+impl ReadJob {
+    /// Total spans across all MR-homogeneous batches.
+    pub fn total_spans(&self) -> usize {
+        self.batches.iter().map(|b| b.lengths.len()).sum()
+    }
+
+    /// Total bytes backed by pinned holder Host memory across all batches.
+    pub fn host_bytes(&self) -> u64 {
+        self.batches.iter().map(|b| b.host_bytes).sum()
+    }
 }
 
 /// A push the holder rank runs for a read (`push`).
@@ -134,16 +148,24 @@ impl Reads {
                         return;
                     };
                     let started = std::time::Instant::now();
+                    let total_spans = job.total_spans();
+                    let host_bytes = job.host_bytes();
                     tracing::debug!(
                         request = job.request_id,
-                        spans = job.spans.lengths.len(),
+                        spans = total_spans,
+                        mr_batches = job.batches.len(),
                         "peer read started"
                     );
-                    let mut outcome = if job.spans.is_empty() {
-                        Ok(())
-                    } else {
-                        reader.read(&job.session, &job.spans)
-                    };
+                    let mut outcome = Ok(());
+                    for batch in &job.batches {
+                        if batch.is_empty() {
+                            continue;
+                        }
+                        if let Err(err) = reader.read(&job.session, batch) {
+                            outcome = Err(err);
+                            break;
+                        }
+                    }
                     // The push holds the landing too: a failed read still
                     // waits for it, so no write trails the outcome.
                     let mut disk_bytes = 0;
@@ -157,7 +179,7 @@ impl Reads {
                         observation.finish(
                             started,
                             started.elapsed(),
-                            job.spans.host_bytes,
+                            host_bytes,
                             disk_bytes,
                             outcome.is_ok(),
                         );
@@ -169,14 +191,22 @@ impl Reads {
                         "peer read ended"
                     );
                     if let Err(error) = &outcome {
-                        let spans = &job.spans;
+                        let first_batch = job.batches.first();
+                        let last_batch = job.batches.last();
                         tracing::warn!(
                             request = job.request_id,
                             %error,
-                            spans = spans.lengths.len(),
-                            first_source = spans.sources.first().map(|a| format!("{a:#x}")),
-                            first_destination = spans.destinations.first().map(|a| format!("{a:#x}")),
-                            last_destination = spans.destinations.last().map(|a| format!("{a:#x}")),
+                            spans = total_spans,
+                            mr_batches = job.batches.len(),
+                            first_source = first_batch
+                                .and_then(|s| s.sources.first())
+                                .map(|a| format!("{a:#x}")),
+                            first_destination = first_batch
+                                .and_then(|s| s.destinations.first())
+                                .map(|a| format!("{a:#x}")),
+                            last_destination = last_batch
+                                .and_then(|s| s.destinations.last())
+                                .map(|a| format!("{a:#x}")),
                             "peer read failed"
                         );
                     }
@@ -334,12 +364,12 @@ mod tests {
         reads.submit(ReadJob {
             request_id: "r".into(),
             session: "s".into(),
-            spans: Spans {
+            batches: vec![Spans {
                 sources: vec![4],
                 destinations: vec![32],
                 lengths: vec![8],
                 host_bytes: 0,
-            },
+            }],
             push: None,
         });
         assert_eq!(wait_for(&reads), vec![("r".to_owned(), true)]);
@@ -371,12 +401,12 @@ mod tests {
         reads.submit(ReadJob {
             request_id: "r".into(),
             session: "s".into(),
-            spans: Spans {
+            batches: vec![Spans {
                 sources: vec![4],
                 destinations: vec![32],
                 lengths: vec![8],
                 host_bytes: 0,
-            },
+            }],
             push: Some(push()),
         });
         assert_eq!(wait_for(&reads), vec![("r".to_owned(), true)]);
@@ -394,7 +424,7 @@ mod tests {
         reads.submit(ReadJob {
             request_id: "r".into(),
             session: "s".into(),
-            spans: Spans::default(),
+            batches: Vec::new(),
             push: Some(push()),
         });
         assert_eq!(wait_for(&reads), vec![("r".to_owned(), false)]);
@@ -411,12 +441,12 @@ mod tests {
             reads.submit(ReadJob {
                 request_id: "r".into(),
                 session: "s".into(),
-                spans: Spans {
+                batches: vec![Spans {
                     sources: vec![1],
                     destinations: vec![2],
                     lengths: vec![8],
                     host_bytes: 0,
-                },
+                }],
                 push: None,
             });
             assert_eq!(wait_for(&reads), vec![("r".to_owned(), false)]);
@@ -458,14 +488,61 @@ mod tests {
         ReadJob {
             request_id: request.into(),
             session: session.into(),
-            spans: Spans {
+            batches: vec![Spans {
                 sources: vec![0],
                 destinations: vec![destination],
                 lengths: vec![8],
                 host_bytes: 0,
-            },
+            }],
             push: None,
         }
+    }
+
+    #[test]
+    fn multi_batch_read_issues_one_reader_call_per_mr_batch() {
+        struct CountingArena {
+            arena: Arena,
+            calls: std::sync::Mutex<Vec<usize>>,
+        }
+        impl PageReader for CountingArena {
+            fn read(&self, session: &str, spans: &Spans) -> Result<(), String> {
+                self.calls.lock().unwrap().push(spans.lengths.len());
+                self.arena.read(session, spans)
+            }
+        }
+        let arena = Arena::new(64);
+        arena.write(0, &[1; 8]);
+        arena.write(8, &[2; 8]);
+        let reader = Arc::new(CountingArena {
+            arena: arena.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let reads =
+            Reads::start(reader.clone(), Arc::new(NoPushes), NonZeroUsize::new(1).unwrap())
+                .unwrap();
+        reads.submit(ReadJob {
+            request_id: "mr-split".into(),
+            session: "s".into(),
+            batches: vec![
+                Spans {
+                    sources: vec![0],
+                    destinations: vec![32],
+                    lengths: vec![8],
+                    host_bytes: 8,
+                },
+                Spans {
+                    sources: vec![8],
+                    destinations: vec![40],
+                    lengths: vec![8],
+                    host_bytes: 8,
+                },
+            ],
+            push: None,
+        });
+        assert_eq!(wait_for(&reads), vec![("mr-split".to_owned(), true)]);
+        assert_eq!(*reader.calls.lock().unwrap(), vec![1, 1]);
+        assert_eq!(arena.read_bytes(32, 8), vec![1; 8]);
+        assert_eq!(arena.read_bytes(40, 8), vec![2; 8]);
     }
 
     #[test]

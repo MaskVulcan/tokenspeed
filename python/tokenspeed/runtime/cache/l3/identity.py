@@ -750,30 +750,34 @@ def _local_checkpoint_code_files(model_dir: str) -> tuple[tuple[str, str], ...]:
     return tuple(found)
 
 
+def _update_file_size_digest(hasher: "hashlib._Hash", path: str) -> None:
+    """Hash a weight shard's byte size without scanning its contents.
+
+    Uses only ``os.path.getsize(path)`` (never ``mtime``, which can differ
+    across replicated cluster nodes or container mounts) so all ranks sharing a
+    checkpoint converge on the identical ``deployment_id`` in milliseconds
+    instead of scanning tens of gigabytes of ``*.safetensors`` on startup.
+    """
+    hasher.update(b"\0")
+    hasher.update(str(os.path.getsize(path)).encode())
+    hasher.update(b"\0")
+
+
 @functools.cache
 def _local_checkpoint_fingerprint(
     model_dir: str, load_format: str, extra_config_json: str
 ) -> str:
-    """Hash config/index/quant-config bytes and the selected weight files.
+    """Hash config/index/quant-config/code bytes and selected weight shard sizes.
 
     Cached by directory path, load format, and loader extra-config so a
     process that resolves the same local checkpoint more than once (target
-    plus draft, or a repeated prefix rebuild) does not re-read every shard.
-    ``hf_quant_config.json`` is hashed with ``config.json``: ModelOpt
-    mixed-precision maps, group sizes, and KV quantization live there,
-    not in the weight tensors. ``consolidated.safetensors.index.json`` is
-    hashed so two Mistral dumps with the same ``consolidated*.safetensors``
-    candidates but different shard maps cannot share a namespace.
-    Local ``*.py`` is hashed, including files imported from package
-    subdirectories and from directory symlinks Python would follow on
-    import, so two trees with identical JSON/weights but
-    different ``--trust-remote-code`` configuration modules cannot share
-    a namespace. ``--load-format`` selects so a directory that contains
-    more than one checkpoint encoding cannot share a namespace across
-    loaders. ``sharded_state`` uses ``model_loader_extra_config["pattern"]``
-    when set. ``npcache`` hashes the NumPy cache when
-    ``np/weight_names.json`` exists, because that is what the loader
-    reads.
+    plus draft, or a repeated prefix rebuild) does not re-stat every shard.
+    Lightweight metadata/code files (``config.json``, ``hf_quant_config.json``,
+    ``*.index.json``, ``np/weight_names.json``, local ``*.py``) are still
+    hashed byte-for-byte; large weight shard files hash ``(relative_name,
+    file_size)`` so 1,000-rank startups on shared storage never stall scanning
+    multi-hundred-GB checkpoints while preserving identical fingerprints across
+    nodes regardless of file mtime.
     """
     hasher = hashlib.sha256()
     try:
@@ -799,10 +803,13 @@ def _local_checkpoint_fingerprint(
             continue
         if name in selected_weights:
             hasher.update(name.encode())
-            _update_file_digest(hasher, path)
+            _update_file_size_digest(hasher, path)
     for rel, path in extra_weight_files:
         hasher.update(rel.encode())
-        _update_file_digest(hasher, path)
+        if rel == "np/weight_names.json":
+            _update_file_digest(hasher, path)
+        else:
+            _update_file_size_digest(hasher, path)
     return hasher.hexdigest()
 
 

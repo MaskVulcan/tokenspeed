@@ -66,6 +66,39 @@ def test_peer_host_region_plans_cover_the_pool_without_splitting_a_parent():
     )
 
 
+def test_build_peer_geometry_records_host_region_lengths():
+    from types import SimpleNamespace
+
+    groups = (
+        CacheGroupLayout(
+            "full",
+            1,
+            (CacheField("layer.0.k", 0, 0, 16, 12),),
+        ),
+    )
+    host_buf = SimpleNamespace(data_ptr=lambda: 1000)
+    host_storage = SimpleNamespace(
+        group_ids=("full",),
+        host_field_offsets=((0,),),
+        host_parent_bytes=24,
+        host_group_block_packing=(1,),
+        host_group_block_bytes=(12,),
+        host_buffer=host_buf,
+        host_buffer_bytes=96,
+    )
+    geometry = build_peer_geometry(
+        scheduler_group_ids=("full",),
+        groups=groups,
+        field_addresses={"layer.0.k": 500},
+        device_regions=((500, 128),),
+        host_storage=host_storage,
+        host_region_planner=lambda length, parent: (48, 48),
+    )
+    assert geometry.host.address == 1000
+    assert geometry.host.region_lengths == (48, 48)
+    assert geometry.regions == ((500, 128), (1000, 48), (1048, 48))
+
+
 @pytest.mark.parametrize("lengths", [(12,), (18, 25), (17, 25), (0, 42), (-6, 48)])
 def test_invalid_peer_host_registration_plans_are_refused(lengths):
     with pytest.raises(ValueError, match="(region|regions)"):
@@ -260,6 +293,38 @@ def test_host_landings_take_a_share_of_the_host_blocks():
     device = peer_scheduler_config(landing_tier="device", **common)
     assert device.landing_tier == ts.PeerLandingTier.Device
     assert (device.max_host_landing_blocks, device.host_ready_timeout_us) == (0, 0)
+
+
+def test_peer_scheduler_config_scales_soft_pin_and_host_ready_with_answer_timeout():
+    pytest.importorskip("tokenspeed_engine.scheduler")
+    base = dict(
+        name="10.0.0.2:7100",
+        incarnation=3,
+        min_fetch_tokens=256,
+        num_host_blocks=100,
+    )
+    # 50 ms: soft_pin = max(2.0, 2*0.05 + 2.0) = 2.1s, host_ready = max(5.0, 0.05 + 5.0) = 5.05s
+    low = peer_scheduler_config(landing_tier="host", answer_timeout_ms=50, **base)
+    assert low.soft_pin_us == 2_100_000
+    assert low.host_ready_timeout_us == 5_050_000
+    assert low.lookup_timeout_us == 50_000
+
+    # 1000 ms: soft_pin = 4.0s, host_ready = 6.0s
+    mid = peer_scheduler_config(landing_tier="host", answer_timeout_ms=1000, **base)
+    assert mid.soft_pin_us == 4_000_000
+    assert mid.host_ready_timeout_us == 6_000_000
+    assert mid.lookup_timeout_us == 1_000_000
+
+    # 5000 ms: soft_pin = 12.0s (> 2.0s hardcoded floor!), host_ready = 10.0s
+    high = peer_scheduler_config(landing_tier="host", answer_timeout_ms=5000, **base)
+    assert high.soft_pin_us == 12_000_000
+    assert high.host_ready_timeout_us == 10_000_000
+    assert high.lookup_timeout_us == 5_000_000
+
+    # Device landing keeps soft_pin scaling while leaving host_ready_timeout_us == 0
+    dev = peer_scheduler_config(landing_tier="device", answer_timeout_ms=5000, **base)
+    assert dev.soft_pin_us == 12_000_000
+    assert dev.host_ready_timeout_us == 0
 
 
 @pytest.mark.parametrize(

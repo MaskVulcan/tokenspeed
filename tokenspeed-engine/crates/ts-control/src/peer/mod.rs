@@ -59,7 +59,7 @@ use ts_scheduler::{
 use crate::{
     codec::{Reader, Writer},
     peer::{
-        geometry::{push_items, read_spans, RankGeometry},
+        geometry::{push_items, read_spans, split_spans_by_mr, RankGeometry},
         landing::{Action, Landing, Timeouts},
         net::{Inbound, PeerNet},
         push::PagePusher,
@@ -70,6 +70,37 @@ use crate::{
 };
 
 const READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+const DEFAULT_HOLDER_FAIL_THRESHOLD: u32 = 3;
+const DEFAULT_HOLDER_COOLDOWN_S: f64 = 30.0;
+const COOLDOWN_WARN_INTERVAL_US: i64 = 5_000_000;
+
+fn parse_holder_circuit_breaker_values(
+    threshold: Option<&str>,
+    cooldown_s: Option<&str>,
+) -> (u32, i64) {
+    let threshold = threshold
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_HOLDER_FAIL_THRESHOLD);
+    let cooldown_s = cooldown_s
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(DEFAULT_HOLDER_COOLDOWN_S);
+    (threshold, (cooldown_s * 1e6) as i64)
+}
+
+fn parse_holder_circuit_breaker_env() -> (u32, i64) {
+    let threshold = std::env::var("TOKENSPEED_PEER_HOLDER_FAIL_THRESHOLD").ok();
+    let cooldown_s = std::env::var("TOKENSPEED_PEER_HOLDER_COOLDOWN_S").ok();
+    parse_holder_circuit_breaker_values(threshold.as_deref(), cooldown_s.as_deref())
+}
+
+#[derive(Debug, Clone, Default)]
+struct HolderHealth {
+    consecutive_failures: u32,
+    cooldown_until_us: Option<i64>,
+    last_warn_us: Option<i64>,
+    suppressed_since_warn: u64,
+}
 
 /// What a replica's peer sharing runs with.
 #[derive(Debug, Clone)]
@@ -387,6 +418,14 @@ pub struct Peer {
     previous_totals: [u64; 2],
     /// Reads that could not be placed, to report as failed.
     unplaced: Vec<(String, bool)>,
+    /// Per-holder physical read failure circuit-breaker state (mirrored across members).
+    holder_health: HashMap<String, HolderHealth>,
+    /// Consecutive physical read failures before entering cooldown (`0` disables).
+    holder_fail_threshold: u32,
+    /// Holder cooldown window in microseconds.
+    holder_cooldown_us: i64,
+    /// Synthetic miss answers for lookups short-circuited by holder cooldown.
+    cooldown_answers: Vec<PeerEventView>,
 }
 
 impl Peer {
@@ -413,6 +452,7 @@ impl Peer {
         let endpoint = listener
             .map(|listener| start_endpoint(&settings, replica, listener, scheduler))
             .transpose()?;
+        let (holder_fail_threshold, holder_cooldown_us) = parse_holder_circuit_breaker_env();
         Ok(Self {
             identity: settings.identity(),
             settings,
@@ -437,7 +477,25 @@ impl Peer {
             previous_totals: [0; 2],
             reads: Reads::start(reader, pusher, READ_CONCURRENCY)?,
             unplaced: Vec::new(),
+            holder_health: HashMap::new(),
+            holder_fail_threshold,
+            holder_cooldown_us,
+            cooldown_answers: Vec::new(),
         })
+    }
+
+    /// Override the reader-side holder failure circuit breaker parameters
+    /// (`fail_threshold == 0` disables cooldown).
+    pub fn set_holder_circuit_breaker(&mut self, fail_threshold: u32, cooldown: Duration) {
+        self.holder_fail_threshold = fail_threshold;
+        self.holder_cooldown_us = i64::try_from(cooldown.as_micros()).unwrap_or(i64::MAX);
+    }
+
+    /// Inspect `(consecutive_failures, cooldown_until_us)` for `holder`.
+    pub fn holder_cooldown_state(&self, holder: &str) -> (u32, Option<i64>) {
+        self.holder_health
+            .get(holder)
+            .map_or((0, None), |h| (h.consecutive_failures, h.cooldown_until_us))
     }
 
     /// Enable logical measurements on member zero and physical measurements on every member.
@@ -524,6 +582,7 @@ impl Peer {
         let now_us = first.now_us;
         self.asked.retain(|_, deadline_us| now_us < *deadline_us);
         let mut events = first.changes.clone();
+        events.extend(self.cooldown_answers.drain(..));
         let mut actions = Vec::new();
         for reply in &first.replies {
             self.take_reply(reply, now_us, &mut events, &mut actions);
@@ -538,13 +597,24 @@ impl Peer {
                 false
             });
         }
+        let mut read_results: Vec<(String, bool)> = Vec::new();
         for (member, report) in reports.iter().enumerate() {
             for (request, ok) in &report.outcomes {
                 if let Some(landing) = self.landings.get_mut(request) {
                     if let Some(action) = landing.read(member, *ok, now_us) {
+                        if let Action::SendRelease { demote } = action {
+                            read_results.push((landing.fetch().holder.clone(), demote));
+                        }
                         actions.push((request.clone(), action));
                     }
                 }
+            }
+        }
+        for (holder, ok) in read_results {
+            if ok {
+                self.record_holder_read_success(&holder);
+            } else {
+                self.record_holder_read_failure(&holder, now_us);
             }
         }
         for (request, landing) in &mut self.landings {
@@ -633,8 +703,23 @@ impl Peer {
             actions.push((request, action));
         }
         self.send(actions, now_us);
-        if let Some(endpoint) = &self.endpoint {
-            for lookup in lookups {
+        for lookup in lookups {
+            if self.is_holder_in_cooldown(&lookup.holder, now_us) {
+                self.cooldown_answers.push(PeerEventView {
+                    kind: PeerEventKind::LookupAnswered,
+                    lease: lookup.lease,
+                    num_tokens: 0,
+                    ..empty_event()
+                });
+                if self.member == 0 {
+                    self.decisions.push((lookup.request_id, "holder_cooldown"));
+                    if let Some(metrics) = &self.metrics {
+                        metrics.stage("lookup", "holder_cooldown", 0.0);
+                    }
+                }
+                continue;
+            }
+            if let Some(endpoint) = &self.endpoint {
                 if self.metrics.is_some() {
                     self.lookup_times.insert(
                         lookup.lease.id,
@@ -872,6 +957,9 @@ impl Peer {
                 .and_then(|holder| {
                     let spans = read_spans(holder, &self.geometry, &read_pages)
                         .map_err(|error| error.to_string())?;
+                    let total_read_bytes = spans.total_bytes();
+                    let batches =
+                        split_spans_by_mr(&spans, holder.host.as_ref(), self.geometry.host.as_ref());
                     let push = if disk_pages.is_empty() {
                         None
                     } else {
@@ -885,23 +973,23 @@ impl Peer {
                                 .map_err(|error| error.to_string())?,
                         })
                     };
-                    Ok((holder.session.clone(), spans, push))
+                    Ok((holder.session.clone(), total_read_bytes, batches, push))
                 });
             self.reading.insert(request.clone());
             match job {
-                Ok((session, spans, push)) => {
+                Ok((session, total_read_bytes, batches, push)) => {
                     let observation = self.read_metrics.as_ref().map(|metrics| {
                         metrics.queue_read(
                             fetch.holder.clone(),
                             self.member,
-                            spans.total_bytes() + push.as_ref().map_or(0, PushJob::bytes),
+                            total_read_bytes + push.as_ref().map_or(0, PushJob::bytes),
                         )
                     });
                     self.reads.submit_observed(
                         ReadJob {
                             request_id: request.clone(),
                             session,
-                            spans,
+                            batches,
                             push,
                         },
                         observation,
@@ -914,6 +1002,82 @@ impl Peer {
                     self.unplaced.push((request.clone(), false));
                 }
             }
+        }
+    }
+
+    fn record_holder_read_success(&mut self, holder: &str) {
+        if let Some(health) = self.holder_health.get_mut(holder) {
+            if health.consecutive_failures > 0 || health.cooldown_until_us.is_some() {
+                if self.member == 0 {
+                    tracing::info!(
+                        holder,
+                        previous_failures = health.consecutive_failures,
+                        "peer holder read succeeded; resetting failure circuit breaker"
+                    );
+                }
+                health.consecutive_failures = 0;
+                health.cooldown_until_us = None;
+                health.suppressed_since_warn = 0;
+            }
+        }
+    }
+
+    fn record_holder_read_failure(&mut self, holder: &str, now_us: i64) {
+        if self.holder_fail_threshold == 0 {
+            return;
+        }
+        let health = self.holder_health.entry(holder.to_owned()).or_default();
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        if health.consecutive_failures >= self.holder_fail_threshold {
+            let until = now_us.saturating_add(self.holder_cooldown_us);
+            health.cooldown_until_us = Some(until);
+            health.last_warn_us = Some(now_us);
+            health.suppressed_since_warn = 0;
+            if self.member == 0 {
+                tracing::warn!(
+                    holder,
+                    consecutive_failures = health.consecutive_failures,
+                    threshold = self.holder_fail_threshold,
+                    cooldown_s = self.holder_cooldown_us as f64 / 1e6,
+                    "peer holder hit read failure threshold; entering lookup cooldown"
+                );
+            }
+        }
+    }
+
+    fn is_holder_in_cooldown(&mut self, holder: &str, now_us: i64) -> bool {
+        if self.holder_fail_threshold == 0 {
+            return false;
+        }
+        let Some(health) = self.holder_health.get_mut(holder) else {
+            return false;
+        };
+        let Some(until_us) = health.cooldown_until_us else {
+            return false;
+        };
+        if now_us < until_us {
+            health.suppressed_since_warn = health.suppressed_since_warn.saturating_add(1);
+            let should_warn = health
+                .last_warn_us
+                .is_none_or(|last| now_us.saturating_sub(last) >= COOLDOWN_WARN_INTERVAL_US);
+            if should_warn {
+                if self.member == 0 {
+                    tracing::warn!(
+                        holder,
+                        suppressed = health.suppressed_since_warn,
+                        remaining_ms = (until_us - now_us) / 1000,
+                        "holder_cooldown: skipping peer lookup for unhealthy holder"
+                    );
+                }
+                health.last_warn_us = Some(now_us);
+                health.suppressed_since_warn = 0;
+            }
+            true
+        } else {
+            // Cooldown expired: allow a half-open probe; keep consecutive_failures
+            // until the probe succeeds so a still-broken holder re-enters cooldown.
+            health.cooldown_until_us = None;
+            false
         }
     }
 }
@@ -970,4 +1134,33 @@ fn start_endpoint(
         replies,
         _servicer: servicer,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn holder_circuit_breaker_env_parser_defaults_overrides_and_disables() {
+        assert_eq!(
+            parse_holder_circuit_breaker_values(None, None),
+            (3, 30_000_000)
+        );
+        assert_eq!(
+            parse_holder_circuit_breaker_values(Some("0"), Some("12.5")),
+            (0, 12_500_000)
+        );
+        assert_eq!(
+            parse_holder_circuit_breaker_values(Some(" 5 "), Some(" 45 ")),
+            (5, 45_000_000)
+        );
+        assert_eq!(
+            parse_holder_circuit_breaker_values(Some("bad"), Some("-1.0")),
+            (3, 30_000_000)
+        );
+        assert_eq!(
+            parse_holder_circuit_breaker_values(Some("2"), Some("NaN")),
+            (2, 30_000_000)
+        );
+    }
 }

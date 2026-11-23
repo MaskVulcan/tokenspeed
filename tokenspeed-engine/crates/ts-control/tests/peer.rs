@@ -166,6 +166,7 @@ fn geometry_with_host(base: u64, host_base: u64) -> RankGeometry {
                 block_bytes: PAGE_BYTES,
                 field_offsets: vec![("layer.0.kv".into(), 0)],
             }],
+            region_lengths: Vec::new(),
         }),
         ..geometry(base)
     }
@@ -849,4 +850,142 @@ fn a_holder_that_moved_to_new_weights_is_no_longer_read() {
         .unwrap();
     let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "r");
     assert_eq!((prefix, landings.len()), (0, 0));
+}
+
+#[test]
+fn holder_read_failure_circuit_breaker_enters_cooldown_suppresses_lookups_and_recovers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use ts_control::peer::{geometry::Spans, read::PageReader};
+
+    struct ToggleReader {
+        arena: Arena,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl PageReader for ToggleReader {
+        fn read(&self, session: &str, spans: &Spans) -> Result<(), String> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err("injected HIXL physical read failure".to_owned());
+            }
+            self.arena.read(session, spans)
+        }
+    }
+
+    let arena = Arena::new(200_000);
+    let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
+
+    // Build reader with a toggleable physical PageReader and short cooldown (150 ms).
+    let fail = Arc::new(AtomicBool::new(true));
+    let toggle_reader = Arc::new(ToggleReader {
+        arena: arena.clone(),
+        fail: fail.clone(),
+    });
+    let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let reader_name = format!("127.0.0.1:{}", listener.port());
+    let reader_sched = Arc::new(Mutex::new(scheduler(
+        &reader_name,
+        1,
+        "Fused",
+        Landing::Device,
+    )));
+    let mut reader_peer = Peer::start(
+        settings(&reader_name, "v1"),
+        0,
+        vec![geometry(READER_BASE)],
+        Some(listener),
+        reader_sched.clone(),
+        toggle_reader,
+        Arc::new(NoPushes),
+    )
+    .unwrap();
+    reader_peer.set_holder_circuit_breaker(3, Duration::from_millis(150));
+    let mut reader = Replica {
+        name: reader_name,
+        scheduler: reader_sched,
+        peer: reader_peer,
+        decisions: Vec::new(),
+        landed: Vec::new(),
+    };
+    reader.enable_logical_metrics();
+
+    // Seed 5 distinct 6-page prefixes on the holder so reader has no local cache for each.
+    let prefixes: Vec<Vec<i32>> = (0..5)
+        .map(|k| ((k + 1) * 1000..(k + 1) * 1000 + 6 * PAGE).collect())
+        .collect();
+    for p in &prefixes {
+        holder_computes(&mut holder, p, &arena);
+    }
+
+    // Helper to submit, drive to prefill, and finish a request on reader.
+    let run_reader_req =
+        |reader: &mut Replica, holder: &mut Replica, rid: &str, prefix: &[i32]| -> i32 {
+            let mut prompt = prefix.to_vec();
+            prompt.extend(90_000..90_000 + PAGE);
+            reader
+                .scheduler
+                .lock()
+                .submit_requests(&[spec(rid, prompt, &holder.name)])
+                .unwrap();
+            let (hit, _) = rounds_until_prefill(reader, Some(holder), rid);
+            reader.advance(&[
+                event(ForwardEventKind::ExtendResult, rid, vec![7]),
+                event(ForwardEventKind::Finish, rid, Vec::new()),
+            ]);
+            reader.round();
+            hit
+        };
+
+    // 1st, 2nd, 3rd consecutive physical read failures trip the circuit breaker (threshold = 3).
+    assert_eq!(run_reader_req(&mut reader, &mut holder, "f1", &prefixes[0]), 0);
+    assert_eq!(reader.peer.holder_cooldown_state(&holder.name).0, 1);
+    assert!(reader.peer.holder_cooldown_state(&holder.name).1.is_none());
+
+    assert_eq!(run_reader_req(&mut reader, &mut holder, "f2", &prefixes[1]), 0);
+    assert_eq!(reader.peer.holder_cooldown_state(&holder.name).0, 2);
+    assert!(reader.peer.holder_cooldown_state(&holder.name).1.is_none());
+
+    assert_eq!(run_reader_req(&mut reader, &mut holder, "f3", &prefixes[2]), 0);
+    let (fails, cooldown_until) = reader.peer.holder_cooldown_state(&holder.name);
+    assert_eq!(fails, 3);
+    assert!(cooldown_until.is_some(), "expected holder to enter cooldown after 3 failures");
+
+    // 4th request while in cooldown: lookup is suppressed immediately with "holder_cooldown"
+    // without touching the holder (even if we don't step holder at all!).
+    reader.decisions.clear();
+    let mut prompt4 = prefixes[3].clone();
+    prompt4.extend(90_000..90_000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("f4-suppressed", prompt4, &holder.name)])
+        .unwrap();
+    let (hit4, landings4) = rounds_until_prefill(&mut reader, None, "f4-suppressed");
+    assert_eq!((hit4, landings4.len()), (0, 0));
+    assert!(
+        reader
+            .decisions
+            .contains(&("f4-suppressed".into(), "holder_cooldown")),
+        "expected holder_cooldown decision, got {:?}",
+        reader.decisions
+    );
+    reader.advance(&[
+        event(ForwardEventKind::ExtendResult, "f4-suppressed", vec![7]),
+        event(ForwardEventKind::Finish, "f4-suppressed", Vec::new()),
+    ]);
+    reader.round();
+
+    // Wait for cooldown (150 ms) to expire, heal physical reader, and send probe request.
+    fail.store(false, Ordering::Release);
+    std::thread::sleep(Duration::from_millis(200));
+    let hit5 = run_reader_req(&mut reader, &mut holder, "f5-probe", &prefixes[4]);
+    assert_eq!(
+        hit5,
+        6 * PAGE,
+        "post-cooldown probe must succeed and land the holder's prefix"
+    );
+    assert_eq!(
+        reader.peer.holder_cooldown_state(&holder.name),
+        (0, None),
+        "successful probe must reset failure counter and clear cooldown"
+    );
 }

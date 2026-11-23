@@ -122,11 +122,14 @@ def peer_scheduler_config(
     host = landing_tier == "host"
     if not host and landing_tier != "device":
         raise ValueError(f"unknown peer landing tier {landing_tier!r}")
+    answer_timeout_s = max(0.0, answer_timeout_ms / 1000.0)
+    soft_pin_s = max(SOFT_PIN_S, 2.0 * answer_timeout_s + 2.0)
+    host_ready_s = max(HOST_READY_S, answer_timeout_s + 5.0)
     return PeerConfig(
         name=name,
         incarnation=incarnation,
         max_leases=MAX_LEASES,
-        soft_pin_us=int(SOFT_PIN_S * 1e6),
+        soft_pin_us=int(soft_pin_s * 1e6),
         hard_pin_us=int(HARD_PIN_S * 1e6),
         lookup_timeout_us=answer_timeout_ms * 1000,
         min_fetch_tokens=min_fetch_tokens,
@@ -134,7 +137,7 @@ def peer_scheduler_config(
         max_host_landing_blocks=(
             max(1, int(num_host_blocks * HOST_LANDING_BLOCKS_FRACTION)) if host else 0
         ),
-        host_ready_timeout_us=int(HOST_READY_S * 1e6) if host else 0,
+        host_ready_timeout_us=int(host_ready_s * 1e6) if host else 0,
     )
 
 
@@ -165,11 +168,12 @@ class PeerHostGroup:
 
 @dataclass(frozen=True, slots=True)
 class PeerHostPool:
-    """The Host pool: its address and every cache group, in the scheduler's
-    order."""
+    """The Host pool: its address, every cache group in the scheduler's order,
+    and the lengths of consecutive registered memory regions (MRs) covering it."""
 
     address: int
     groups: tuple[PeerHostGroup, ...]
+    region_lengths: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,7 +279,11 @@ def build_peer_geometry(
     )
     return PeerGeometry(
         device=tuple(device),
-        host=PeerHostPool(address=host_address, groups=tuple(host_groups)),
+        host=PeerHostPool(
+            address=host_address,
+            groups=tuple(host_groups),
+            region_lengths=tuple(int(length) for _, length in host_regions),
+        ),
         regions=(
             *((int(address), int(length)) for address, length in device_regions),
             *host_regions,
