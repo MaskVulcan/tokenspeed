@@ -32,7 +32,7 @@ use std::{
 use parking_lot::Mutex;
 
 use crate::{
-    dispatch::{self, Chunk, Limits, Shared},
+    dispatch::{self, Chunk, IoPlan, Limits, Shared},
     file::{DiskFile, ALIGNMENT},
     psync, uring,
 };
@@ -260,6 +260,11 @@ impl Pieces {
         self.pieces.iter().copied()
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_raw_for_test(pieces: Vec<(usize, usize)>) -> Self {
+        Self { pieces }
+    }
+
     /// The piece holding `address`: its index and end.
     fn find(&self, address: usize) -> Option<(usize, usize)> {
         let index = self
@@ -272,9 +277,16 @@ impl Pieces {
 
     /// Cut `io` into requests of at most `max_io_bytes` that each stay in
     /// one piece; None when part of it is not registered.
-    fn split(&self, io: Io, direction: Direction, max_io_bytes: usize) -> Option<Vec<Chunk>> {
+    fn split(
+        &self,
+        io: Io,
+        io_index: usize,
+        direction: Direction,
+        max_io_bytes: usize,
+    ) -> Option<Vec<Chunk>> {
         let mut chunks = Vec::new();
         let (mut file_offset, mut address, mut remaining) = (io.file_offset, io.address, io.len);
+        let mut chunk_index = 0;
         while remaining > 0 {
             let (index, end) = self.find(address)?;
             let len = remaining.min(end - address).min(max_io_bytes);
@@ -285,11 +297,14 @@ impl Pieces {
                 address,
                 len,
                 buffer: u16::try_from(index).expect("pieces fit u16"),
+                io_index,
+                chunk_index,
                 issued_at: None,
             });
             file_offset += len as u64;
             address += len;
             remaining -= len;
+            chunk_index += 1;
         }
         Some(chunks)
     }
@@ -422,7 +437,8 @@ impl Executor {
             return Err(SubmitError::Empty);
         }
         let mut chunks = Vec::with_capacity(job.ios.len());
-        for &io in &job.ios {
+        let mut io_plans = Vec::with_capacity(job.ios.len());
+        for (io_index, &io) in job.ios.iter().enumerate() {
             if io.len == 0
                 || io.file_offset % ALIGNMENT as u64 != 0
                 || io.address % ALIGNMENT != 0
@@ -437,17 +453,30 @@ impl Executor {
             {
                 return Err(SubmitError::PastFile(io));
             }
-            chunks.extend(
-                self.pieces
-                    .split(io, job.direction, self.max_io_bytes)
-                    .ok_or(SubmitError::Unregistered(io))?,
-            );
+            let split = self
+                .pieces
+                .split(io, io_index, job.direction, self.max_io_bytes)
+                .ok_or(SubmitError::Unregistered(io))?;
+            io_plans.push(IoPlan {
+                file_offset: io.file_offset,
+                len: io.len,
+                chunks: split.len(),
+            });
+            chunks.extend(split);
         }
         let mut queues = self.shared.queues.lock();
         if queues.closing() || queues.degraded() {
             return Err(SubmitError::Closed);
         }
-        let id = queues.admit(job.direction, chunks, Box::new(done), Instant::now());
+        if job.direction == Direction::Write {
+            // Invalidate any previous checksums overlapping the target ranges
+            // before workers can touch disk, so a failed/cancelled write never
+            // leaves a stale checksum behind.
+            for plan in &io_plans {
+                self.shared.checksums.invalidate(plan.file_offset, plan.len);
+            }
+        }
+        let id = queues.admit(job.direction, io_plans, chunks, Box::new(done), Instant::now());
         drop(queues);
         self.shared.wake();
         Ok(JobId(id))
@@ -561,7 +590,7 @@ mod tests {
             len: 3 * ALIGNMENT,
         };
         let chunks = pieces
-            .split(io, Direction::Read, 16 * ALIGNMENT)
+            .split(io, 0, Direction::Read, 16 * ALIGNMENT)
             .expect("registered");
         let cut: Vec<_> = chunks
             .iter()
@@ -577,7 +606,7 @@ mod tests {
             address: base + PIECE_BYTES + 2 * ALIGNMENT,
             len: ALIGNMENT,
         };
-        assert!(pieces.split(outside, Direction::Read, ALIGNMENT).is_none());
+        assert!(pieces.split(outside, 0, Direction::Read, ALIGNMENT).is_none());
     }
 
     #[test]
@@ -589,7 +618,7 @@ mod tests {
             len: 5 * ALIGNMENT,
         };
         let lens: Vec<_> = pieces
-            .split(io, Direction::Write, 2 * ALIGNMENT)
+            .split(io, 0, Direction::Write, 2 * ALIGNMENT)
             .unwrap()
             .iter()
             .map(|chunk| chunk.len / ALIGNMENT)

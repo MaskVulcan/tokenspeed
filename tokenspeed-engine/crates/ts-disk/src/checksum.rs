@@ -18,8 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Hardware-accelerated CRC32C (Castagnoli) checksums and an in-memory table
-//! keyed by `(file_offset, len)` for end-to-end chunk integrity verification.
+//! Hardware-accelerated CRC32C (Castagnoli) checksums and an in-memory range
+//! table keyed by logical `Io` `(file_offset, len)` for end-to-end integrity
+//! verification independent of `Pieces::split` fixed-buffer boundaries.
 //!
 //! Storing checksums in host memory avoids changing the on-disk block layout
 //! or adding space overhead to `O_DIRECT` aligned slots while catching silent
@@ -27,7 +28,7 @@
 //! blocks can poison model attention.
 
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -123,11 +124,70 @@ pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
     crc32c_sw(bytes)
 }
 
-/// In-memory map of `(file_offset, len) -> crc32c` for chunks written through
-/// this executor.
+fn gf2_matrix_times(mat: &[u32; 32], mut vec: u32) -> u32 {
+    let mut sum = 0u32;
+    let mut idx = 0;
+    while vec != 0 {
+        if vec & 1 != 0 {
+            sum ^= mat[idx];
+        }
+        vec >>= 1;
+        idx += 1;
+    }
+    sum
+}
+
+fn gf2_matrix_square(square: &mut [u32; 32], mat: &[u32; 32]) {
+    for n in 0..32 {
+        square[n] = gf2_matrix_times(mat, mat[n]);
+    }
+}
+
+/// Combine CRC32C of two contiguous byte slices:
+/// `crc32c(a || b) == crc32c_combine(crc32c(a), crc32c(b), b.len())`.
+pub(crate) fn crc32c_combine(mut crc1: u32, crc2: u32, mut len2: usize) -> u32 {
+    if len2 == 0 {
+        return crc1;
+    }
+    let mut odd = [0u32; 32];
+    let mut even = [0u32; 32];
+    // Operator for one zero bit in the reflected Castagnoli polynomial.
+    odd[0] = CRC32C_POLY;
+    let mut row = 1u32;
+    for item in &mut odd[1..] {
+        *item = row;
+        row <<= 1;
+    }
+    // Operator for two zero bits, then four zero bits.
+    gf2_matrix_square(&mut even, &odd);
+    gf2_matrix_square(&mut odd, &even);
+    // Apply `len2` zero bytes to `crc1`.
+    loop {
+        gf2_matrix_square(&mut even, &odd);
+        if len2 & 1 != 0 {
+            crc1 = gf2_matrix_times(&even, crc1);
+        }
+        len2 >>= 1;
+        if len2 == 0 {
+            break;
+        }
+        gf2_matrix_square(&mut odd, &even);
+        if len2 & 1 != 0 {
+            crc1 = gf2_matrix_times(&odd, crc1);
+        }
+        len2 >>= 1;
+        if len2 == 0 {
+            break;
+        }
+    }
+    crc1 ^ crc2
+}
+
+/// In-memory map of non-overlapping file ranges `file_offset -> (len, crc32c)`
+/// for logical `Io` ranges written through this executor.
 pub(crate) struct ChecksumTable {
     enabled: AtomicBool,
-    entries: Mutex<HashMap<(u64, usize), u32>>,
+    entries: Mutex<BTreeMap<u64, (usize, u32)>>,
 }
 
 impl Default for ChecksumTable {
@@ -136,11 +196,27 @@ impl Default for ChecksumTable {
     }
 }
 
+fn invalidate_range_locked(entries: &mut BTreeMap<u64, (usize, u32)>, file_offset: u64, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = file_offset.saturating_add(len as u64);
+    if let Some((&prev_start, &(prev_len, _))) = entries.range(..file_offset).next_back() {
+        if prev_start.saturating_add(prev_len as u64) > file_offset {
+            entries.remove(&prev_start);
+        }
+    }
+    let overlapping: Vec<u64> = entries.range(file_offset..end).map(|(&k, _)| k).collect();
+    for key in overlapping {
+        entries.remove(&key);
+    }
+}
+
 impl ChecksumTable {
     pub(crate) fn new() -> Self {
         Self {
             enabled: AtomicBool::new(true),
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -152,34 +228,77 @@ impl ChecksumTable {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Record the checksum of a chunk about to be written.
+    /// Record a precomputed CRC32C for `[file_offset, file_offset + len)`,
+    /// evicting any previously overlapping entries so slot reuse across block
+    /// sizes never leaves stale checksums behind.
+    pub(crate) fn record_crc(&self, file_offset: u64, len: usize, crc: u32) {
+        if !self.enabled() || len == 0 {
+            return;
+        }
+        let mut entries = self.entries.lock();
+        invalidate_range_locked(&mut entries, file_offset, len);
+        entries.insert(file_offset, (len, crc));
+    }
+
+    /// Record the checksum of a range about to be or just written.
+    #[cfg(test)]
     pub(crate) fn record(&self, file_offset: u64, bytes: &[u8]) {
-        if !self.enabled() {
+        if !self.enabled() || bytes.is_empty() {
             return;
         }
         let crc = crc32c(bytes);
-        self.entries.lock().insert((file_offset, bytes.len()), crc);
+        self.record_crc(file_offset, bytes.len(), crc);
     }
 
-    /// Drop any recorded checksum for a chunk whose write failed.
+    /// Drop any recorded checksums overlapping `[file_offset, file_offset + len)`.
     pub(crate) fn invalidate(&self, file_offset: u64, len: usize) {
-        if !self.enabled() {
+        if len == 0 {
             return;
         }
-        self.entries.lock().remove(&(file_offset, len));
+        let mut entries = self.entries.lock();
+        invalidate_range_locked(&mut entries, file_offset, len);
     }
 
-    /// Verify a completed read against the checksum recorded on write.
+    /// Verify a precomputed read CRC32C against the checksum recorded on write.
     ///
     /// Unrecorded ranges (e.g. direct reads of pre-populated test files) pass
     /// through without error.
+    pub(crate) fn verify_crc(
+        &self,
+        file_offset: u64,
+        len: usize,
+        actual: u32,
+    ) -> Result<(), (u32, u32)> {
+        if !self.enabled() {
+            return Ok(());
+        }
+        let expected = {
+            let entries = self.entries.lock();
+            entries
+                .get(&file_offset)
+                .filter(|&&(recorded_len, _)| recorded_len == len)
+                .map(|&(_, crc)| crc)
+        };
+        if let Some(expected) = expected {
+            if actual != expected {
+                return Err((expected, actual));
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify a completed read slice against the checksum recorded on write.
+    #[cfg(test)]
     pub(crate) fn verify(&self, file_offset: u64, bytes: &[u8]) -> Result<(), (u32, u32)> {
         if !self.enabled() {
             return Ok(());
         }
         let expected = {
             let entries = self.entries.lock();
-            entries.get(&(file_offset, bytes.len())).copied()
+            entries
+                .get(&file_offset)
+                .filter(|&&(recorded_len, _)| recorded_len == bytes.len())
+                .map(|&(_, crc)| crc)
         };
         if let Some(expected) = expected {
             let actual = crc32c(bytes);
@@ -241,5 +360,49 @@ mod tests {
         table.set_enabled(true);
         table.invalidate(8192, data.len());
         assert_eq!(table.verify(8192, &data), Ok(()));
+    }
+
+    #[test]
+    fn crc32c_combine_matches_whole_buffer_across_splits() {
+        let buf: Vec<u8> = (0..16_384)
+            .map(|i| ((i * 73 + 19) & 0xFF) as u8)
+            .collect();
+        let full = crc32c(&buf);
+        for split in [0, 1, 7, 13, 64, 4095, 4096, 4097, 8192, 12288, 16_383, 16_384] {
+            let combined = crc32c_combine(crc32c(&buf[..split]), crc32c(&buf[split..]), buf.len() - split);
+            assert_eq!(combined, full, "combine mismatch at split={split}");
+        }
+        // Three-way split.
+        let c0 = crc32c(&buf[..4096]);
+        let c1 = crc32c(&buf[4096..12288]);
+        let c2 = crc32c(&buf[12288..]);
+        let c01 = crc32c_combine(c0, c1, 8192);
+        assert_eq!(crc32c_combine(c01, c2, 4096), full);
+    }
+
+    #[test]
+    fn table_invalidates_overlapping_ranges_on_different_size_overwrite() {
+        let table = ChecksumTable::new();
+        let a = vec![0x11u8; 4096];
+        let b = vec![0x22u8; 4096];
+        let ab_new = vec![0x33u8; 8192];
+        table.record(0, &a);
+        table.record(4096, &b);
+        assert_eq!(table.verify(0, &a), Ok(()));
+        assert_eq!(table.verify(4096, &b), Ok(()));
+
+        // Overwriting [0, 8192) removes both [0, 4096) and [4096, 8192).
+        table.record(0, &ab_new);
+        assert_eq!(table.verify(0, &ab_new), Ok(()));
+        // Old sub-range checksums are gone (no false mismatch against stale CRC).
+        let stale_probe = vec![0x99u8; 4096];
+        assert_eq!(table.verify(0, &stale_probe), Ok(()));
+        assert_eq!(table.verify(4096, &stale_probe), Ok(()));
+
+        // Overwriting the second half [4096, 8192) evicts the enclosing [0, 8192).
+        table.record(4096, &b);
+        assert_eq!(table.verify(4096, &b), Ok(()));
+        let whole_probe = vec![0x77u8; 8192];
+        assert_eq!(table.verify(0, &whole_probe), Ok(()));
     }
 }

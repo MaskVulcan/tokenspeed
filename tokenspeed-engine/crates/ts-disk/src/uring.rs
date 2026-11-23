@@ -35,6 +35,7 @@ use std::{
 use io_uring::{opcode, squeue, types, IoUring};
 
 use crate::{
+    checksum::crc32c,
     dispatch::{self, Chunk, Shared},
     executor::{Direction, IoError, Pieces},
     file::{DiskFile, ALIGNMENT},
@@ -58,6 +59,7 @@ struct InFlight {
     chunk: Chunk,
     done: usize,
     retries: u8,
+    write_crc: Option<u32>,
 }
 
 pub(crate) struct Ring {
@@ -119,7 +121,7 @@ impl Ring {
                 tracing::warn!(
                     %error,
                     pieces = buffers.len(),
-                    "io_uring register_buffers failed (check RLIMIT_MEMLOCK / THP); \
+                    "io_uring register_buffers failed (check RLIMIT_MEMLOCK / THP / device-pinned memory); \
                      falling back to non-fixed O_DIRECT ops"
                 );
                 false
@@ -131,6 +133,20 @@ impl Ring {
             fd: file.raw_fd(),
             depth,
             fixed_buffers,
+            r_disabled,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_non_fixed(file: &DiskFile, depth: usize) -> io::Result<Self> {
+        let entries = u32::try_from((depth + 1).next_power_of_two())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let (ring, r_disabled) = build_ring(entries)?;
+        Ok(Self {
+            ring,
+            fd: file.raw_fd(),
+            depth,
+            fixed_buffers: false,
             r_disabled,
         })
     }
@@ -158,7 +174,8 @@ impl Ring {
         let mut retries: VecDeque<InFlight> = VecDeque::new();
         let mut armed = false;
         let mut to_issue: Vec<InFlight> = Vec::with_capacity(self.depth);
-        let mut outcomes: Vec<(Chunk, Result<(), IoError>)> = Vec::with_capacity(self.depth);
+        let mut outcomes: Vec<(Chunk, Result<(), IoError>, Option<u32>)> =
+            Vec::with_capacity(self.depth);
         loop {
             let sq_space = {
                 let submission = self.ring.submission();
@@ -181,6 +198,7 @@ impl Ring {
                                 chunk,
                                 done: 0,
                                 retries: 0,
+                                write_crc: None,
                             },
                             None => break,
                         },
@@ -198,20 +216,23 @@ impl Ring {
             }
             // Compute write CRC32C outside `shared.queues` to avoid holding
             // the dispatch mutex during hashing.
-            for inflight in &to_issue {
-                if inflight.chunk.direction == Direction::Write
-                    && inflight.done == 0
-                    && inflight.retries == 0
-                {
-                    // SAFETY: the chunk lies in registered memory that stays
-                    // mapped until the executor closes.
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(
-                            inflight.chunk.address as *const u8,
-                            inflight.chunk.len,
-                        )
-                    };
-                    shared.checksums.record(inflight.chunk.file_offset, slice);
+            if shared.checksums.enabled() {
+                for inflight in &mut to_issue {
+                    if inflight.chunk.direction == Direction::Write
+                        && inflight.done == 0
+                        && inflight.retries == 0
+                        && inflight.write_crc.is_none()
+                    {
+                        // SAFETY: the chunk lies in registered memory that stays
+                        // mapped until the executor closes.
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(
+                                inflight.chunk.address as *const u8,
+                                inflight.chunk.len,
+                            )
+                        };
+                        inflight.write_crc = Some(crc32c(slice));
+                    }
                 }
             }
             {
@@ -274,16 +295,12 @@ impl Ring {
                         inflight.retries += 1;
                         retries.push_back(inflight);
                     } else {
-                        if inflight.chunk.direction == Direction::Write {
-                            shared
-                                .checksums
-                                .invalidate(inflight.chunk.file_offset, inflight.chunk.len);
-                        }
-                        outcomes.push((inflight.chunk, Err(IoError::Os(-result))));
+                        outcomes.push((inflight.chunk, Err(IoError::Os(-result)), None));
                     }
                     continue;
                 }
                 let remaining = inflight.chunk.len - inflight.done;
+                let mut chunk_crc = None;
                 let outcome = match usize::try_from(result) {
                     Err(_) => Err(IoError::Os(-result)),
                     Ok(0) => Err(IoError::Short {
@@ -307,45 +324,36 @@ impl Ring {
                     }
                     Ok(n) if n == remaining => {
                         if inflight.chunk.direction == Direction::Read {
-                            // SAFETY: the read just completed into registered
-                            // memory that stays mapped until close.
-                            let slice = unsafe {
-                                std::slice::from_raw_parts(
-                                    inflight.chunk.address as *const u8,
-                                    inflight.chunk.len,
-                                )
-                            };
-                            match shared.checksums.verify(inflight.chunk.file_offset, slice) {
-                                Ok(()) => Ok(()),
-                                Err((expected, actual)) => {
-                                    tracing::error!(
-                                        file_offset = inflight.chunk.file_offset,
-                                        len = inflight.chunk.len,
-                                        expected = format_args!("{expected:#010x}"),
-                                        actual = format_args!("{actual:#010x}"),
-                                        "disk read CRC32C mismatch; dropping corrupted chunk"
-                                    );
-                                    Err(IoError::ChecksumMismatch { expected, actual })
-                                }
+                            if shared.checksums.enabled() {
+                                // SAFETY: the read just completed into registered
+                                // memory that stays mapped until close.
+                                let slice = unsafe {
+                                    std::slice::from_raw_parts(
+                                        inflight.chunk.address as *const u8,
+                                        inflight.chunk.len,
+                                    )
+                                };
+                                chunk_crc = Some(crc32c(slice));
                             }
                         } else {
-                            Ok(())
+                            chunk_crc = inflight.write_crc;
                         }
+                        Ok(())
                     }
                     Ok(_) => Err(IoError::Os(libc::EIO)),
                 };
-                if outcome.is_err() && inflight.chunk.direction == Direction::Write {
-                    shared
-                        .checksums
-                        .invalidate(inflight.chunk.file_offset, inflight.chunk.len);
-                }
-                outcomes.push((inflight.chunk, outcome));
+                outcomes.push((inflight.chunk, outcome, chunk_crc));
             }
             let mut finished = Vec::new();
             if !outcomes.is_empty() {
                 let mut queues = shared.queues.lock();
-                for (chunk, outcome) in outcomes.drain(..) {
-                    finished.extend(queues.finish(chunk, outcome));
+                for (chunk, outcome, chunk_crc) in outcomes.drain(..) {
+                    finished.extend(queues.finish_with_checksum(
+                        chunk,
+                        outcome,
+                        chunk_crc,
+                        &shared.checksums,
+                    ));
                 }
             }
             shared.work.notify_all();
@@ -385,5 +393,173 @@ fn request(fd: RawFd, inflight: InFlight, fixed_buffers: bool) -> squeue::Entry 
                 .ioprio(IOPRIO_WRITE)
                 .build()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        os::fd::{FromRawFd, OwnedFd},
+        path::PathBuf,
+        sync::{mpsc, Arc},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use super::*;
+    use crate::{
+        dispatch::{Chunk, IoPlan, Limits, Shared},
+        executor::JobReport,
+        memory::Memory,
+    };
+
+    struct ScratchFile(PathBuf);
+
+    impl ScratchFile {
+        fn new(name: &str) -> Self {
+            let dir = std::env::var_os("TS_DISK_TEST_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            Self(dir.join(format!("ts-disk-uring-{}-{name}", std::process::id())))
+        }
+    }
+
+    impl Drop for ScratchFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn register_buffers_efault_falls_back_to_non_fixed_without_failing() {
+        let scratch = ScratchFile::new("efault-fallback");
+        let file = DiskFile::create(&scratch.0, 16 * ALIGNMENT as u64).unwrap();
+        // A PROT_READ mapping triggers EFAULT (os error 14) on
+        // io_uring_register_buffers (FOLL_WRITE | FOLL_LONGTERM), mirroring
+        // device-pinned memory (e.g. torch_npu) that cannot be pinned as fixed.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                ALIGNMENT,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED);
+        let pieces = Pieces::from_raw_for_test(vec![(ptr as usize, ptr as usize + ALIGNMENT)]);
+        let ring = Ring::new(&file, &pieces, 4).expect("EFAULT should fall back cleanly");
+        assert!(!ring.fixed_buffers);
+        drop(ring);
+        unsafe {
+            libc::munmap(ptr, ALIGNMENT);
+        }
+    }
+
+    #[test]
+    fn non_fixed_direct_io_round_trips_with_crc32c() {
+        let scratch = ScratchFile::new("non-fixed-round-trip");
+        let file = DiskFile::create(&scratch.0, 16 * ALIGNMENT as u64).unwrap();
+        let mut memory = Memory::map(4 * ALIGNMENT).unwrap();
+        let payload: Vec<u8> = (0..2 * ALIGNMENT)
+            .map(|i| (i as u8).wrapping_mul(17).wrapping_add(5))
+            .collect();
+        memory.write_at(0, &payload);
+
+        let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(efd >= 0);
+        let eventfd = unsafe { OwnedFd::from_raw_fd(efd) };
+        let shared = Arc::new(Shared::new(
+            Limits {
+                depth: 4,
+                write_depth: 2,
+            },
+            Some(eventfd),
+        ));
+        let ring = Ring::new_non_fixed(&file, 4).unwrap();
+        assert!(!ring.fixed_buffers);
+        let worker_shared = shared.clone();
+        let worker = thread::spawn(move || ring.run(&worker_shared));
+
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut queues = shared.queues.lock();
+            queues.admit(
+                Direction::Write,
+                vec![IoPlan {
+                    file_offset: 0,
+                    len: 2 * ALIGNMENT,
+                    chunks: 2,
+                }],
+                [
+                    Chunk {
+                        job: 0,
+                        direction: Direction::Write,
+                        file_offset: 0,
+                        address: memory.address(),
+                        len: ALIGNMENT,
+                        buffer: 0,
+                        io_index: 0,
+                        chunk_index: 0,
+                        issued_at: None,
+                    },
+                    Chunk {
+                        job: 0,
+                        direction: Direction::Write,
+                        file_offset: ALIGNMENT as u64,
+                        address: memory.address() + ALIGNMENT,
+                        len: ALIGNMENT,
+                        buffer: 0,
+                        io_index: 0,
+                        chunk_index: 1,
+                        issued_at: None,
+                    },
+                ],
+                Box::new(move |report: JobReport| tx.send(report.outcome).unwrap()),
+                Instant::now(),
+            );
+            queues.release_write();
+            queues.release_write();
+        }
+        shared.wake();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(()));
+
+        // Read back into a separate slot as ONE single chunk (different split!) and verify bytes + CRC32C.
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut queues = shared.queues.lock();
+            queues.admit(
+                Direction::Read,
+                vec![IoPlan {
+                    file_offset: 0,
+                    len: 2 * ALIGNMENT,
+                    chunks: 1,
+                }],
+                [Chunk {
+                    job: 0,
+                    direction: Direction::Read,
+                    file_offset: 0,
+                    address: memory.address() + 2 * ALIGNMENT,
+                    len: 2 * ALIGNMENT,
+                    buffer: 0,
+                    io_index: 0,
+                    chunk_index: 0,
+                    issued_at: None,
+                }],
+                Box::new(move |report: JobReport| tx.send(report.outcome).unwrap()),
+                Instant::now(),
+            );
+        }
+        shared.wake();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(()));
+
+        let mut actual = vec![0u8; 2 * ALIGNMENT];
+        memory.read_at(2 * ALIGNMENT, &mut actual);
+        assert_eq!(actual, payload);
+
+        let _ = shared.queues.lock().close();
+        shared.wake();
+        worker.join().unwrap();
     }
 }

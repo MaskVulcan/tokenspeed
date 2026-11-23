@@ -550,6 +550,24 @@ impl Holder {
         budget: Duration,
         items: Vec<PushItem>,
     ) {
+        if self.state.source.executor.degraded() || self.state.source.executor.broken() {
+            tracing::warn!(
+                job = key.job,
+                reader = key.reply_to,
+                "rejecting peer push because holder Disk executor is degraded"
+            );
+            if let Some(sockets) = sockets.upgrade() {
+                send(
+                    &sockets,
+                    &key.reply_to,
+                    &Message::Done {
+                        job: key.job,
+                        ok: false,
+                    },
+                );
+            }
+            return;
+        }
         let running = Arc::new(Running::new());
         {
             let mut running_map = self.state.running.lock();
@@ -642,6 +660,9 @@ impl HolderState {
         let lane = PUSHES.hold();
         let begin_ns = profile::now_ns();
         let deadline = Instant::now() + budget.min(MAX_PUSH_BUDGET);
+        if self.source.executor.degraded() || self.source.executor.broken() {
+            return false;
+        }
 
         // Pre-validate every item before issuing any disk read or RDMA write.
         let mut ranges = Vec::with_capacity(items.len());
@@ -722,8 +743,26 @@ impl HolderState {
             if inflight.is_empty() {
                 break;
             }
-            let Ok((index, slot_idx, read)) = completions.recv() else {
-                break;
+            let (index, slot_idx, read) = match completions.recv_timeout(Duration::from_millis(50))
+            {
+                Ok(item) => item,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.source.executor.broken() {
+                        tracing::error!(
+                            inflight = inflight.len(),
+                            "holder Disk executor broke down during peer push; retiring push without reusing unretired staging slots"
+                        );
+                        // The kernel may still write into these staging slots;
+                        // leak their SlotGuards so no future push reuses them.
+                        for (_, (slot_guard, _)) in inflight.drain() {
+                            std::mem::forget(slot_guard);
+                        }
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             let Some((_slot_guard, _job_id)) = inflight.remove(&slot_idx) else {
                 continue;

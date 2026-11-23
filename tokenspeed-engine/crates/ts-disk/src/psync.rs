@@ -24,7 +24,7 @@
 use std::{io, os::fd::RawFd, thread};
 
 use crate::{
-    checksum::ChecksumTable,
+    checksum::{crc32c, ChecksumTable},
     dispatch::{self, Chunk, Shared},
     executor::{Direction, IoError},
     file::{DiskFile, ALIGNMENT},
@@ -48,44 +48,38 @@ pub(crate) fn run(shared: &Shared, file: &DiskFile) {
                 shared.work.wait(&mut queues);
             }
         };
-        let result = transfer(file.raw_fd(), chunk, &shared.checksums);
-        let finished = shared.queues.lock().finish(chunk, result);
+        let (result, chunk_crc) = transfer(file.raw_fd(), chunk, &shared.checksums);
+        let finished = shared.queues.lock().finish_with_checksum(
+            chunk,
+            result,
+            chunk_crc,
+            &shared.checksums,
+        );
         shared.work.notify_all();
         dispatch::report(finished);
     }
 }
 
-fn transfer(fd: RawFd, chunk: Chunk, checksums: &ChecksumTable) -> Result<(), IoError> {
-    if chunk.direction == Direction::Write {
+fn transfer(
+    fd: RawFd,
+    chunk: Chunk,
+    checksums: &ChecksumTable,
+) -> (Result<(), IoError>, Option<u32>) {
+    let mut chunk_crc = None;
+    if chunk.direction == Direction::Write && checksums.enabled() {
         // SAFETY: the chunk lies in memory the executor's caller keeps mapped
         // (`Executor::start`).
         let slice = unsafe { std::slice::from_raw_parts(chunk.address as *const u8, chunk.len) };
-        checksums.record(chunk.file_offset, slice);
+        chunk_crc = Some(crc32c(slice));
     }
     let result = transfer_raw(fd, chunk);
-    match (chunk.direction, &result) {
-        (Direction::Write, Err(_)) => {
-            checksums.invalidate(chunk.file_offset, chunk.len);
-        }
-        (Direction::Read, Ok(())) => {
-            // SAFETY: the read just completed into registered memory that stays
-            // mapped until close.
-            let slice =
-                unsafe { std::slice::from_raw_parts(chunk.address as *const u8, chunk.len) };
-            if let Err((expected, actual)) = checksums.verify(chunk.file_offset, slice) {
-                tracing::error!(
-                    file_offset = chunk.file_offset,
-                    len = chunk.len,
-                    expected = format_args!("{expected:#010x}"),
-                    actual = format_args!("{actual:#010x}"),
-                    "disk read CRC32C mismatch; dropping corrupted chunk"
-                );
-                return Err(IoError::ChecksumMismatch { expected, actual });
-            }
-        }
-        _ => {}
+    if chunk.direction == Direction::Read && result.is_ok() && checksums.enabled() {
+        // SAFETY: the read just completed into registered memory that stays
+        // mapped until close.
+        let slice = unsafe { std::slice::from_raw_parts(chunk.address as *const u8, chunk.len) };
+        chunk_crc = Some(crc32c(slice));
     }
-    result
+    (result, chunk_crc)
 }
 
 fn transfer_raw(fd: RawFd, chunk: Chunk) -> Result<(), IoError> {

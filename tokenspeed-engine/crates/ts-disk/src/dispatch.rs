@@ -35,7 +35,7 @@ use std::{
 use parking_lot::{Condvar, Mutex};
 
 use crate::{
-    checksum::ChecksumTable,
+    checksum::{crc32c_combine, ChecksumTable},
     executor::{Direction, IoError, JobReport, Pressure, Stats},
 };
 
@@ -72,8 +72,56 @@ pub(crate) struct Chunk {
     pub address: usize,
     pub len: usize,
     pub buffer: u16,
+    /// Index of the logical `Io` in the owning job.
+    pub io_index: usize,
+    /// Sequential chunk index within that logical `Io` (for CRC32C combine).
+    pub chunk_index: usize,
     /// When the chunk was dispatched to the backend (for read-latency AIMD).
     pub issued_at: Option<Instant>,
+}
+
+/// Logical `Io` bounds before `Pieces::split`, used to combine per-chunk
+/// CRC32Cs back to the logical Disk block range.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IoPlan {
+    pub file_offset: u64,
+    pub len: usize,
+    pub chunks: usize,
+}
+
+struct IoChecksumState {
+    file_offset: u64,
+    len: usize,
+    chunk_crcs: Vec<Option<(u32, usize)>>,
+    remaining: usize,
+    failed: bool,
+}
+
+impl IoChecksumState {
+    fn new(plan: IoPlan) -> Self {
+        Self {
+            file_offset: plan.file_offset,
+            len: plan.len,
+            chunk_crcs: vec![None; plan.chunks],
+            remaining: plan.chunks,
+            failed: false,
+        }
+    }
+
+    fn combined_crc(&self) -> Option<u32> {
+        let mut combined = 0u32;
+        let mut first = true;
+        for entry in &self.chunk_crcs {
+            let (crc, len) = (*entry)?;
+            if first {
+                combined = crc;
+                first = false;
+            } else {
+                combined = crc32c_combine(combined, crc, len);
+            }
+        }
+        (!first).then_some(combined)
+    }
 }
 
 struct JobEntry {
@@ -84,6 +132,7 @@ struct JobEntry {
     issued_at: Option<Instant>,
     queued: usize,
     inflight: usize,
+    ios: Vec<IoChecksumState>,
     error: Option<IoError>,
     cancelled: bool,
     done: Option<Done>,
@@ -206,10 +255,11 @@ pub(crate) struct Queues {
 }
 
 impl Queues {
-    /// Queue a job's chunks; returns its id.
+    /// Queue a job's chunks and logical `Io` plans; returns its id.
     pub(crate) fn admit(
         &mut self,
         direction: Direction,
+        ios: Vec<IoPlan>,
         chunks: impl IntoIterator<Item = Chunk>,
         done: Done,
         now: Instant,
@@ -236,6 +286,7 @@ impl Queues {
                 issued_at: None,
                 queued,
                 inflight: 0,
+                ios: ios.into_iter().map(IoChecksumState::new).collect(),
                 error: None,
                 cancelled: false,
                 done: Some(done),
@@ -274,13 +325,32 @@ impl Queues {
         Some(chunk)
     }
 
-    /// A chunk retired with `result`; returns all jobs that ended (usually 0
-    /// or 1, or more if this error tripped the degraded circuit breaker).
-    pub(crate) fn finish(&mut self, chunk: Chunk, result: Result<(), IoError>) -> Finished {
-        self.finish_at(chunk, result, Instant::now())
+    /// A chunk retired with `result` and optional chunk CRC32C; combines chunk
+    /// CRCs per logical `Io` into `checksums` and returns all jobs that ended
+    /// (usually 0 or 1, or more if this error tripped the circuit breaker).
+    pub(crate) fn finish_with_checksum(
+        &mut self,
+        chunk: Chunk,
+        result: Result<(), IoError>,
+        chunk_crc: Option<u32>,
+        checksums: &ChecksumTable,
+    ) -> Finished {
+        self.finish_at(chunk, result, chunk_crc, Some(checksums), Instant::now())
     }
 
-    fn finish_at(&mut self, chunk: Chunk, result: Result<(), IoError>, now: Instant) -> Finished {
+    #[cfg(test)]
+    pub(crate) fn finish(&mut self, chunk: Chunk, result: Result<(), IoError>) -> Finished {
+        self.finish_at(chunk, result, None, None, Instant::now())
+    }
+
+    fn finish_at(
+        &mut self,
+        chunk: Chunk,
+        mut result: Result<(), IoError>,
+        chunk_crc: Option<u32>,
+        checksums: Option<&ChecksumTable>,
+        now: Instant,
+    ) -> Finished {
         match chunk.direction {
             Direction::Read => self.inflight_reads -= 1,
             Direction::Write => self.inflight_writes -= 1,
@@ -313,6 +383,48 @@ impl Queues {
             .get_mut(&chunk.job)
             .expect("an issued chunk's job");
         entry.inflight -= 1;
+        if let Some(io_state) = entry.ios.get_mut(chunk.io_index) {
+            if result.is_ok() {
+                if let (Some(crc), Some(slot)) =
+                    (chunk_crc, io_state.chunk_crcs.get_mut(chunk.chunk_index))
+                {
+                    *slot = Some((crc, chunk.len));
+                }
+                io_state.remaining = io_state.remaining.saturating_sub(1);
+                if io_state.remaining == 0 && !io_state.failed {
+                    if let (Some(table), Some(combined)) = (checksums, io_state.combined_crc()) {
+                        match chunk.direction {
+                            Direction::Write => {
+                                if !entry.cancelled && entry.error.is_none() {
+                                    table.record_crc(io_state.file_offset, io_state.len, combined);
+                                }
+                            }
+                            Direction::Read => {
+                                if let Err((expected, actual)) =
+                                    table.verify_crc(io_state.file_offset, io_state.len, combined)
+                                {
+                                    tracing::error!(
+                                        file_offset = io_state.file_offset,
+                                        len = io_state.len,
+                                        expected = format_args!("{expected:#010x}"),
+                                        actual = format_args!("{actual:#010x}"),
+                                        "disk read CRC32C mismatch; dropping corrupted block"
+                                    );
+                                    result = Err(IoError::ChecksumMismatch { expected, actual });
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                io_state.failed = true;
+                if chunk.direction == Direction::Write {
+                    if let Some(table) = checksums {
+                        table.invalidate(io_state.file_offset, io_state.len);
+                    }
+                }
+            }
+        }
         if let Err(error) = result {
             entry.error.get_or_insert(error);
             // Its other chunks are not issued: the job failed already.
@@ -588,8 +700,20 @@ mod tests {
             address: 0,
             len,
             buffer: 0,
+            io_index: 0,
+            chunk_index: 0,
             issued_at: None,
         }
+    }
+
+    fn admit_chunks(
+        queues: &mut Queues,
+        direction: Direction,
+        chunks: impl IntoIterator<Item = Chunk>,
+        done: Done,
+        now: Instant,
+    ) -> u64 {
+        queues.admit(direction, Vec::new(), chunks, done, now)
     }
 
     type Outcomes = std::sync::Arc<Mutex<Vec<Result<(), IoError>>>>;
@@ -613,7 +737,8 @@ mod tests {
         let mut queues = Queues::default();
         let now = Instant::now();
         let (done, _) = recorder();
-        queues.admit(
+        admit_chunks(
+            &mut queues,
             Direction::Write,
             [chunk(Direction::Write, 1), chunk(Direction::Write, 1)],
             done,
@@ -622,7 +747,7 @@ mod tests {
         queues.release_write();
         queues.release_write();
         let (done, _) = recorder();
-        queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done, now);
+        admit_chunks(&mut queues, Direction::Read, [chunk(Direction::Read, 1)], done, now);
         assert_eq!(queues.next(LIMITS).unwrap().direction, Direction::Read);
         assert_eq!(queues.next(LIMITS).unwrap().direction, Direction::Write);
         // One write in flight is the share, though a slot is free.
@@ -633,7 +758,8 @@ mod tests {
     fn a_job_reports_once_after_its_last_chunk_and_keeps_the_first_error() {
         let mut queues = Queues::default();
         let (done, seen) = recorder();
-        queues.admit(
+        admit_chunks(
+            &mut queues,
             Direction::Read,
             [
                 chunk(Direction::Read, 1),
@@ -660,7 +786,8 @@ mod tests {
     fn a_cancelled_job_waits_for_its_chunks_in_flight() {
         let mut queues = Queues::default();
         let (done, _) = recorder();
-        let job = queues.admit(
+        let job = admit_chunks(
+            &mut queues,
             Direction::Read,
             [chunk(Direction::Read, 1), chunk(Direction::Read, 1)],
             done,
@@ -680,7 +807,8 @@ mod tests {
     fn closing_cancels_what_is_queued() {
         let mut queues = Queues::default();
         let (done, _) = recorder();
-        queues.admit(
+        admit_chunks(
+            &mut queues,
             Direction::Write,
             [chunk(Direction::Write, 1)],
             done,
@@ -756,14 +884,14 @@ mod tests {
         let now = Instant::now();
         // Queue one extra job that will remain unissued when the breaker trips.
         let (done_queued, seen_queued) = recorder();
-        queues.admit(Direction::Write, [chunk(Direction::Write, 1)], done_queued, now);
+        admit_chunks(&mut queues, Direction::Write, [chunk(Direction::Write, 1)], done_queued, now);
         queues.release_write();
 
         // Fail MAX_CONSECUTIVE_DISK_ERRORS reads consecutively.
         let mut last_finished = Vec::new();
         for _ in 0..MAX_CONSECUTIVE_DISK_ERRORS {
             let (done, _) = recorder();
-            queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done, now);
+            admit_chunks(&mut queues, Direction::Read, [chunk(Direction::Read, 1)], done, now);
             let issued = queues.next(LIMITS).unwrap();
             last_finished = queues.finish(issued, Err(IoError::Os(libc::EIO)));
         }
@@ -775,7 +903,7 @@ mod tests {
         assert_eq!(*seen_queued.lock(), vec![Err(IoError::Os(libc::EIO))]);
         // No more work is dispatched once degraded.
         let (done_after, _) = recorder();
-        queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done_after, now);
+        admit_chunks(&mut queues, Direction::Read, [chunk(Direction::Read, 1)], done_after, now);
         assert_eq!(queues.next(LIMITS), None);
     }
 
@@ -785,19 +913,19 @@ mod tests {
         let now = Instant::now();
         for _ in 0..(MAX_CONSECUTIVE_DISK_ERRORS - 1) {
             let (done, _) = recorder();
-            queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done, now);
+            admit_chunks(&mut queues, Direction::Read, [chunk(Direction::Read, 1)], done, now);
             let issued = queues.next(LIMITS).unwrap();
             let _ = queues.finish(issued, Err(IoError::Os(libc::EIO)));
         }
         assert!(!queues.degraded());
         // One healthy completion resets the streak.
         let (done, _) = recorder();
-        queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done, now);
+        admit_chunks(&mut queues, Direction::Read, [chunk(Direction::Read, 1)], done, now);
         let issued = queues.next(LIMITS).unwrap();
         let _ = queues.finish(issued, Ok(()));
         // Another error does not trip the breaker.
         let (done, _) = recorder();
-        queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done, now);
+        admit_chunks(&mut queues, Direction::Read, [chunk(Direction::Read, 1)], done, now);
         let issued = queues.next(LIMITS).unwrap();
         let _ = queues.finish(issued, Err(IoError::Os(libc::EIO)));
         assert!(!queues.degraded());

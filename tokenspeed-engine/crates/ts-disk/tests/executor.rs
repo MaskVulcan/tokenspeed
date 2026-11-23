@@ -368,3 +368,159 @@ fn closing_cancels_queued_jobs_and_refuses_new_ones() {
         Err(SubmitError::Closed)
     );
 }
+
+fn straddling_checksum_round_trip(backend: Backend, name: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let scratch = ScratchFile::new(name);
+    // Register two contiguous pieces in `straddling` (mirroring a 1 GiB
+    // PIECE_BYTES split boundary) plus a separate contiguous `staging` buffer
+    // (mirroring a non-straddling push_ring / aligned Host slot).
+    let mut straddling = Memory::map(4 * ALIGNMENT).unwrap();
+    let mut staging = Memory::map(4 * ALIGNMENT).unwrap();
+    let file = DiskFile::create(&scratch.0, FILE_BYTES).unwrap();
+    let executor = Executor::start(
+        file,
+        &[
+            (straddling.address(), 2 * ALIGNMENT),
+            (straddling.address() + 2 * ALIGNMENT, 2 * ALIGNMENT),
+            (staging.address(), staging.size()),
+        ],
+        ExecutorConfig {
+            max_io_bytes: 4 * ALIGNMENT,
+            ..config(backend)
+        },
+    )
+    .unwrap();
+
+    // 1. Write 2*ALIGNMENT straddling the piece boundary (split into 2 chunks)
+    //    and read it back into the single-piece staging buffer (1 chunk).
+    let first = pattern(2 * ALIGNMENT, 11);
+    straddling.write_at(ALIGNMENT, &first);
+    run(
+        &executor,
+        Job {
+            direction: Direction::Write,
+            ios: vec![Io {
+                file_offset: 0,
+                address: straddling.address() + ALIGNMENT,
+                len: 2 * ALIGNMENT,
+            }],
+        },
+    )
+    .unwrap();
+    run(
+        &executor,
+        Job {
+            direction: Direction::Read,
+            ios: vec![Io {
+                file_offset: 0,
+                address: staging.address(),
+                len: 2 * ALIGNMENT,
+            }],
+        },
+    )
+    .unwrap();
+    let mut read_back = vec![0u8; 2 * ALIGNMENT];
+    staging.read_at(0, &mut read_back);
+    assert_eq!(read_back, first);
+
+    // 2. Corrupt 1 byte on disk: the non-straddling read MUST detect the flip.
+    {
+        let mut raw = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&scratch.0)
+            .unwrap();
+        raw.seek(SeekFrom::Start(5000)).unwrap();
+        raw.write_all(&[first[5000] ^ 0xFF]).unwrap();
+        raw.sync_all().unwrap();
+    }
+    let err = run(
+        &executor,
+        Job {
+            direction: Direction::Read,
+            ios: vec![Io {
+                file_offset: 0,
+                address: staging.address(),
+                len: 2 * ALIGNMENT,
+            }],
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, IoError::ChecksumMismatch { .. }),
+        "expected ChecksumMismatch on non-straddling read of straddling write, got {err:?}"
+    );
+
+    // 3. Overwrite the same Disk slot from the non-straddling staging buffer
+    //    with new bytes, then read back into the straddling buffer (2 chunks):
+    //    no stale sub-chunk checksum should cause a false mismatch!
+    let second = pattern(2 * ALIGNMENT, 99);
+    staging.write_at(0, &second);
+    run(
+        &executor,
+        Job {
+            direction: Direction::Write,
+            ios: vec![Io {
+                file_offset: 0,
+                address: staging.address(),
+                len: 2 * ALIGNMENT,
+            }],
+        },
+    )
+    .unwrap();
+    straddling.write_at(ALIGNMENT, &vec![0u8; 2 * ALIGNMENT]);
+    run(
+        &executor,
+        Job {
+            direction: Direction::Read,
+            ios: vec![Io {
+                file_offset: 0,
+                address: straddling.address() + ALIGNMENT,
+                len: 2 * ALIGNMENT,
+            }],
+        },
+    )
+    .unwrap();
+    straddling.read_at(ALIGNMENT, &mut read_back);
+    assert_eq!(read_back, second);
+
+    // 4. Corrupt 1 byte on disk again: the straddling read MUST also detect it.
+    {
+        let mut raw = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&scratch.0)
+            .unwrap();
+        raw.seek(SeekFrom::Start(123)).unwrap();
+        raw.write_all(&[second[123] ^ 0x01]).unwrap();
+        raw.sync_all().unwrap();
+    }
+    let err = run(
+        &executor,
+        Job {
+            direction: Direction::Read,
+            ios: vec![Io {
+                file_offset: 0,
+                address: straddling.address() + ALIGNMENT,
+                len: 2 * ALIGNMENT,
+            }],
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, IoError::ChecksumMismatch { .. }),
+        "expected ChecksumMismatch on straddling read of non-straddling write, got {err:?}"
+    );
+}
+
+#[test]
+fn straddling_piece_boundary_checksums_work_with_io_uring() {
+    straddling_checksum_round_trip(Backend::IoUring, "straddling-uring");
+}
+
+#[test]
+fn straddling_piece_boundary_checksums_work_with_psync() {
+    straddling_checksum_round_trip(Backend::Psync, "straddling-psync");
+}

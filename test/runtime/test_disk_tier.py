@@ -43,9 +43,11 @@ ts = pytest.importorskip("tokenspeed_engine.scheduler")
 from tokenspeed.runtime.cache.disk import (  # noqa: E402
     DIRECT_IO_ALIGNMENT,
     DiskTierTuning,
+    disk_file_path,
     disk_scheduler_config,
     disk_settings,
     host_block_alignment,
+    is_raw_block_device_path,
 )
 from tokenspeed.runtime.cache.host_storage import HostCacheStorage  # noqa: E402
 from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
@@ -358,3 +360,63 @@ def test_a_written_back_page_is_cleaned_to_disk_by_the_host_executors():
     advance_scheduler(scheduler, [ts.Cache.DiskDone(write.op_id, True)])
     stats = scheduler.disk_stats()
     assert (stats.operations, stats.disk_blocks, stats.written_blocks) == (0, 1, 1)
+
+
+def test_raw_block_device_paths_are_opened_directly_and_reject_local_sharing(tmp_path):
+    # Distinct raw block devices per local rank are returned verbatim (no .bin suffix).
+    args = _disk_args(disk_tier_paths=["/dev/nvme0n1", "/dev/nvme1n1"])
+    args.validate_disk_tier_options()
+    assert is_raw_block_device_path("/dev/nvme0n1")
+    assert disk_file_path(args, global_rank=0) == "/dev/nvme0n1"
+    assert disk_file_path(args, global_rank=1) == "/dev/nvme1n1"
+
+    # Sharing one raw block device across multiple local ranks must fail validation.
+    shared = _disk_args(disk_tier_paths=["/dev/nvme0n1"])
+    with pytest.raises(ValueError, match="cannot be shared by multiple local ranks"):
+        shared.validate_disk_tier_options()
+    with pytest.raises(ValueError, match="cannot be shared by multiple local ranks"):
+        disk_file_path(shared, global_rank=0)
+
+    # Duplicate raw block device paths also fail validation.
+    duplicate = _disk_args(disk_tier_paths=["/dev/nvme0n1", "/dev/nvme0n1"])
+    with pytest.raises(ValueError, match="cannot be shared by multiple local ranks"):
+        duplicate.validate_disk_tier_options()
+
+    # Multi-node: 2 nodes x 2 local ranks = 4 world_size with 2 local raw drives is valid.
+    multi_node = _disk_args(
+        disk_tier_paths=["/dev/nvme0n1", "/dev/nvme1n1"],
+        nnodes=2,
+        mapping=Mapping(rank=2, world_size=4, attn_tp_size=2, attn_dp_size=2),
+    )
+    multi_node.validate_disk_tier_options()
+    assert disk_file_path(multi_node, global_rank=2) == "/dev/nvme0n1"
+    assert disk_file_path(multi_node, global_rank=3) == "/dev/nvme1n1"
+
+    # Mixed raw block device + real directory: directory still gets per-port/per-rank filename.
+    mixed = _disk_args(disk_tier_paths=["/dev/nvme0n1", str(tmp_path)])
+    mixed.validate_disk_tier_options()
+    assert not is_raw_block_device_path(str(tmp_path))
+    assert disk_file_path(mixed, global_rank=0) == "/dev/nvme0n1"
+    assert disk_file_path(mixed, global_rank=1) == str(
+        tmp_path / "tokenspeed-disk-p30000-r1.bin"
+    )
+
+
+def test_kv_events_clear_medium_matches_dynamo_msgpack_wire_format():
+    import msgspec
+    from tokenspeed.runtime.pd.kv_events import ClearMedium, KVEventBatch, MEDIUM_DISK
+
+    batch = KVEventBatch(ts=1.0, events=[ClearMedium(medium=MEDIUM_DISK)], attn_dp_rank=2)
+    encoded = msgspec.msgpack.encode(batch)
+    expected = (
+        bytes([0x93, 0xCB])
+        + __import__("struct").pack(">d", 1.0)
+        + bytes([0x91, 0x92, 0xAB])
+        + b"ClearMedium"
+        + bytes([0xA4])
+        + b"DISK"
+        + bytes([0x02])
+    )
+    assert encoded == expected
+    decoded = msgspec.msgpack.decode(encoded, type=KVEventBatch)
+    assert decoded == batch

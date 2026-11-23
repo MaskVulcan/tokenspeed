@@ -2844,8 +2844,12 @@ class ServerArgs:
         _require_choice("--disk-tier-io", self.disk_tier_io, ("io_uring", "psync"))
         if self.disk_tier_write_mbps is None or self.disk_tier_write_mbps <= 0:
             raise ValueError("--disk-tier-write-mbps must be a positive budget")
-        from tokenspeed.runtime.cache.disk import DiskTierTuning
+        from tokenspeed.runtime.cache.disk import (
+            DiskTierTuning,
+            validate_disk_tier_paths,
+        )
 
+        validate_disk_tier_paths(self)
         DiskTierTuning.from_json(self.disk_tier_config)
 
     def validate_cache_options(self):

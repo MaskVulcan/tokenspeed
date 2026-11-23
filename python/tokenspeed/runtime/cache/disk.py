@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -195,14 +196,73 @@ class DiskSettings:
     push_ring_bytes: int
 
 
+def is_raw_block_device_path(path: str) -> bool:
+    """Whether ``path`` names a raw block device (e.g. ``/dev/nvme0n1`` or a
+    ``/dev/disk/by-id/...`` symlink) rather than a directory."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        normalized = os.path.normpath(path)
+        return normalized.startswith("/dev/") and not path.endswith(os.sep)
+    if stat.S_ISBLK(mode):
+        return True
+    if stat.S_ISDIR(mode):
+        return False
+    return os.path.normpath(path).startswith("/dev/")
+
+
+def _local_world_size(server_args) -> int:
+    """Number of ranks sharing this node's ``/dev`` namespace."""
+    nnodes = max(1, int(getattr(server_args, "nnodes", 1) or 1))
+    mapping = getattr(server_args, "mapping", None)
+    if mapping is not None:
+        per_node = max(1, int(mapping.world_size) // nnodes)
+        nprocs_per_node = getattr(mapping, "nprocs_per_node", None)
+        if isinstance(nprocs_per_node, int) and nprocs_per_node > 0:
+            return min(per_node, nprocs_per_node)
+        return per_node
+    tp_size = max(1, int(getattr(server_args, "tp_size", 1) or 1))
+    dp_size = max(1, int(getattr(server_args, "dp_size", 1) or 1))
+    return max(1, (tp_size * dp_size) // nnodes)
+
+
+def validate_disk_tier_paths(server_args) -> None:
+    """Validate ``--disk-tier-paths``: directories may be shared across local
+    ranks (each rank opens its own per-port/per-rank file), while raw block
+    devices (``/dev/...``) must map exclusively to one local rank so two ranks
+    never overwrite offset 0 of the same device."""
+    paths = server_args.disk_tier_paths
+    if not paths:
+        raise ValueError("--disk-tier-paths needs at least one directory")
+    local_ranks = _local_world_size(server_args)
+    seen_raw: dict[str, int] = {}
+    for local_rank in range(local_ranks):
+        target = paths[local_rank % len(paths)]
+        if not is_raw_block_device_path(target):
+            continue
+        canonical = os.path.realpath(target)
+        if canonical in seen_raw:
+            raise ValueError(
+                f"raw block device {target!r} in --disk-tier-paths cannot be "
+                f"shared by multiple local ranks (ranks {seen_raw[canonical]} "
+                f"and {local_rank}); supply one distinct block device or "
+                f"partition per local rank, or use mounted directories"
+            )
+        seen_raw[canonical] = local_rank
+
+
 def disk_file_path(server_args, *, global_rank: int) -> str:
-    """This rank's file: one directory per drive, ranks spread over them;
-    the port keeps engines on one node apart."""
-    directory = server_args.disk_tier_paths[
+    """This rank's file or raw block device: one directory or block device per
+    drive, ranks spread over them; for directories the port and rank keep
+    engines apart, while raw block devices (``/dev/...``) are opened directly."""
+    validate_disk_tier_paths(server_args)
+    target = server_args.disk_tier_paths[
         global_rank % len(server_args.disk_tier_paths)
     ]
+    if is_raw_block_device_path(target):
+        return target
     return os.path.join(
-        directory, f"tokenspeed-disk-p{server_args.port}-r{global_rank}.bin"
+        target, f"tokenspeed-disk-p{server_args.port}-r{global_rank}.bin"
     )
 
 
