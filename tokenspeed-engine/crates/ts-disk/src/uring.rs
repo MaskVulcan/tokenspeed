@@ -39,7 +39,11 @@ use crate::{
     dispatch::{self, Chunk, Shared},
     executor::{Direction, IoError, Pieces},
     file::{DiskFile, ALIGNMENT},
+    memory::Memory,
 };
+
+/// Maximum single-iovec length registered with `io_uring_register_buffers`.
+const MAX_FIXED_BOUNCE_BYTES: usize = 1 << 30;
 
 /// The user data of the eventfd read; requests use their slot index.
 const WAKE_UP: u64 = u64::MAX;
@@ -62,12 +66,81 @@ struct InFlight {
     write_crc: Option<u32>,
 }
 
+enum BufferMode {
+    /// Caller's registered memory pieces are pinned directly in io_uring fixed buffers.
+    FixedCaller,
+    /// Caller's memory is usable by O_DIRECT directly, without fixed-buffer registration.
+    NonFixedCaller,
+    /// Caller's memory is VM_PFNMAP/VM_IO (e.g. Ascend `torch_npu` `/dev/davinci_manager`)
+    /// which Linux `O_DIRECT` rejects with `EFAULT`. Stage each slot through a page-aligned
+    /// anonymous `mmap` bounce pool (registered as a single fixed buffer when possible).
+    Bounce {
+        pool: Memory,
+        slot_size: usize,
+        fixed: bool,
+    },
+}
+
+impl BufferMode {
+    fn bounce_slot_addr(&self, slot: usize) -> Option<usize> {
+        match self {
+            Self::Bounce {
+                pool, slot_size, ..
+            } => Some(pool.address() + slot * slot_size),
+            _ => None,
+        }
+    }
+
+    fn is_bounce(&self) -> bool {
+        matches!(self, Self::Bounce { .. })
+    }
+}
+
 pub(crate) struct Ring {
     ring: IoUring,
     fd: RawFd,
     depth: usize,
-    fixed_buffers: bool,
+    max_io_bytes: usize,
+    mode: BufferMode,
     r_disabled: bool,
+}
+
+fn allocate_bounce_mode(ring: &IoUring, depth: usize, max_io_bytes: usize) -> io::Result<BufferMode> {
+    let total = depth
+        .checked_mul(max_io_bytes)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let pool = Memory::map(total)?;
+    let fixed = if total <= MAX_FIXED_BOUNCE_BYTES {
+        let iov = libc::iovec {
+            iov_base: pool.address() as *mut libc::c_void,
+            iov_len: pool.size(),
+        };
+        // SAFETY: `pool` stays mapped until after `ring` is dropped (or both are forgotten on breakdown).
+        match unsafe { ring.submitter().register_buffers(&[iov]) } {
+            Ok(()) => true,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOMEM | libc::EFAULT | libc::EINVAL | libc::E2BIG | libc::EPERM)
+                ) =>
+            {
+                tracing::warn!(
+                    %error,
+                    bounce_bytes = total,
+                    "io_uring register_buffers failed on bounce pool; using non-fixed O_DIRECT on bounce pool"
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        false
+    };
+    Ok(BufferMode::Bounce {
+        pool,
+        slot_size: max_io_bytes,
+        fixed,
+    })
 }
 
 fn build_ring(entries: u32) -> io::Result<(IoUring, bool)> {
@@ -93,7 +166,12 @@ fn build_ring(entries: u32) -> io::Result<(IoUring, bool)> {
 }
 
 impl Ring {
-    pub(crate) fn new(file: &DiskFile, pieces: &Pieces, depth: usize) -> io::Result<Self> {
+    pub(crate) fn new(
+        file: &DiskFile,
+        pieces: &Pieces,
+        depth: usize,
+        max_io_bytes: usize,
+    ) -> io::Result<Self> {
         // One entry beyond the requests for the armed wake-up read.
         let entries = u32::try_from((depth + 1).next_power_of_two())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -107,24 +185,41 @@ impl Ring {
             .collect();
         // SAFETY: the executor's caller keeps the memory mapped until close
         // succeeds (`Executor::start`), and a failed close leaks this ring.
-        // Fall back to ordinary direct-I/O Read/Write when fixed-buffer
-        // registration hits RLIMIT_MEMLOCK (ENOMEM/EPERM), VM_PFNMAP/THP
-        // (EFAULT/EINVAL), or buffer count limits (E2BIG).
-        let fixed_buffers = match unsafe { ring.submitter().register_buffers(&buffers) } {
-            Ok(()) => true,
+        // - `EFAULT` signals VM_PFNMAP/VM_IO device-pinned memory (e.g. Ascend
+        //   `torch_npu` `/dev/davinci_manager`), which Linux `O_DIRECT` also
+        //   rejects on non-fixed Read/Write -> stage through an anonymous mmap
+        //   bounce pool (registered as fixed buffers when possible).
+        // - `ENOMEM`/`EINVAL`/`E2BIG`/`EPERM` fall back to non-fixed O_DIRECT
+        //   on the caller's memory (with lazy promotion to a bounce pool if a
+        //   runtime CQE still returns `-EFAULT`).
+        let mode = match unsafe { ring.submitter().register_buffers(&buffers) } {
+            Ok(()) => BufferMode::FixedCaller,
+            Err(error) if error.raw_os_error() == Some(libc::EFAULT) => {
+                let bounce = allocate_bounce_mode(&ring, depth, max_io_bytes)?;
+                let bounce_fixed = matches!(bounce, BufferMode::Bounce { fixed: true, .. });
+                tracing::warn!(
+                    %error,
+                    pieces = buffers.len(),
+                    bounce_bytes = depth * max_io_bytes,
+                    bounce_fixed,
+                    "io_uring register_buffers failed with EFAULT (device-pinned VM_PFNMAP/VM_IO memory); \
+                     staging O_DIRECT through anonymous mmap bounce pool"
+                );
+                bounce
+            }
             Err(error)
                 if matches!(
                     error.raw_os_error(),
-                    Some(libc::ENOMEM | libc::EFAULT | libc::EINVAL | libc::E2BIG | libc::EPERM)
+                    Some(libc::ENOMEM | libc::EINVAL | libc::E2BIG | libc::EPERM)
                 ) =>
             {
                 tracing::warn!(
                     %error,
                     pieces = buffers.len(),
-                    "io_uring register_buffers failed (check RLIMIT_MEMLOCK / THP / device-pinned memory); \
+                    "io_uring register_buffers failed (check RLIMIT_MEMLOCK / THP); \
                      falling back to non-fixed O_DIRECT ops"
                 );
-                false
+                BufferMode::NonFixedCaller
             }
             Err(error) => return Err(error),
         };
@@ -132,13 +227,14 @@ impl Ring {
             ring,
             fd: file.raw_fd(),
             depth,
-            fixed_buffers,
+            max_io_bytes,
+            mode,
             r_disabled,
         })
     }
 
     #[cfg(test)]
-    fn new_non_fixed(file: &DiskFile, depth: usize) -> io::Result<Self> {
+    fn new_non_fixed(file: &DiskFile, depth: usize, max_io_bytes: usize) -> io::Result<Self> {
         let entries = u32::try_from((depth + 1).next_power_of_two())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         let (ring, r_disabled) = build_ring(entries)?;
@@ -146,7 +242,24 @@ impl Ring {
             ring,
             fd: file.raw_fd(),
             depth,
-            fixed_buffers: false,
+            max_io_bytes,
+            mode: BufferMode::NonFixedCaller,
+            r_disabled,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_bounce(file: &DiskFile, depth: usize, max_io_bytes: usize) -> io::Result<Self> {
+        let entries = u32::try_from((depth + 1).next_power_of_two())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let (ring, r_disabled) = build_ring(entries)?;
+        let mode = allocate_bounce_mode(&ring, depth, max_io_bytes)?;
+        Ok(Self {
+            ring,
+            fd: file.raw_fd(),
+            depth,
+            max_io_bytes,
+            mode,
             r_disabled,
         })
     }
@@ -215,8 +328,9 @@ impl Ring {
                 }
             }
             // Compute write CRC32C outside `shared.queues` to avoid holding
-            // the dispatch mutex during hashing.
-            if shared.checksums.enabled() {
+            // the dispatch mutex during hashing. In bounce mode we hash the
+            // cache-hot bounce buffer right after copying into the slot below.
+            if shared.checksums.enabled() && !self.mode.is_bounce() {
                 for inflight in &mut to_issue {
                     if inflight.chunk.direction == Direction::Write
                         && inflight.done == 0
@@ -249,12 +363,40 @@ impl Ring {
                     unsafe { submission.push(&read) }.expect("the ring has room for the wake-up");
                     armed = true;
                 }
-                for inflight in to_issue.drain(..) {
+                for mut inflight in to_issue.drain(..) {
                     let slot = free.pop().expect("free slot reserved for to_issue");
-                    let req = request(self.fd, inflight, self.fixed_buffers)
+                    if let Some(bounce_addr) = self.mode.bounce_slot_addr(slot) {
+                        let remaining = inflight.chunk.len - inflight.done;
+                        debug_assert!(remaining <= self.max_io_bytes);
+                        if inflight.chunk.direction == Direction::Write {
+                            // SAFETY: source is caller's registered memory (stays mapped
+                            // until close) and destination is this slot's owned bounce buffer.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    (inflight.chunk.address + inflight.done) as *const u8,
+                                    bounce_addr as *mut u8,
+                                    remaining,
+                                );
+                            }
+                            if shared.checksums.enabled()
+                                && inflight.done == 0
+                                && inflight.retries == 0
+                                && inflight.write_crc.is_none()
+                            {
+                                let slice = unsafe {
+                                    std::slice::from_raw_parts(
+                                        bounce_addr as *const u8,
+                                        inflight.chunk.len,
+                                    )
+                                };
+                                inflight.write_crc = Some(crc32c(slice));
+                            }
+                        }
+                    }
+                    let req = request(self.fd, inflight, slot, &self.mode)
                         .user_data(slot as u64);
-                    // SAFETY: the chunk lies in registered memory that stays
-                    // mapped; its slot keeps it until it completes.
+                    // SAFETY: the chunk (or bounce slot) stays mapped; its slot
+                    // keeps it until it completes.
                     unsafe { submission.push(&req) }
                         .expect("the ring has an entry for every slot");
                     slots[slot] = Some(inflight);
@@ -267,9 +409,10 @@ impl Ring {
                     let finished = shared.queues.lock().break_down();
                     shared.wake();
                     dispatch::report(finished);
-                    // The kernel may still write into the memory and the
-                    // counter: keep them, and the ring, for the process.
+                    // The kernel may still write into the memory, bounce pool,
+                    // and counter: keep them, and the ring, for the process.
                     std::mem::forget(self.ring);
+                    std::mem::forget(self.mode);
                     std::mem::forget(counter);
                     return;
                 }
@@ -280,6 +423,7 @@ impl Ring {
                 .map(|completion| (completion.user_data(), completion.result()))
                 .collect();
             outcomes.clear();
+            let mut promote_to_bounce = false;
             for (user_data, result) in completions {
                 if user_data == WAKE_UP {
                     armed = false;
@@ -289,8 +433,22 @@ impl Ring {
                 let mut inflight = slots[slot]
                     .take()
                     .expect("a completion of an issued request");
-                free.push(slot);
+                let bounce_addr = self.mode.bounce_slot_addr(slot);
+                // If NonFixedCaller hits -EFAULT at runtime (e.g. ENOMEM hid a
+                // VM_PFNMAP region at setup), promote lazily to an unfixed bounce pool.
+                if result == -libc::EFAULT
+                    && matches!(self.mode, BufferMode::NonFixedCaller)
+                    && inflight.done == 0
+                    && inflight.retries == 0
+                {
+                    free.push(slot);
+                    promote_to_bounce = true;
+                    inflight.retries = 1;
+                    retries.push_back(inflight);
+                    continue;
+                }
                 if result == -libc::EINTR || result == -libc::EAGAIN {
+                    free.push(slot);
                     if inflight.retries < MAX_TRANSIENT_RETRIES {
                         inflight.retries += 1;
                         retries.push_back(inflight);
@@ -308,6 +466,19 @@ impl Ring {
                         done: inflight.done,
                     }),
                     Ok(n) if n < remaining => {
+                        if let Some(b_addr) = bounce_addr {
+                            if inflight.chunk.direction == Direction::Read {
+                                // SAFETY: kernel wrote `n` bytes into slot's bounce buffer;
+                                // copy into caller's registered memory before freeing slot.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        b_addr as *const u8,
+                                        (inflight.chunk.address + inflight.done) as *mut u8,
+                                        n,
+                                    );
+                                }
+                            }
+                        }
                         let next_done = inflight.done + n;
                         if n % ALIGNMENT != 0 {
                             // O_DIRECT cannot resume from an unaligned offset.
@@ -316,6 +487,7 @@ impl Ring {
                                 done: next_done,
                             })
                         } else {
+                            free.push(slot);
                             inflight.done = next_done;
                             inflight.retries = 0;
                             retries.push_back(inflight);
@@ -324,7 +496,36 @@ impl Ring {
                     }
                     Ok(n) if n == remaining => {
                         if inflight.chunk.direction == Direction::Read {
-                            if shared.checksums.enabled() {
+                            if let Some(b_addr) = bounce_addr {
+                                // SAFETY: kernel wrote `n` bytes into slot's bounce buffer;
+                                // hash cache-hot bounce buffer when full chunk landed in one
+                                // op, then copy into caller's registered memory.
+                                if shared.checksums.enabled() && inflight.done == 0 {
+                                    let slice = unsafe {
+                                        std::slice::from_raw_parts(
+                                            b_addr as *const u8,
+                                            inflight.chunk.len,
+                                        )
+                                    };
+                                    chunk_crc = Some(crc32c(slice));
+                                }
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        b_addr as *const u8,
+                                        (inflight.chunk.address + inflight.done) as *mut u8,
+                                        n,
+                                    );
+                                }
+                                if shared.checksums.enabled() && inflight.done > 0 {
+                                    let slice = unsafe {
+                                        std::slice::from_raw_parts(
+                                            inflight.chunk.address as *const u8,
+                                            inflight.chunk.len,
+                                        )
+                                    };
+                                    chunk_crc = Some(crc32c(slice));
+                                }
+                            } else if shared.checksums.enabled() {
                                 // SAFETY: the read just completed into registered
                                 // memory that stays mapped until close.
                                 let slice = unsafe {
@@ -342,7 +543,26 @@ impl Ring {
                     }
                     Ok(_) => Err(IoError::Os(libc::EIO)),
                 };
+                free.push(slot);
                 outcomes.push((inflight.chunk, outcome, chunk_crc));
+            }
+            if promote_to_bounce && matches!(self.mode, BufferMode::NonFixedCaller) {
+                match Memory::map(self.depth * self.max_io_bytes) {
+                    Ok(pool) => {
+                        tracing::warn!(
+                            bounce_bytes = pool.size(),
+                            "io_uring non-fixed O_DIRECT hit EFAULT at runtime; switching to anonymous mmap bounce pool"
+                        );
+                        self.mode = BufferMode::Bounce {
+                            pool,
+                            slot_size: self.max_io_bytes,
+                            fixed: false,
+                        };
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to allocate io_uring runtime bounce pool");
+                    }
+                }
             }
             let mut finished = Vec::new();
             if !outcomes.is_empty() {
@@ -360,38 +580,77 @@ impl Ring {
             dispatch::report(finished);
         }
         drop(self.ring);
+        drop(self.mode);
         drop(counter);
     }
 }
 
-fn request(fd: RawFd, inflight: InFlight, fixed_buffers: bool) -> squeue::Entry {
+fn request(fd: RawFd, inflight: InFlight, slot: usize, mode: &BufferMode) -> squeue::Entry {
     let chunk = inflight.chunk;
     let remaining = chunk.len - inflight.done;
     let len = u32::try_from(remaining).expect("requests are at most 1 GiB");
-    let address = chunk.address + inflight.done;
     let file_offset = chunk.file_offset + inflight.done as u64;
-    match (chunk.direction, fixed_buffers) {
-        (Direction::Read, true) => {
-            opcode::ReadFixed::new(types::Fd(fd), address as *mut u8, len, chunk.buffer)
-                .offset(file_offset)
-                .ioprio(IOPRIO_READ)
-                .build()
+    match mode {
+        BufferMode::FixedCaller => {
+            let address = chunk.address + inflight.done;
+            match chunk.direction {
+                Direction::Read => {
+                    opcode::ReadFixed::new(types::Fd(fd), address as *mut u8, len, chunk.buffer)
+                        .offset(file_offset)
+                        .ioprio(IOPRIO_READ)
+                        .build()
+                }
+                Direction::Write => {
+                    opcode::WriteFixed::new(types::Fd(fd), address as *const u8, len, chunk.buffer)
+                        .offset(file_offset)
+                        .ioprio(IOPRIO_WRITE)
+                        .build()
+                }
+            }
         }
-        (Direction::Write, true) => {
-            opcode::WriteFixed::new(types::Fd(fd), address as *const u8, len, chunk.buffer)
-                .offset(file_offset)
-                .ioprio(IOPRIO_WRITE)
-                .build()
+        BufferMode::NonFixedCaller => {
+            let address = chunk.address + inflight.done;
+            match chunk.direction {
+                Direction::Read => opcode::Read::new(types::Fd(fd), address as *mut u8, len)
+                    .offset(file_offset)
+                    .ioprio(IOPRIO_READ)
+                    .build(),
+                Direction::Write => opcode::Write::new(types::Fd(fd), address as *const u8, len)
+                    .offset(file_offset)
+                    .ioprio(IOPRIO_WRITE)
+                    .build(),
+            }
         }
-        (Direction::Read, false) => opcode::Read::new(types::Fd(fd), address as *mut u8, len)
-            .offset(file_offset)
-            .ioprio(IOPRIO_READ)
-            .build(),
-        (Direction::Write, false) => {
-            opcode::Write::new(types::Fd(fd), address as *const u8, len)
-                .offset(file_offset)
-                .ioprio(IOPRIO_WRITE)
-                .build()
+        BufferMode::Bounce {
+            pool,
+            slot_size,
+            fixed,
+        } => {
+            let address = pool.address() + slot * slot_size;
+            match (chunk.direction, *fixed) {
+                (Direction::Read, true) => {
+                    opcode::ReadFixed::new(types::Fd(fd), address as *mut u8, len, 0)
+                        .offset(file_offset)
+                        .ioprio(IOPRIO_READ)
+                        .build()
+                }
+                (Direction::Write, true) => {
+                    opcode::WriteFixed::new(types::Fd(fd), address as *const u8, len, 0)
+                        .offset(file_offset)
+                        .ioprio(IOPRIO_WRITE)
+                        .build()
+                }
+                (Direction::Read, false) => opcode::Read::new(types::Fd(fd), address as *mut u8, len)
+                    .offset(file_offset)
+                    .ioprio(IOPRIO_READ)
+                    .build(),
+                (Direction::Write, false) => {
+                    opcode::Write::new(types::Fd(fd), address as *const u8, len)
+                        .offset(file_offset)
+                        .ioprio(IOPRIO_WRITE)
+                        .build()
+                }
+            }
         }
     }
 }
@@ -431,12 +690,13 @@ mod tests {
     }
 
     #[test]
-    fn register_buffers_efault_falls_back_to_non_fixed_without_failing() {
+    fn register_buffers_efault_falls_back_to_bounce_pool_without_failing() {
         let scratch = ScratchFile::new("efault-fallback");
         let file = DiskFile::create(&scratch.0, 16 * ALIGNMENT as u64).unwrap();
         // A PROT_READ mapping triggers EFAULT (os error 14) on
         // io_uring_register_buffers (FOLL_WRITE | FOLL_LONGTERM), mirroring
-        // device-pinned memory (e.g. torch_npu) that cannot be pinned as fixed.
+        // device-pinned VM_PFNMAP/VM_IO memory (e.g. Ascend torch_npu) that
+        // Linux O_DIRECT also rejects with EFAULT.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -449,17 +709,17 @@ mod tests {
         };
         assert_ne!(ptr, libc::MAP_FAILED);
         let pieces = Pieces::from_raw_for_test(vec![(ptr as usize, ptr as usize + ALIGNMENT)]);
-        let ring = Ring::new(&file, &pieces, 4).expect("EFAULT should fall back cleanly");
-        assert!(!ring.fixed_buffers);
+        let ring = Ring::new(&file, &pieces, 4, 2 * ALIGNMENT)
+            .expect("EFAULT should fall back cleanly to bounce pool");
+        assert!(ring.mode.is_bounce());
         drop(ring);
         unsafe {
             libc::munmap(ptr, ALIGNMENT);
         }
     }
 
-    #[test]
-    fn non_fixed_direct_io_round_trips_with_crc32c() {
-        let scratch = ScratchFile::new("non-fixed-round-trip");
+    fn run_round_trip_with_ring(name: &str, make_ring: impl FnOnce(&DiskFile) -> Ring) {
+        let scratch = ScratchFile::new(name);
         let file = DiskFile::create(&scratch.0, 16 * ALIGNMENT as u64).unwrap();
         let mut memory = Memory::map(4 * ALIGNMENT).unwrap();
         let payload: Vec<u8> = (0..2 * ALIGNMENT)
@@ -477,8 +737,7 @@ mod tests {
             },
             Some(eventfd),
         ));
-        let ring = Ring::new_non_fixed(&file, 4).unwrap();
-        assert!(!ring.fixed_buffers);
+        let ring = make_ring(&file);
         let worker_shared = shared.clone();
         let worker = thread::spawn(move || ring.run(&worker_shared));
 
@@ -561,5 +820,23 @@ mod tests {
         let _ = shared.queues.lock().close();
         shared.wake();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn non_fixed_direct_io_round_trips_with_crc32c() {
+        run_round_trip_with_ring("non-fixed-round-trip", |file| {
+            let ring = Ring::new_non_fixed(file, 4, 2 * ALIGNMENT).unwrap();
+            assert!(matches!(ring.mode, BufferMode::NonFixedCaller));
+            ring
+        });
+    }
+
+    #[test]
+    fn bounce_pool_direct_io_round_trips_with_crc32c() {
+        run_round_trip_with_ring("bounce-round-trip", |file| {
+            let ring = Ring::new_bounce(file, 4, 2 * ALIGNMENT).unwrap();
+            assert!(ring.mode.is_bounce());
+            ring
+        });
     }
 }

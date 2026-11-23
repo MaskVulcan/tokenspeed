@@ -21,20 +21,29 @@
 //! The thread-pool backend, for hosts whose policy refuses io_uring: each
 //! of `queue_depth` threads issues one blocking `pread`/`pwrite` at a time.
 
-use std::{io, os::fd::RawFd, thread};
+use std::{
+    io,
+    os::fd::RawFd,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+};
 
 use crate::{
     checksum::{crc32c, ChecksumTable},
     dispatch::{self, Chunk, Shared},
     executor::{Direction, IoError},
     file::{DiskFile, ALIGNMENT},
+    memory::Memory,
 };
 
 /// Upper bound on transient `EINTR`/`EAGAIN` retries per chunk so a broken
 /// device cannot livelock `Executor::close`.
 const MAX_TRANSIENT_RETRIES: u8 = 16;
 
-pub(crate) fn run(shared: &Shared, file: &DiskFile) {
+static LOGGED_BOUNCE_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn run(shared: &Shared, file: &DiskFile, max_io_bytes: usize) {
+    let mut bounce: Option<Memory> = None;
     loop {
         let chunk = {
             let mut queues = shared.queues.lock();
@@ -48,7 +57,8 @@ pub(crate) fn run(shared: &Shared, file: &DiskFile) {
                 shared.work.wait(&mut queues);
             }
         };
-        let (result, chunk_crc) = transfer(file.raw_fd(), chunk, &shared.checksums);
+        let (result, chunk_crc) =
+            transfer(file.raw_fd(), chunk, &shared.checksums, &mut bounce, max_io_bytes);
         let finished = shared.queues.lock().finish_with_checksum(
             chunk,
             result,
@@ -64,6 +74,8 @@ fn transfer(
     fd: RawFd,
     chunk: Chunk,
     checksums: &ChecksumTable,
+    bounce: &mut Option<Memory>,
+    max_io_bytes: usize,
 ) -> (Result<(), IoError>, Option<u32>) {
     let mut chunk_crc = None;
     if chunk.direction == Direction::Write && checksums.enabled() {
@@ -72,7 +84,30 @@ fn transfer(
         let slice = unsafe { std::slice::from_raw_parts(chunk.address as *const u8, chunk.len) };
         chunk_crc = Some(crc32c(slice));
     }
-    let result = transfer_raw(fd, chunk);
+    let result = match bounce.as_ref() {
+        Some(buf) => transfer_bounced(fd, chunk, buf),
+        None => match transfer_raw(fd, chunk) {
+            Err(IoError::Os(libc::EFAULT)) => {
+                let buf_size = max_io_bytes.max(chunk.len);
+                match Memory::map(buf_size) {
+                    Ok(buf) => {
+                        if !LOGGED_BOUNCE_FALLBACK.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(
+                                bounce_bytes = buf_size,
+                                "psync O_DIRECT hit EFAULT (device-pinned VM_PFNMAP/VM_IO memory); \
+                                 staging through per-worker anonymous mmap bounce buffer"
+                            );
+                        }
+                        let res = transfer_bounced(fd, chunk, &buf);
+                        *bounce = Some(buf);
+                        res
+                    }
+                    Err(err) => Err(IoError::Os(err.raw_os_error().unwrap_or(libc::ENOMEM))),
+                }
+            }
+            other => other,
+        },
+    };
     if chunk.direction == Direction::Read && result.is_ok() && checksums.enabled() {
         // SAFETY: the read just completed into registered memory that stays
         // mapped until close.
@@ -80,6 +115,36 @@ fn transfer(
         chunk_crc = Some(crc32c(slice));
     }
     (result, chunk_crc)
+}
+
+fn transfer_bounced(fd: RawFd, chunk: Chunk, bounce: &Memory) -> Result<(), IoError> {
+    debug_assert!(chunk.len <= bounce.size());
+    if chunk.direction == Direction::Write {
+        // SAFETY: source is caller's mapped memory; dest is worker-owned bounce buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk.address as *const u8,
+                bounce.address() as *mut u8,
+                chunk.len,
+            );
+        }
+    }
+    let bounce_chunk = Chunk {
+        address: bounce.address(),
+        ..chunk
+    };
+    transfer_raw(fd, bounce_chunk)?;
+    if chunk.direction == Direction::Read {
+        // SAFETY: bounce holds the bytes read from disk; dest is caller's mapped memory.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bounce.address() as *const u8,
+                chunk.address as *mut u8,
+                chunk.len,
+            );
+        }
+    }
+    Ok(())
 }
 
 fn transfer_raw(fd: RawFd, chunk: Chunk) -> Result<(), IoError> {

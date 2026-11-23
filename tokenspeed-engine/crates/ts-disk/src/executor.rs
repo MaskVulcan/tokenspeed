@@ -395,8 +395,13 @@ impl Executor {
         };
         match config.backend {
             Backend::IoUring => {
-                let ring = uring::Ring::new(&file, &pieces, config.queue_depth)
-                    .map_err(StartError::Ring)?;
+                let ring = uring::Ring::new(
+                    &file,
+                    &pieces,
+                    config.queue_depth,
+                    config.max_io_bytes,
+                )
+                .map_err(StartError::Ring)?;
                 let (shared, file) = (shared.clone(), file.clone());
                 executor.lifecycle.lock().threads.push(spawn(
                     "ts-disk-uring".to_owned(),
@@ -408,11 +413,12 @@ impl Executor {
                 )?);
             }
             Backend::Psync => {
+                let max_io_bytes = config.max_io_bytes;
                 for index in 0..config.queue_depth {
                     let (shared, file) = (shared.clone(), file.clone());
                     executor.lifecycle.lock().threads.push(spawn(
                         format!("ts-disk-io-{index}"),
-                        Box::new(move || psync::run(&shared, &file)),
+                        Box::new(move || psync::run(&shared, &file, max_io_bytes)),
                     )?);
                 }
             }
