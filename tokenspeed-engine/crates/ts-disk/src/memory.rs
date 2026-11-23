@@ -59,6 +59,15 @@ impl Memory {
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
+        #[cfg(target_os = "linux")]
+        // SAFETY: `base..base+size` is the private mapping just created above.
+        // Disable THP so `io_uring_register_buffers` (FOLL_LONGTERM) does not
+        // fail on transparent huge pages, and mark `MADV_DONTFORK` so a child
+        // process cannot trigger COW on DMA-pinned pages.
+        unsafe {
+            let _ = libc::madvise(base, size, libc::MADV_NOHUGEPAGE);
+            let _ = libc::madvise(base, size, libc::MADV_DONTFORK);
+        }
         Ok(Self {
             base: NonNull::new(base.cast()).expect("mmap returns a non-null mapping"),
             size,

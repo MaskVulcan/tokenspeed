@@ -26,7 +26,7 @@ use std::{
     fs::{File, OpenOptions},
     io,
     os::unix::{
-        fs::OpenOptionsExt,
+        fs::{FileTypeExt, OpenOptionsExt},
         io::{AsRawFd, RawFd},
     },
     path::{Path, PathBuf},
@@ -92,16 +92,39 @@ impl DiskFile {
                 path: path.to_owned(),
                 source,
             })?;
-        // Allocate the extents now, so a write never fails for space and
-        // never pays for allocation.
-        // SAFETY: fallocate on a descriptor this function owns; no memory is
-        // involved.
-        if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, length) } != 0 {
-            return Err(FileError::Allocate {
-                path: path.to_owned(),
-                size,
-                source: io::Error::last_os_error(),
-            });
+        let meta = file.metadata().map_err(|source| FileError::Open {
+            path: path.to_owned(),
+            source,
+        })?;
+        if meta.file_type().is_block_device() {
+            // Raw NVMe / LVM block devices do not support `fallocate`; verify
+            // the device capacity covers `size`.
+            let dev_size = block_device_size(file.as_raw_fd()).map_err(|source| {
+                FileError::Allocate {
+                    path: path.to_owned(),
+                    size,
+                    source,
+                }
+            })?;
+            if dev_size < size {
+                return Err(FileError::Allocate {
+                    path: path.to_owned(),
+                    size,
+                    source: io::Error::from_raw_os_error(libc::ENOSPC),
+                });
+            }
+        } else {
+            // Allocate the extents now, so a write never fails for space and
+            // never pays for allocation.
+            // SAFETY: fallocate on a descriptor this function owns; no memory
+            // is involved.
+            if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, length) } != 0 {
+                return Err(FileError::Allocate {
+                    path: path.to_owned(),
+                    size,
+                    source: io::Error::last_os_error(),
+                });
+            }
         }
         Ok(Self {
             file,
@@ -123,4 +146,21 @@ impl DiskFile {
     pub(crate) fn raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
     }
+}
+
+#[cfg(target_os = "linux")]
+fn block_device_size(fd: RawFd) -> io::Result<u64> {
+    // Linux `BLKGETSIZE64` = `_IOR(0x12, 114, size_t)` = 0x8008_1272.
+    const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
+    let mut bytes: u64 = 0;
+    // SAFETY: `BLKGETSIZE64` writes a `u64` byte length into `bytes`.
+    if unsafe { libc::ioctl(fd, BLKGETSIZE64 as _, &mut bytes) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn block_device_size(_fd: RawFd) -> io::Result<u64> {
+    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }

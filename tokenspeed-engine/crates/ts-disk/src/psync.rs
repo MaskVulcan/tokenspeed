@@ -51,36 +51,46 @@ pub(crate) fn run(shared: &Shared, file: &DiskFile) {
 }
 
 fn transfer(fd: RawFd, chunk: Chunk) -> Result<(), IoError> {
-    let offset = libc::off_t::try_from(chunk.file_offset).expect("files are below 2^63 bytes");
-    loop {
+    let base_offset =
+        libc::off_t::try_from(chunk.file_offset).expect("files are below 2^63 bytes");
+    let mut moved = 0usize;
+    while moved < chunk.len {
+        let remaining = chunk.len - moved;
+        let offset = base_offset + moved as libc::off_t;
         // SAFETY: the chunk lies in memory the executor's caller keeps mapped
         // (`Executor::start`); the file stays open while this thread runs.
         let done = unsafe {
             match chunk.direction {
-                Direction::Read => {
-                    libc::pread(fd, chunk.address as *mut libc::c_void, chunk.len, offset)
-                }
-                Direction::Write => {
-                    libc::pwrite(fd, chunk.address as *const libc::c_void, chunk.len, offset)
-                }
+                Direction::Read => libc::pread(
+                    fd,
+                    (chunk.address + moved) as *mut libc::c_void,
+                    remaining,
+                    offset,
+                ),
+                Direction::Write => libc::pwrite(
+                    fd,
+                    (chunk.address + moved) as *const libc::c_void,
+                    remaining,
+                    offset,
+                ),
             }
         };
         let Ok(done) = usize::try_from(done) else {
             let errno = io::Error::last_os_error()
                 .raw_os_error()
                 .unwrap_or(libc::EIO);
-            if errno == libc::EINTR {
+            if errno == libc::EINTR || errno == libc::EAGAIN {
                 continue;
             }
             return Err(IoError::Os(errno));
         };
-        return if done == chunk.len {
-            Ok(())
-        } else {
-            Err(IoError::Short {
+        if done == 0 {
+            return Err(IoError::Short {
                 expected: chunk.len,
-                done,
-            })
-        };
+                done: moved,
+            });
+        }
+        moved += done;
     }
+    Ok(())
 }

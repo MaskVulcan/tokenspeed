@@ -84,6 +84,10 @@ void Scheduler::prepareDisk(Request& request) {
 
     auto* admission = request.AdmissionResourcesPtr();
     if (admission == nullptr || admission->storage_prepared || !storage_allowed_) return;
+    // If Disk operation or Host-block credits are temporarily exhausted, leave
+    // `storage_prepared` unset so a still-queued request can retry on a later
+    // tick instead of permanently falling back to recomputation.
+    if (!disk_transfers_->HasReadCredits()) return;
     admission->storage_prepared = true;
     // Decode receives its prompt from its PD peer.
     if (config_.role == Role::kD) return;

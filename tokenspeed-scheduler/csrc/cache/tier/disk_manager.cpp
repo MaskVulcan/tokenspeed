@@ -62,6 +62,19 @@ std::size_t DiskTransferManager::NumHeldHostBlocks() const {
     return heldHostBlocks(DiskOpKind::kRead) + heldHostBlocks(DiskOpKind::kWrite);
 }
 
+std::size_t DiskTransferManager::numOperations(DiskOpKind kind) const {
+    std::size_t count = 0;
+    for (const auto& [id, ticket] : operations_) {
+        if (ticket.kind == kind) ++count;
+    }
+    return count;
+}
+
+bool DiskTransferManager::HasReadCredits() const {
+    return operations_.size() < static_cast<std::size_t>(config_.max_operations) &&
+           NumHeldHostBlocks() < static_cast<std::size_t>(config_.max_host_blocks);
+}
+
 std::size_t DiskTransferManager::heldHostBlocks(DiskOpKind kind) const {
     std::size_t count = 0;
     for (const auto& [id, ticket] : operations_) {
@@ -142,7 +155,13 @@ void DiskTransferManager::DropCleaning() {
 }
 
 void DiskTransferManager::StartCleaning() {
-    if (cleaning_.empty() || operations_.size() >= static_cast<std::size_t>(config_.max_operations)) return;
+    const auto max_ops = static_cast<std::size_t>(config_.max_operations);
+    const std::size_t max_write_ops = std::max<std::size_t>(1, max_ops / 4);
+    const std::size_t read_reserve = max_ops > 1 ? 1 : 0;
+    if (cleaning_.empty() || operations_.size() + read_reserve >= max_ops ||
+        numOperations(DiskOpKind::kWrite) >= max_write_ops) {
+        return;
+    }
     const std::size_t held = NumHeldHostBlocks();
     const std::size_t write_held = heldHostBlocks(DiskOpKind::kWrite);
     const auto limit = static_cast<std::size_t>(config_.max_host_blocks);

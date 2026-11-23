@@ -35,7 +35,7 @@
 //! (`landing::Timeouts`).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
@@ -291,6 +291,43 @@ impl Slots {
     }
 }
 
+/// Maximum completed or cancelled push job ids retained to fence duplicate or
+/// late-arriving Push messages after a Cancel.
+const MAX_FENCED_JOBS: usize = 4096;
+
+/// Bounded FIFO set of job ids that may never start again.
+#[derive(Default)]
+struct FencedJobs {
+    set: HashSet<u64>,
+    order: VecDeque<u64>,
+}
+
+impl FencedJobs {
+    fn contains(&self, job: u64) -> bool {
+        self.set.contains(&job)
+    }
+
+    fn insert(&mut self, job: u64) {
+        if self.set.insert(job) {
+            self.order.push_back(job);
+            while self.order.len() > MAX_FENCED_JOBS {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.set.remove(&oldest);
+                }
+            }
+        }
+    }
+}
+
+/// Validates that every span stays within the block's byte range.
+fn validate_spans(spans: &[PushSpan], block_bytes: u64) -> bool {
+    spans.iter().all(|span| {
+        span.offset
+            .checked_add(span.length)
+            .is_some_and(|end| end <= block_bytes)
+    })
+}
+
 /// A push the holder runs, and whether the reader cancelled it.
 struct Running {
     cancelled: AtomicBool,
@@ -303,6 +340,7 @@ struct Holder {
     source: PushSource,
     slots: Slots,
     running: Mutex<HashMap<u64, Arc<Running>>>,
+    fenced: Mutex<FencedJobs>,
 }
 
 impl Holder {
@@ -326,6 +364,7 @@ impl Holder {
                 returned: Condvar::new(),
             },
             running: Mutex::new(HashMap::new()),
+            fenced: Mutex::new(FencedJobs::default()),
         })
     }
 
@@ -356,8 +395,13 @@ impl Holder {
                 let Some(slot) = slot else { break };
                 let item = &items[next];
                 let range = match self.source.disk_layout.owned_range(item.group, item.block) {
-                    Ok(Some(range)) => range,
+                    Ok(Some(range)) if validate_spans(&item.spans, range.size as u64) => range,
                     _ => {
+                        tracing::warn!(
+                            group = item.group,
+                            block = item.block,
+                            "peer push item has invalid block or out-of-bounds spans"
+                        );
                         self.slots.give_back(slot);
                         ok = false;
                         break;
@@ -508,10 +552,18 @@ impl PushEndpoint {
                                 );
                             }
                             Some(Message::Cancel { job, reply_to }) => {
-                                let running = holder
-                                    .lock()
-                                    .as_ref()
-                                    .and_then(|holder| holder.running.lock().get(&job).cloned());
+                                let serving = holder.lock().clone();
+                                let running = serving.as_ref().and_then(|holder| {
+                                    let running_map = holder.running.lock();
+                                    if let Some(active) = running_map.get(&job) {
+                                        Some(active.clone())
+                                    } else {
+                                        // Fence before acknowledging so a late
+                                        // or replayed Push cannot start later.
+                                        holder.fenced.lock().insert(job);
+                                        None
+                                    }
+                                });
                                 match running {
                                     Some(running) => {
                                         running.cancelled.store(true, Ordering::Relaxed);
@@ -657,7 +709,15 @@ fn start_job(
         cancelled: AtomicBool::new(false),
         acknowledge: Mutex::new(None),
     });
-    holder.running.lock().insert(job, running.clone());
+    {
+        let mut running_map = holder.running.lock();
+        if running_map.contains_key(&job) || holder.fenced.lock().contains(job) {
+            tracing::warn!(job, "rejecting duplicate or fenced peer push");
+            send(&sockets, &reply_to, &Message::Done { job, ok: false });
+            return;
+        }
+        running_map.insert(job, running.clone());
+    }
     let spawned = thread::Builder::new()
         .name("ts-peer-push-job".to_owned())
         .spawn({
@@ -672,7 +732,11 @@ fn start_job(
                     elapsed_us = started.elapsed().as_micros() as u64,
                     "peer push ended"
                 );
-                holder.running.lock().remove(&job);
+                {
+                    let mut running_map = holder.running.lock();
+                    running_map.remove(&job);
+                    holder.fenced.lock().insert(job);
+                }
                 send(&sockets, &reply_to, &Message::Done { job, ok });
                 if let Some(acknowledge) = running.acknowledge.lock().take() {
                     send(&sockets, &acknowledge, &Message::Cancelled { job });
@@ -681,7 +745,11 @@ fn start_job(
         });
     if let Err(error) = spawned {
         tracing::warn!(%error, "peer push not started");
-        holder.running.lock().remove(&job);
+        {
+            let mut running_map = holder.running.lock();
+            running_map.remove(&job);
+            holder.fenced.lock().insert(job);
+        }
         send(&sockets, &reply_to, &Message::Done { job, ok: false });
     }
 }
@@ -728,5 +796,45 @@ mod tests {
             Message::decode(&[Bytes::from_static(b"?"), Bytes::new()]),
             None
         );
+    }
+
+    #[test]
+    fn validate_spans_rejects_out_of_bounds_and_overflow() {
+        assert!(validate_spans(
+            &[PushSpan {
+                offset: 0,
+                address: 1 << 20,
+                length: 4096,
+            }],
+            4096
+        ));
+        assert!(!validate_spans(
+            &[PushSpan {
+                offset: 2048,
+                address: 1 << 20,
+                length: 4096,
+            }],
+            4096
+        ));
+        assert!(!validate_spans(
+            &[PushSpan {
+                offset: u64::MAX - 16,
+                address: 1 << 20,
+                length: 32,
+            }],
+            4096
+        ));
+    }
+
+    #[test]
+    fn fenced_jobs_bounds_memory_and_evicts_oldest() {
+        let mut fenced = FencedJobs::default();
+        for job in 0..(MAX_FENCED_JOBS as u64 + 2) {
+            fenced.insert(job);
+        }
+        assert!(!fenced.contains(0));
+        assert!(!fenced.contains(1));
+        assert!(fenced.contains(2));
+        assert!(fenced.contains(MAX_FENCED_JOBS as u64 + 1));
     }
 }

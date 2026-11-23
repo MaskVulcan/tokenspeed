@@ -27,6 +27,7 @@
 //! SQPOLL.
 
 use std::{
+    collections::VecDeque,
     io,
     os::fd::{AsRawFd, RawFd},
 };
@@ -42,10 +43,18 @@ use crate::{
 /// The user data of the eventfd read; requests use their slot index.
 const WAKE_UP: u64 = u64::MAX;
 
+/// One in-flight request in a ring slot, tracking progress across short I/Os.
+#[derive(Clone, Copy)]
+struct InFlight {
+    chunk: Chunk,
+    done: usize,
+}
+
 pub(crate) struct Ring {
     ring: IoUring,
     fd: RawFd,
     depth: usize,
+    fixed_buffers: bool,
 }
 
 impl Ring {
@@ -63,11 +72,30 @@ impl Ring {
             .collect();
         // SAFETY: the executor's caller keeps the memory mapped until close
         // succeeds (`Executor::start`), and a failed close leaks this ring.
-        unsafe { ring.submitter().register_buffers(&buffers)? };
+        // Fall back to ordinary direct-I/O Read/Write when fixed-buffer
+        // registration hits RLIMIT_MEMLOCK (ENOMEM) or VM_PFNMAP/THP (EFAULT/EINVAL).
+        let fixed_buffers = match unsafe { ring.submitter().register_buffers(&buffers) } {
+            Ok(()) => true,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOMEM | libc::EFAULT | libc::EINVAL)
+                ) =>
+            {
+                tracing::warn!(
+                    %error,
+                    pieces = buffers.len(),
+                    "io_uring register_buffers failed; falling back to non-fixed O_DIRECT ops"
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        };
         Ok(Self {
             ring,
             fd: file.raw_fd(),
             depth,
+            fixed_buffers,
         })
     }
 
@@ -80,8 +108,9 @@ impl Ring {
         // The wake-up read's target. Dropped after the ring, whose teardown
         // cancels the read.
         let mut counter = Box::new(0u64);
-        let mut slots: Vec<Option<Chunk>> = vec![None; self.depth];
+        let mut slots: Vec<Option<InFlight>> = vec![None; self.depth];
         let mut free: Vec<usize> = (0..self.depth).rev().collect();
+        let mut retries: VecDeque<InFlight> = VecDeque::new();
         let mut armed = false;
         loop {
             {
@@ -100,19 +129,28 @@ impl Ring {
                     armed = true;
                 }
                 while let Some(&slot) = free.last() {
-                    let Some(chunk) = queues.next(shared.limits) else {
-                        break;
+                    let inflight = match retries.pop_front() {
+                        Some(inflight) => inflight,
+                        None => match queues.next(shared.limits) {
+                            Some(chunk) => InFlight { chunk, done: 0 },
+                            None => break,
+                        },
                     };
                     free.pop();
-                    let request = request(self.fd, chunk).user_data(slot as u64);
-                    // SAFETY: the chunk lies in one registered piece, which
-                    // stays mapped; its slot keeps it until it completes.
-                    unsafe { submission.push(&request) }
+                    let req = request(self.fd, inflight, self.fixed_buffers)
+                        .user_data(slot as u64);
+                    // SAFETY: the chunk lies in registered memory that stays
+                    // mapped; its slot keeps it until it completes.
+                    unsafe { submission.push(&req) }
                         .expect("the ring has an entry for every slot");
-                    slots[slot] = Some(chunk);
+                    slots[slot] = Some(inflight);
                 }
                 drop(submission);
-                if queues.closing() && queues.drained() && free.len() == self.depth {
+                if queues.closing()
+                    && queues.drained()
+                    && retries.is_empty()
+                    && free.len() == self.depth
+                {
                     break;
                 }
             }
@@ -144,11 +182,38 @@ impl Ring {
                         continue;
                     }
                     let slot = usize::try_from(user_data).expect("a slot index");
-                    let chunk = slots[slot]
+                    let mut inflight = slots[slot]
                         .take()
                         .expect("a completion of an issued request");
                     free.push(slot);
-                    finished.extend(queues.finish(chunk, outcome(result, chunk.len)));
+                    if result == -libc::EINTR || result == -libc::EAGAIN {
+                        retries.push_back(inflight);
+                        continue;
+                    }
+                    let remaining = inflight.chunk.len - inflight.done;
+                    match usize::try_from(result) {
+                        Err(_) => {
+                            finished.extend(
+                                queues.finish(inflight.chunk, Err(IoError::Os(-result))),
+                            );
+                        }
+                        Ok(0) => {
+                            finished.extend(queues.finish(
+                                inflight.chunk,
+                                Err(IoError::Short {
+                                    expected: inflight.chunk.len,
+                                    done: inflight.done,
+                                }),
+                            ));
+                        }
+                        Ok(n) if n < remaining => {
+                            inflight.done += n;
+                            retries.push_back(inflight);
+                        }
+                        Ok(_) => {
+                            finished.extend(queues.finish(inflight.chunk, Ok(())));
+                        }
+                    }
                 }
             }
             shared.work.notify_all();
@@ -159,26 +224,30 @@ impl Ring {
     }
 }
 
-fn request(fd: RawFd, chunk: Chunk) -> squeue::Entry {
-    let len = u32::try_from(chunk.len).expect("requests are at most 1 GiB");
-    match chunk.direction {
-        Direction::Read => {
-            opcode::ReadFixed::new(types::Fd(fd), chunk.address as *mut u8, len, chunk.buffer)
-                .offset(chunk.file_offset)
+fn request(fd: RawFd, inflight: InFlight, fixed_buffers: bool) -> squeue::Entry {
+    let chunk = inflight.chunk;
+    let remaining = chunk.len - inflight.done;
+    let len = u32::try_from(remaining).expect("requests are at most 1 GiB");
+    let address = chunk.address + inflight.done;
+    let file_offset = chunk.file_offset + inflight.done as u64;
+    match (chunk.direction, fixed_buffers) {
+        (Direction::Read, true) => {
+            opcode::ReadFixed::new(types::Fd(fd), address as *mut u8, len, chunk.buffer)
+                .offset(file_offset)
                 .build()
         }
-        Direction::Write => {
-            opcode::WriteFixed::new(types::Fd(fd), chunk.address as *const u8, len, chunk.buffer)
-                .offset(chunk.file_offset)
+        (Direction::Write, true) => {
+            opcode::WriteFixed::new(types::Fd(fd), address as *const u8, len, chunk.buffer)
+                .offset(file_offset)
                 .build()
         }
-    }
-}
-
-fn outcome(result: i32, expected: usize) -> Result<(), IoError> {
-    match usize::try_from(result) {
-        Err(_) => Err(IoError::Os(-result)),
-        Ok(done) if done == expected => Ok(()),
-        Ok(done) => Err(IoError::Short { expected, done }),
+        (Direction::Read, false) => opcode::Read::new(types::Fd(fd), address as *mut u8, len)
+            .offset(file_offset)
+            .build(),
+        (Direction::Write, false) => {
+            opcode::Write::new(types::Fd(fd), address as *const u8, len)
+                .offset(file_offset)
+                .build()
+        }
     }
 }

@@ -55,6 +55,8 @@ public:
 
     const DiskConfig& Config() const { return config_; }
 
+    // Whether a read can start now within the operation and Host-block bounds.
+    bool HasReadCredits() const;
     // Reads the keys of the prompt's prefix that only the Disk holds -- for
     // the longest boundary Disk extends the local hit to under the
     // Host-suffix rule -- into Host blocks it allocates, holding the Disk
@@ -113,6 +115,7 @@ private:
 
     std::uint64_t nextId();
     void detach(std::uint64_t id) noexcept override;
+    std::size_t numOperations(DiskOpKind kind) const;
     std::size_t heldHostBlocks(DiskOpKind kind) const;
     DiskOperation command(std::uint64_t id, const Ticket& ticket) const;
 

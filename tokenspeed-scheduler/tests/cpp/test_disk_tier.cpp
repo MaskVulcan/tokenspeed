@@ -793,5 +793,26 @@ TEST(DiskTierConfigTest, ADiskTierNeedsHostWriteBackAndItsLimits) {
     EXPECT_THROW(config.Validate(), std::invalid_argument) << "disk_config without a Disk tier";
 }
 
+TEST(DiskTierTest, CleaningReservesOperationSlotsForForegroundReads) {
+    DiskConfig limits = Limits();
+    limits.max_operations = 4;
+    limits.max_blocks_per_operation = 1;
+    DiskTierCache cache(FullOnly(), /*disk_parents=*/16, limits);
+    const Prompt first(2, 1);
+    const Prompt second(2, 2);
+    const std::vector<CacheKey> first_keys = cache.OnHostOnly(first);
+    const std::vector<CacheKey> second_keys = cache.OnHostOnly(second);
+    cache.disks.QueueCleaning(first_keys);
+    cache.disks.QueueCleaning(second_keys);
+
+    // First cleaning write starts (max_write_ops = max(1, 4 / 4) = 1).
+    cache.disks.StartCleaning();
+    ASSERT_EQ(cache.disks.TakeCommands().size(), 1u);
+    // Second cleaning write is held back so foreground reads keep slots.
+    cache.disks.StartCleaning();
+    EXPECT_TRUE(cache.disks.TakeCommands().empty());
+    EXPECT_TRUE(cache.disks.HasReadCredits());
+}
+
 }  // namespace
 }  // namespace tokenspeed::test
