@@ -77,12 +77,14 @@ from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import cache_deployment_id, l3_settings
 from tokenspeed.runtime.cache.peer import (
     PUSH_TIMEOUT_S,
-    QUARANTINE_S,
     RECORD_LIFETIME_S,
     PeerSharingSettings,
     peer_endpoint_name,
     peer_incarnation,
     peer_scheduler_config,
+    resolve_disable_same_node,
+    resolve_holder_circuit_breaker,
+    resolve_quarantine_s,
 )
 from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -158,6 +160,7 @@ from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.host_peer import (
     build_host_peer,
     enable_mooncake_ipv6_for_host,
+    ensure_mooncake_transfer_timeouts,
     kv_bootstrap_address,
     mooncake_library,
     mooncake_protocol,
@@ -1236,7 +1239,8 @@ def _peer_sharing_settings(
     host_cache,
     geometry,
 ) -> PeerSharingSettings:
-    """Build the live cache namespace and agree on the TP replica's incarnation."""
+    """Build the live cache namespace and agree on the TP replica's settings."""
+    ensure_mooncake_transfer_timeouts()
     mapping = server_args.mapping
     deployment_id = cache_deployment_id(
         server_args,
@@ -1246,13 +1250,30 @@ def _peer_sharing_settings(
         world_cpu_group=None,
         for_peer=True,
     )
-    incarnation = [peer_incarnation()]
+    protocol = mooncake_protocol()
+    quarantine_s = resolve_quarantine_s(PUSH_TIMEOUT_S)
+    holder_fail_threshold, holder_cooldown_s = resolve_holder_circuit_breaker()
+    disable_same_node = resolve_disable_same_node(protocol)
+    agreed = [
+        peer_incarnation(),
+        quarantine_s,
+        holder_fail_threshold,
+        holder_cooldown_s,
+        disable_same_node,
+    ]
     if mapping.attn.tp_size > 1:
         dist.broadcast_object_list(
-            incarnation,
+            agreed,
             src=mapping.attn.tp_group[0],
             group=pg_manager.get_process_group("gloo", mapping.attn.tp_group),
         )
+    (
+        incarnation,
+        quarantine_s,
+        holder_fail_threshold,
+        holder_cooldown_s,
+        disable_same_node,
+    ) = agreed
     local_ip = get_local_ip_by_remote()
     enable_mooncake_ipv6_for_host(local_ip)
     port = server_args.peer_prefix_port
@@ -1272,19 +1293,22 @@ def _peer_sharing_settings(
         ),
         bind_host="::" if ":" in local_ip else "0.0.0.0",
         port=port,
-        incarnation=incarnation[0],
+        incarnation=incarnation,
         deployment_id=deployment_id,
         weight_version=str(server_args.weight_version),
         answer_timeout_s=server_args.peer_prefix_answer_timeout_ms / 1000,
-        quarantine_s=QUARANTINE_S,
+        quarantine_s=quarantine_s,
         push_timeout_s=PUSH_TIMEOUT_S,
         record_lifetime_s=RECORD_LIFETIME_S,
         library=mooncake_library(),
         local_ip=local_ip,
         push_host=host,
-        protocol=mooncake_protocol(),
+        protocol=protocol,
         ib_device=server_args.disaggregation_ib_device or "",
         geometry=geometry,
+        holder_fail_threshold=holder_fail_threshold,
+        holder_cooldown_s=holder_cooldown_s,
+        disable_same_node=disable_same_node,
     )
 
 
@@ -1318,6 +1342,7 @@ class HostBootstrap:
         global_rank = mapping.rank
 
         faulthandler.enable()
+        ensure_mooncake_transfer_timeouts()
         # NVSHMEM reads its IB traffic class from the process environment at
         # bootstrap; re-assert the launcher's setting in this process.
         if envs.NVSHMEM_IB_TRAFFIC_CLASS.is_set():

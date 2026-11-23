@@ -46,6 +46,17 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
+def _resolved_model_loader_extra_config(server_args: ServerArgs) -> dict[str, Any]:
+    raw = getattr(server_args, "model_loader_extra_config", None)
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        return parse_extra_config(raw)
+    if isinstance(raw, dict):
+        return dict(raw)
+    raise TypeError("model_loader_extra_config must be a dict or JSON object string")
+
+
 def model_checkpoint_id(server_args: ServerArgs, model_config: ModelConfig) -> str:
     from tokenspeed.runtime.cache.l3.identity import l3_checkpoint_id
 
@@ -54,8 +65,7 @@ def model_checkpoint_id(server_args: ServerArgs, model_config: ModelConfig) -> s
         hf_config=model_config.hf_config,
         revision=str(model_config.revision or ""),
         load_format=str(server_args.load_format),
-        # LoadConfig uses this same empty extra-config.
-        model_loader_extra_config={},
+        model_loader_extra_config=_resolved_model_loader_extra_config(server_args),
         ext_yaml=str(server_args.ext_yaml or ""),
     )
 

@@ -62,6 +62,36 @@ enum Phase {
     Done(i32),
 }
 
+/// Physical read outcome reported by one replica member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOutcome {
+    /// Every RDMA `READ` batch and Disk `Push` (if any) landed cleanly.
+    Ok,
+    /// Holder `PushEndpoint` rejected the push due to `MAX_QUEUED_PUSHES`
+    /// backpressure before touching Disk or RDMA; benign miss, not a fault.
+    Busy,
+    /// RDMA `READ` or Disk `Push` failed or timed out.
+    Failed,
+}
+
+/// One-shot holder health signal emitted at the exact transition into
+/// `Phase::Quarantine` or `Phase::Done` (never delayed until quarantine expiry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthOutcome {
+    /// Benign cache miss / soft-pin LRU eviction or push queue backpressure.
+    BenignMiss,
+    /// Clean vouched landing completion (`Done(end_tokens)`).
+    Success {
+        /// Agreed peer clock when this `Landing` started.
+        started_us: i64,
+    },
+    /// Holder control-plane timeout/untrusted answer or physical RDMA/Push fault.
+    Fault {
+        /// Agreed peer clock when this `Landing` started.
+        started_us: i64,
+    },
+}
+
 /// What a step asks the replica to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -106,9 +136,14 @@ pub struct Landing {
     deadline_us: i64,
     timeouts: Timeouts,
     /// Each member's read outcome, once reported.
-    outcomes: Vec<Option<bool>>,
+    outcomes: Vec<Option<ReadOutcome>>,
     /// The pin's pages, once it held.
     pinned: Option<PeerAnswerView>,
+    untrusted_pin: bool,
+    read_failed: bool,
+    read_busy: bool,
+    pending_health: Option<HealthOutcome>,
+    health_emitted: bool,
 }
 
 impl Landing {
@@ -146,6 +181,11 @@ impl Landing {
                 timeouts,
                 outcomes: vec![None; members],
                 pinned: None,
+                untrusted_pin: false,
+                read_failed: false,
+                read_busy: false,
+                pending_health: None,
+                health_emitted: false,
             },
             action,
         )
@@ -215,6 +255,24 @@ impl Landing {
         self.phase_us
     }
 
+    /// Agreed peer clock when this landing started.
+    pub fn started_us(&self) -> i64 {
+        self.started_us
+    }
+
+    /// Drain the one-shot health outcome emitted when entering `Phase::Quarantine`
+    /// or `Phase::Done` (`None` before that transition, or if already drained).
+    pub fn take_health_outcome(&mut self) -> Option<HealthOutcome> {
+        self.pending_health.take()
+    }
+
+    fn emit_health(&mut self, outcome: HealthOutcome) {
+        if !self.health_emitted {
+            self.health_emitted = true;
+            self.pending_health = Some(outcome);
+        }
+    }
+
     /// The fetch.
     pub fn fetch(&self) -> &PeerFetchView {
         &self.fetch
@@ -252,6 +310,7 @@ impl Landing {
             self.pinned = Some(answer);
             None
         } else {
+            self.untrusted_pin = !trusted;
             // A pin that holds anything must go; nothing was read.
             self.release(false, now_us)
         }
@@ -265,16 +324,29 @@ impl Landing {
     }
 
     /// `member`'s read ended.
-    pub fn read(&mut self, member: usize, ok: bool, now_us: i64) -> Option<Action> {
+    pub fn read(&mut self, member: usize, outcome: ReadOutcome, now_us: i64) -> Option<Action> {
         if self.phase != Phase::Read {
             return None;
         }
         let slot = self.outcomes.get_mut(member)?;
-        slot.get_or_insert(ok);
+        slot.get_or_insert(outcome);
         if self.outcomes.iter().any(Option::is_none) {
             return None;
         }
-        let read = self.outcomes.iter().all(|outcome| *outcome == Some(true));
+        let read = self
+            .outcomes
+            .iter()
+            .all(|entry| *entry == Some(ReadOutcome::Ok));
+        let any_failed = self
+            .outcomes
+            .iter()
+            .any(|entry| *entry == Some(ReadOutcome::Failed));
+        let any_busy = self
+            .outcomes
+            .iter()
+            .any(|entry| *entry == Some(ReadOutcome::Busy));
+        self.read_failed = any_failed;
+        self.read_busy = !any_failed && any_busy;
         self.release(read, now_us)
     }
 
@@ -284,6 +356,7 @@ impl Landing {
             self.settle(
                 read,
                 trusted && answer.held,
+                trusted,
                 if trusted && answer.held {
                     "ok"
                 } else {
@@ -299,11 +372,14 @@ impl Landing {
         match self.phase {
             // No read started: nothing can still write the destinations.
             Phase::Layout | Phase::Pin if now_us >= self.deadline_us => {
+                self.emit_health(HealthOutcome::Fault {
+                    started_us: self.started_us,
+                });
                 self.transition(Phase::Done(self.fetch.begin_tokens), "timeout", now_us);
             }
             // An unanswered release vouches for nothing.
             Phase::Release { read } if now_us >= self.deadline_us => {
-                self.settle(read, false, "timeout", now_us)
+                self.settle(read, false, false, "timeout", now_us)
             }
             Phase::Quarantine { until_us } if now_us >= until_us => {
                 self.transition(Phase::Done(self.fetch.begin_tokens), "ok", now_us);
@@ -330,8 +406,48 @@ impl Landing {
         Some(Action::SendRelease { demote: read })
     }
 
-    fn settle(&mut self, read: bool, vouched: bool, outcome: &str, now_us: i64) {
-        let failed_read = self.pinned.is_some() && !read;
+    fn settle(
+        &mut self,
+        read: bool,
+        vouched: bool,
+        trusted_release: bool,
+        outcome: &str,
+        now_us: i64,
+    ) {
+        let failed_read = self.pinned.is_some() && self.read_failed;
+        let busy_read = self.pinned.is_some() && self.read_busy;
+        let health = if failed_read {
+            HealthOutcome::Fault {
+                started_us: self.started_us,
+            }
+        } else if busy_read {
+            if trusted_release {
+                HealthOutcome::BenignMiss
+            } else {
+                HealthOutcome::Fault {
+                    started_us: self.started_us,
+                }
+            }
+        } else if read && vouched {
+            HealthOutcome::Success {
+                started_us: self.started_us,
+            }
+        } else if self.pinned.is_some() {
+            // Read succeeded on every member, but Release timed out, was untrusted,
+            // or reported `!answer.held`.
+            HealthOutcome::Fault {
+                started_us: self.started_us,
+            }
+        } else if self.untrusted_pin || !trusted_release {
+            HealthOutcome::Fault {
+                started_us: self.started_us,
+            }
+        } else {
+            // Trusted `Pin { held: false }` (or boundary/page eviction before pin)
+            // followed by a trusted `Release`: benign cache miss.
+            HealthOutcome::BenignMiss
+        };
+        self.emit_health(health);
         let next = if failed_read {
             Phase::Quarantine {
                 until_us: deadline(now_us, self.timeouts.quarantine_us),
@@ -417,12 +533,22 @@ mod tests {
     #[test]
     fn a_landing_every_member_read_and_the_holder_vouched_for_keeps_its_end() {
         let mut landing = pinned_landing();
-        assert_eq!(landing.read(1, true, 5), None, "one member still reads");
         assert_eq!(
-            landing.read(0, true, 6),
+            landing.read(1, ReadOutcome::Ok, 5),
+            None,
+            "one member still reads"
+        );
+        assert_eq!(
+            landing.read(0, ReadOutcome::Ok, 6),
             Some(Action::SendRelease { demote: true })
         );
+        assert_eq!(landing.take_health_outcome(), None);
         landing.released(&answer(PeerAnswerKind::Release, true, 0, vec![]), true, 7);
+        assert_eq!(
+            landing.take_health_outcome(),
+            Some(HealthOutcome::Success { started_us: 0 })
+        );
+        assert_eq!(landing.take_health_outcome(), None, "emitted once");
         assert_eq!(landing.done(), Some(8));
         landing.transition(super::Phase::Layout, "ok", 8);
         assert_eq!(landing.done(), Some(8), "a finished landing is terminal");
@@ -438,15 +564,25 @@ mod tests {
         assert_eq!(landing.done(), None);
         landing.tick(110);
         assert_eq!(landing.done(), Some(0), "the pin's answer timed out");
+        assert_eq!(
+            landing.take_health_outcome(),
+            Some(HealthOutcome::Fault { started_us: 0 })
+        );
     }
 
     #[test]
     fn an_unusable_pin_is_released_and_reads_nothing() {
-        for (held, tokens, pages, trusted) in [
-            (false, 8, vec![page(0), page(1)], true),
-            (true, 6, vec![page(0), page(1)], true),
-            (true, 8, vec![page(0)], true),
-            (true, 8, vec![page(0), page(1)], false),
+        for (held, tokens, pages, trusted, expected_health) in [
+            (false, 8, vec![page(0), page(1)], true, HealthOutcome::BenignMiss),
+            (true, 6, vec![page(0), page(1)], true, HealthOutcome::BenignMiss),
+            (true, 8, vec![page(0)], true, HealthOutcome::BenignMiss),
+            (
+                true,
+                8,
+                vec![page(0), page(1)],
+                false,
+                HealthOutcome::Fault { started_us: 0 },
+            ),
         ] {
             let (mut landing, _) = Landing::new(fetch(), 1, true, 0, TIMEOUTS);
             assert_eq!(
@@ -454,56 +590,89 @@ mod tests {
                 Some(Action::SendRelease { demote: false })
             );
             assert!(landing.pages_to_read().is_none());
-            landing.released(&answer(PeerAnswerKind::Release, true, 0, vec![]), true, 2);
+            // Holder servicer replies `Release { held: false }` when `pinned_at` was `None`.
+            landing.released(&answer(PeerAnswerKind::Release, false, 0, vec![]), true, 2);
             assert_eq!(landing.done(), Some(0), "nothing was read: no quarantine");
+            assert_eq!(landing.take_health_outcome(), Some(expected_health));
         }
     }
 
     #[test]
-    fn a_failed_read_holds_its_destinations_through_the_quarantine() {
+    fn a_failed_read_emits_fault_at_quarantine_entry_not_expiry() {
         let mut landing = pinned_landing();
-        landing.read(0, true, 1);
+        landing.read(0, ReadOutcome::Ok, 1);
         assert_eq!(
-            landing.read(1, false, 2),
+            landing.read(1, ReadOutcome::Failed, 2),
             Some(Action::SendRelease { demote: false })
         );
         landing.released(&answer(PeerAnswerKind::Release, true, 0, vec![]), true, 3);
-        assert_eq!(landing.done(), None);
+        assert_eq!(landing.done(), None, "still in quarantine");
+        assert_eq!(
+            landing.take_health_outcome(),
+            Some(HealthOutcome::Fault { started_us: 0 }),
+            "fault must emit immediately upon entering quarantine"
+        );
         landing.tick(1002);
         assert_eq!(landing.done(), None);
         landing.tick(1003);
         assert_eq!(landing.done(), Some(0));
+        assert_eq!(
+            landing.take_health_outcome(),
+            None,
+            "quarantine expiry must not emit a duplicate ghost fault"
+        );
+    }
+
+    #[test]
+    fn busy_push_backpressure_maps_to_benign_miss_without_quarantine() {
+        let mut landing = pinned_landing();
+        landing.read(0, ReadOutcome::Ok, 1);
+        assert_eq!(
+            landing.read(1, ReadOutcome::Busy, 2),
+            Some(Action::SendRelease { demote: false })
+        );
+        landing.released(&answer(PeerAnswerKind::Release, true, 0, vec![]), true, 3);
+        assert_eq!(landing.done(), Some(0));
+        assert_eq!(landing.take_health_outcome(), Some(HealthOutcome::BenignMiss));
     }
 
     #[test]
     fn an_unvouched_or_unanswered_release_gives_a_complete_read_up() {
         let mut landing = pinned_landing();
-        landing.read(0, true, 1);
-        landing.read(1, true, 1);
+        landing.read(0, ReadOutcome::Ok, 1);
+        landing.read(1, ReadOutcome::Ok, 1);
         landing.released(&answer(PeerAnswerKind::Release, false, 0, vec![]), true, 2);
         assert_eq!(
             landing.done(),
             Some(0),
             "the pages may have changed under the read"
         );
+        assert_eq!(
+            landing.take_health_outcome(),
+            Some(HealthOutcome::Fault { started_us: 0 })
+        );
 
         let mut landing = pinned_landing();
-        landing.read(0, true, 1);
-        landing.read(1, true, 1);
+        landing.read(0, ReadOutcome::Ok, 1);
+        landing.read(1, ReadOutcome::Ok, 1);
         landing.tick(101);
         assert_eq!(landing.done(), Some(0), "no answer vouches for nothing");
+        assert_eq!(
+            landing.take_health_outcome(),
+            Some(HealthOutcome::Fault { started_us: 0 })
+        );
     }
 
     #[test]
     fn a_member_reports_once_and_reports_outside_a_read_change_nothing() {
         let mut landing = pinned_landing();
-        landing.read(0, true, 1);
-        landing.read(0, false, 1);
+        landing.read(0, ReadOutcome::Ok, 1);
+        landing.read(0, ReadOutcome::Failed, 1);
         assert_eq!(
-            landing.read(1, true, 1),
+            landing.read(1, ReadOutcome::Ok, 1),
             Some(Action::SendRelease { demote: true })
         );
-        assert_eq!(landing.read(1, true, 1), None);
-        assert_eq!(landing.read(5, true, 1), None);
+        assert_eq!(landing.read(1, ReadOutcome::Ok, 1), None);
+        assert_eq!(landing.read(5, ReadOutcome::Ok, 1), None);
     }
 }

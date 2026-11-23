@@ -194,6 +194,11 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Whether no unread bytes remain.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     /// `value`, if nothing is left to read.
     pub(crate) fn finish<T>(self, value: T) -> Option<T> {
         self.0.is_empty().then_some(value)

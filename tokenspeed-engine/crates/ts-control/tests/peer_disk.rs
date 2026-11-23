@@ -172,6 +172,7 @@ fn geometry(base: u64, push: &str) -> RankGeometry {
             page_stride: BLOCK_BYTES as u64,
             bytes: BLOCK_BYTES as u64,
         }],
+        device_regions: Vec::new(),
         host: Some(HostPool {
             address: 0,
             groups: vec![HostGroup {
@@ -230,6 +231,9 @@ fn settings(name: &str) -> PeerSettings {
             push_us: 2_000_000,
         },
         record_lifetime: Duration::from_secs(5),
+        holder_fail_threshold: 3,
+        holder_cooldown_us: 30_000_000,
+        disable_same_node: false,
     }
 }
 

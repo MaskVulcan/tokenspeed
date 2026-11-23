@@ -154,6 +154,16 @@ class DecodeSettings:
     heartbeat_max_failures: int
 
 
+def ensure_mooncake_transfer_timeouts() -> None:
+    """Install bounded transfer timeouts before Mooncake / CANN ADXL initializes.
+
+    Respects any explicit operator/launcher setting via ``os.environ.setdefault``
+    while preventing Mooncake's ``60s`` unbound default when unset.
+    """
+    os.environ.setdefault("MC_TRANSFER_TIMEOUT", "10")
+    os.environ.setdefault("ASCEND_TRANSFER_TIMEOUT", "10000")
+
+
 def enable_mooncake_ipv6_for_host(hostname: str) -> None:
     """Make Mooncake's handshake use IPv6 when ``hostname``, the address the
     host's transfer engine starts on, is an IPv6 literal.
@@ -306,6 +316,7 @@ def build_host_peer(
     )
     topology = PDParallelTopology.from_mapping(server_args.mapping)
     local_ip = get_local_ip_by_remote()
+    ensure_mooncake_transfer_timeouts()
     enable_mooncake_ipv6_for_host(local_ip)
     settings = PeerSettings(
         library=mooncake_library(),

@@ -43,6 +43,12 @@ from tokenspeed.runtime.cache.peer import (  # noqa: E402
     peer_host_regions,
     peer_incarnation,
     peer_scheduler_config,
+    resolve_disable_same_node,
+    resolve_holder_circuit_breaker,
+    resolve_quarantine_s,
+)
+from tokenspeed.runtime.pd.host_peer import (  # noqa: E402
+    ensure_mooncake_transfer_timeouts,
 )
 from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
     CacheField,
@@ -82,9 +88,9 @@ def test_build_peer_geometry_records_host_region_lengths():
     host_storage = SimpleNamespace(
         group_ids=("full",),
         host_field_offsets=((0,),),
-        host_parent_bytes=24,
-        host_group_block_packing=(1,),
-        host_group_block_bytes=(12,),
+        host_lcm_block_bytes=24,
+        group_packing=(1,),
+        host_cache_block_bytes=(12,),
         host_buffer=host_buf,
         host_buffer_bytes=96,
     )
@@ -98,6 +104,7 @@ def test_build_peer_geometry_records_host_region_lengths():
     )
     assert geometry.host.address == 1000
     assert geometry.host.region_lengths == (48, 48)
+    assert geometry.device_regions == ((500, 128),)
     assert geometry.regions == ((500, 128), (1000, 48), (1048, 48))
 
 
@@ -330,10 +337,85 @@ def test_peer_scheduler_config_scales_soft_pin_and_host_ready_with_answer_timeou
     assert high.host_ready_timeout_us == 10_000_000
     assert high.lookup_timeout_us == 5_000_000
 
-    # Device landing keeps soft_pin scaling while leaving host_ready_timeout_us == 0
+    # Device landing raises soft_pin floor to max(8.0s, 6.0 * answer_timeout_s)
+    # while leaving host_ready_timeout_us == 0.
+    dev_low = peer_scheduler_config(landing_tier="device", answer_timeout_ms=50, **base)
+    assert dev_low.soft_pin_us == 8_000_000
+    assert dev_low.host_ready_timeout_us == 0
+
+    dev_mid = peer_scheduler_config(
+        landing_tier="device", answer_timeout_ms=1000, **base
+    )
+    assert dev_mid.soft_pin_us == 8_000_000
+    assert dev_mid.host_ready_timeout_us == 0
+
     dev = peer_scheduler_config(landing_tier="device", answer_timeout_ms=5000, **base)
-    assert dev.soft_pin_us == 12_000_000
+    assert dev.soft_pin_us == 30_000_000
     assert dev.host_ready_timeout_us == 0
+
+
+def test_resolve_quarantine_s_tracks_effective_transfer_timeouts(monkeypatch):
+    # Explicit 10s / 10000ms defaults -> max(30.0, 2 * 10 + 10 - 6 = 24.0) = 30.0s.
+    monkeypatch.setenv("MC_TRANSFER_TIMEOUT", "10")
+    monkeypatch.setenv("ASCEND_TRANSFER_TIMEOUT", "10000")
+    assert resolve_quarantine_s(10.0) == 30.0
+
+    # Hulk ASCEND_TRANSFER_TIMEOUT=31000 (31s) -> 2 * 31 + 10 - 6 = 66.0s!
+    monkeypatch.setenv("MC_TRANSFER_TIMEOUT", "10")
+    monkeypatch.setenv("ASCEND_TRANSFER_TIMEOUT", "31000")
+    assert resolve_quarantine_s(10.0) == 66.0
+
+    # Unset MC_TRANSFER_TIMEOUT falls back to Mooncake C++ 60s default -> 2 * 60 + 4 = 124.0s!
+    monkeypatch.delenv("MC_TRANSFER_TIMEOUT", raising=False)
+    monkeypatch.setenv("ASCEND_TRANSFER_TIMEOUT", "10000")
+    assert resolve_quarantine_s(10.0) == 124.0
+
+    # Invalid env strings fall back safely to 60.0s / 10.0s.
+    monkeypatch.setenv("MC_TRANSFER_TIMEOUT", "not-a-number")
+    monkeypatch.setenv("ASCEND_TRANSFER_TIMEOUT", "-5")
+    assert resolve_quarantine_s(10.0) == 124.0
+
+
+def test_ensure_mooncake_transfer_timeouts_preserves_operator_overrides(monkeypatch):
+    monkeypatch.delenv("MC_TRANSFER_TIMEOUT", raising=False)
+    monkeypatch.delenv("ASCEND_TRANSFER_TIMEOUT", raising=False)
+    ensure_mooncake_transfer_timeouts()
+    assert os.environ["MC_TRANSFER_TIMEOUT"] == "10"
+    assert os.environ["ASCEND_TRANSFER_TIMEOUT"] == "10000"
+    assert resolve_quarantine_s(10.0) == 30.0
+
+    # Pre-existing Hulk override is preserved by setdefault and scales quarantine_s to 66.0s.
+    monkeypatch.setenv("ASCEND_TRANSFER_TIMEOUT", "31000")
+    ensure_mooncake_transfer_timeouts()
+    assert os.environ["ASCEND_TRANSFER_TIMEOUT"] == "31000"
+    assert resolve_quarantine_s(10.0) == 66.0
+
+
+def test_resolve_disable_same_node_defaults_on_for_ascend_direct_and_honors_zero(
+    monkeypatch,
+):
+    monkeypatch.delenv("TOKENSPEED_PEER_DISABLE_SAME_NODE", raising=False)
+    assert resolve_disable_same_node("ascend_direct") is True
+    assert resolve_disable_same_node("rdma") is False
+    assert resolve_disable_same_node("tcp") is False
+
+    monkeypatch.setenv("TOKENSPEED_PEER_DISABLE_SAME_NODE", "0")
+    assert resolve_disable_same_node("ascend_direct") is False
+    monkeypatch.setenv("TOKENSPEED_PEER_DISABLE_SAME_NODE", "false")
+    assert resolve_disable_same_node("ascend_direct") is False
+
+    monkeypatch.setenv("TOKENSPEED_PEER_DISABLE_SAME_NODE", "1")
+    assert resolve_disable_same_node("rdma") is True
+
+
+def test_resolve_holder_circuit_breaker_parses_env_cleanly(monkeypatch):
+    monkeypatch.delenv("TOKENSPEED_PEER_HOLDER_FAIL_THRESHOLD", raising=False)
+    monkeypatch.delenv("TOKENSPEED_PEER_HOLDER_COOLDOWN_S", raising=False)
+    assert resolve_holder_circuit_breaker() == (3, 30.0)
+
+    monkeypatch.setenv("TOKENSPEED_PEER_HOLDER_FAIL_THRESHOLD", "5")
+    monkeypatch.setenv("TOKENSPEED_PEER_HOLDER_COOLDOWN_S", "45.5")
+    assert resolve_holder_circuit_breaker() == (5, 45.5)
 
 
 @pytest.mark.parametrize(

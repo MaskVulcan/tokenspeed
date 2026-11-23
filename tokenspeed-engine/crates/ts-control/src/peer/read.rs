@@ -34,7 +34,8 @@ use parking_lot::Mutex;
 
 use crate::peer::{
     geometry::Spans,
-    push::{PagePusher, PushItem},
+    landing::ReadOutcome,
+    push::{PagePusher, PushFailure, PushItem},
 };
 
 /// What moves a read's bytes.
@@ -109,7 +110,7 @@ impl PushJob {
 /// The member's bounded read workers: jobs in, outcomes out.
 pub struct Reads {
     jobs: Option<mpsc::Sender<(ReadJob, Option<ts_metrics::QueuedPeerRead>)>>,
-    outcomes: mpsc::Receiver<(String, bool)>,
+    outcomes: mpsc::Receiver<(String, ReadOutcome)>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -150,54 +151,114 @@ impl Reads {
                     let started = std::time::Instant::now();
                     let total_spans = job.total_spans();
                     let host_bytes = job.host_bytes();
+                    let ReadJob {
+                        request_id,
+                        session,
+                        batches,
+                        push,
+                    } = job;
                     tracing::debug!(
-                        request = job.request_id,
+                        request = request_id,
                         spans = total_spans,
-                        mr_batches = job.batches.len(),
+                        mr_batches = batches.len(),
                         "peer read started"
                     );
-                    let mut outcome = Ok(());
-                    for batch in &job.batches {
-                        if batch.is_empty() {
-                            continue;
+                    let has_read_batches = batches.iter().any(|b| !b.is_empty());
+                    // Overlap `PushJob` concurrently with MR-split `READ` batches,
+                    // joining both before reporting the landing outcome so no
+                    // transfer trails behind settlement.
+                    let (read_outcome, push_outcome, disk_bytes) = match (push, has_read_batches) {
+                        (Some(push), true) => {
+                            let bytes = push.bytes();
+                            let PushJob {
+                                endpoint,
+                                session: push_session,
+                                budget,
+                                items,
+                            } = push;
+                            let (read_res, push_res) = std::thread::scope(|scope| {
+                                let push_handle = scope.spawn(|| {
+                                    pusher.push_checked(&endpoint, &push_session, budget, items)
+                                });
+                                let mut read_res = Ok(());
+                                for batch in &batches {
+                                    if batch.is_empty() {
+                                        continue;
+                                    }
+                                    if let Err(err) = reader.read(&session, batch) {
+                                        read_res = Err(err);
+                                        break;
+                                    }
+                                }
+                                let push_res = push_handle.join().unwrap_or_else(|_| {
+                                    Err(PushFailure::Failed(
+                                        "peer push worker panicked".to_owned(),
+                                    ))
+                                });
+                                (read_res, push_res)
+                            });
+                            (read_res, Some(push_res), bytes)
                         }
-                        if let Err(err) = reader.read(&job.session, batch) {
-                            outcome = Err(err);
-                            break;
+                        (Some(push), false) => {
+                            let bytes = push.bytes();
+                            let res = pusher.push_checked(
+                                &push.endpoint,
+                                &push.session,
+                                push.budget,
+                                push.items,
+                            );
+                            (Ok(()), Some(res), bytes)
                         }
-                    }
-                    // The push holds the landing too: a failed read still
-                    // waits for it, so no write trails the outcome.
-                    let mut disk_bytes = 0;
-                    if let Some(push) = job.push {
-                        disk_bytes = push.bytes();
-                        let pushed =
-                            pusher.push(&push.endpoint, &push.session, push.budget, push.items);
-                        outcome = outcome.and(pushed);
-                    }
+                        (None, _) => {
+                            let mut read_res = Ok(());
+                            for batch in &batches {
+                                if batch.is_empty() {
+                                    continue;
+                                }
+                                if let Err(err) = reader.read(&session, batch) {
+                                    read_res = Err(err);
+                                    break;
+                                }
+                            }
+                            (read_res, None, 0)
+                        }
+                    };
+                    let (status, fatal_error) = match (read_outcome, push_outcome) {
+                        (Ok(()), None | Some(Ok(()))) => (ReadOutcome::Ok, None),
+                        (Ok(()), Some(Err(PushFailure::Busy))) => (ReadOutcome::Busy, None),
+                        (Err(err), _) => (ReadOutcome::Failed, Some(err)),
+                        (Ok(()), Some(Err(PushFailure::Failed(err)))) => {
+                            (ReadOutcome::Failed, Some(err))
+                        }
+                    };
                     if let Some(observation) = observation {
                         observation.finish(
                             started,
                             started.elapsed(),
                             host_bytes,
                             disk_bytes,
-                            outcome.is_ok(),
+                            status == ReadOutcome::Ok,
                         );
                     }
                     tracing::debug!(
-                        request = job.request_id,
-                        ok = outcome.is_ok(),
+                        request = request_id,
+                        ?status,
                         elapsed_us = started.elapsed().as_micros() as u64,
                         "peer read ended"
                     );
-                    if let Err(error) = &outcome {
-                        let first_batch = job.batches.first();
-                        let last_batch = job.batches.last();
+                    if status == ReadOutcome::Busy {
+                        tracing::debug!(
+                            request = request_id,
+                            "peer push skipped due to holder queue-full backpressure"
+                        );
+                    } else if let Some(error) = &fatal_error {
+                        let first_batch = batches.first();
+                        let last_batch = batches.last();
                         tracing::warn!(
-                            request = job.request_id,
+                            request = request_id,
                             %error,
                             spans = total_spans,
-                            mr_batches = job.batches.len(),
+                            mr_batches = batches.len(),
                             first_source = first_batch
                                 .and_then(|s| s.sources.first())
                                 .map(|a| format!("{a:#x}")),
@@ -210,7 +271,7 @@ impl Reads {
                             "peer read failed"
                         );
                     }
-                    if done.send((job.request_id, outcome.is_ok())).is_err() {
+                    if done.send((request_id, status)).is_err() {
                         return;
                     }
                 })?;
@@ -235,7 +296,7 @@ impl Reads {
     }
 
     /// The reads that ended since the last poll, by landing request.
-    pub fn poll(&self) -> Vec<(String, bool)> {
+    pub fn poll(&self) -> Vec<(String, ReadOutcome)> {
         self.outcomes.try_iter().collect()
     }
 }
@@ -340,7 +401,7 @@ mod tests {
         }
     }
 
-    fn wait_for(reads: &Reads) -> Vec<(String, bool)> {
+    fn wait_for(reads: &Reads) -> Vec<(String, ReadOutcome)> {
         let start = Instant::now();
         loop {
             let polled = reads.poll();
@@ -372,7 +433,7 @@ mod tests {
             }],
             push: None,
         });
-        assert_eq!(wait_for(&reads), vec![("r".to_owned(), true)]);
+        assert_eq!(wait_for(&reads), vec![("r".to_owned(), ReadOutcome::Ok)]);
         assert_eq!(arena.read_bytes(32, 8), vec![7; 8]);
         assert_eq!(arena.read_bytes(40, 8), vec![0; 8]);
     }
@@ -409,7 +470,7 @@ mod tests {
             }],
             push: Some(push()),
         });
-        assert_eq!(wait_for(&reads), vec![("r".to_owned(), true)]);
+        assert_eq!(wait_for(&reads), vec![("r".to_owned(), ReadOutcome::Ok)]);
         assert_eq!(
             *pushes.0.lock().unwrap(),
             vec![("holder:7200".to_owned(), 1)]
@@ -427,7 +488,123 @@ mod tests {
             batches: Vec::new(),
             push: Some(push()),
         });
-        assert_eq!(wait_for(&reads), vec![("r".to_owned(), false)]);
+        assert_eq!(
+            wait_for(&reads),
+            vec![("r".to_owned(), ReadOutcome::Failed)]
+        );
+    }
+
+    #[test]
+    fn push_and_mr_read_batches_overlap_concurrently_and_busy_push_reports_busy() {
+        use std::sync::Barrier;
+
+        struct BarrierReader {
+            arena: Arena,
+            barrier: Arc<Barrier>,
+        }
+        impl PageReader for BarrierReader {
+            fn read(&self, session: &str, spans: &Spans) -> Result<(), String> {
+                self.barrier.wait();
+                self.arena.read(session, spans)
+            }
+        }
+
+        struct BarrierPusher {
+            barrier: Arc<Barrier>,
+            busy: bool,
+        }
+        impl PagePusher for BarrierPusher {
+            fn push(&self, _: &str, _: &str, _: Duration, _: Vec<PushItem>) -> Result<(), String> {
+                unreachable!("Reads calls push_checked")
+            }
+            fn push_checked(
+                &self,
+                _: &str,
+                _: &str,
+                _: Duration,
+                _: Vec<PushItem>,
+            ) -> Result<(), PushFailure> {
+                self.barrier.wait();
+                if self.busy {
+                    Err(PushFailure::Busy)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let arena = Arena::new(64);
+        arena.write(0, &[9; 8]);
+        // A 2-party barrier deadlocks unless `READ` and `PushJob` run concurrently!
+        let barrier = Arc::new(Barrier::new(2));
+        let reads = Reads::start(
+            Arc::new(BarrierReader {
+                arena: arena.clone(),
+                barrier: barrier.clone(),
+            }),
+            Arc::new(BarrierPusher {
+                barrier: barrier.clone(),
+                busy: false,
+            }),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+        let push = || PushJob {
+            endpoint: "holder:7200".into(),
+            session: "reader".into(),
+            budget: Duration::from_secs(1),
+            items: vec![PushItem {
+                group: 0,
+                block: 1,
+                spans: Vec::new(),
+            }],
+        };
+        reads.submit(ReadJob {
+            request_id: "overlapped".into(),
+            session: "s".into(),
+            batches: vec![Spans {
+                sources: vec![0],
+                destinations: vec![24],
+                lengths: vec![8],
+                host_bytes: 0,
+            }],
+            push: Some(push()),
+        });
+        assert_eq!(
+            wait_for(&reads),
+            vec![("overlapped".to_owned(), ReadOutcome::Ok)]
+        );
+        assert_eq!(arena.read_bytes(24, 8), vec![9; 8]);
+
+        // Busy push maps to ReadOutcome::Busy when READs succeed.
+        let barrier2 = Arc::new(Barrier::new(2));
+        let busy_reads = Reads::start(
+            Arc::new(BarrierReader {
+                arena,
+                barrier: barrier2.clone(),
+            }),
+            Arc::new(BarrierPusher {
+                barrier: barrier2,
+                busy: true,
+            }),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+        busy_reads.submit(ReadJob {
+            request_id: "busy-job".into(),
+            session: "s".into(),
+            batches: vec![Spans {
+                sources: vec![0],
+                destinations: vec![32],
+                lengths: vec![8],
+                host_bytes: 0,
+            }],
+            push: Some(push()),
+        });
+        assert_eq!(
+            wait_for(&busy_reads),
+            vec![("busy-job".to_owned(), ReadOutcome::Busy)]
+        );
     }
 
     #[test]
@@ -449,7 +626,10 @@ mod tests {
                 }],
                 push: None,
             });
-            assert_eq!(wait_for(&reads), vec![("r".to_owned(), false)]);
+            assert_eq!(
+                wait_for(&reads),
+                vec![("r".to_owned(), ReadOutcome::Failed)]
+            );
         }
     }
 
@@ -539,7 +719,10 @@ mod tests {
             ],
             push: None,
         });
-        assert_eq!(wait_for(&reads), vec![("mr-split".to_owned(), true)]);
+        assert_eq!(
+            wait_for(&reads),
+            vec![("mr-split".to_owned(), ReadOutcome::Ok)]
+        );
         assert_eq!(*reader.calls.lock().unwrap(), vec![1, 1]);
         assert_eq!(arena.read_bytes(32, 8), vec![1; 8]);
         assert_eq!(arena.read_bytes(40, 8), vec![2; 8]);
@@ -565,11 +748,11 @@ mod tests {
             "paused"
         );
         reads.submit(read_job("fast", "ready", 32));
-        assert_eq!(wait_for(&reads), vec![("fast".to_owned(), true)]);
+        assert_eq!(wait_for(&reads), vec![("fast".to_owned(), ReadOutcome::Ok)]);
         assert_eq!(arena.read_bytes(32, 8), vec![7; 8]);
         assert_eq!(arena.read_bytes(16, 8), vec![0; 8]);
         drop(release);
-        assert_eq!(wait_for(&reads), vec![("slow".to_owned(), true)]);
+        assert_eq!(wait_for(&reads), vec![("slow".to_owned(), ReadOutcome::Ok)]);
         assert_eq!(arena.read_bytes(16, 8), vec![7; 8]);
     }
 

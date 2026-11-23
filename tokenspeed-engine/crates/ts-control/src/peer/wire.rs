@@ -221,6 +221,11 @@ fn write_geometry(out: &mut Writer, geometry: &RankGeometry) {
         out.u64(field.page_stride);
         out.u64(field.bytes);
     }
+    out.count(geometry.device_regions.len());
+    for &(address, length) in &geometry.device_regions {
+        out.u64(address);
+        out.u64(length);
+    }
     out.option(geometry.push.as_ref(), |out, endpoint| {
         out.bytes(endpoint.as_bytes())
     });
@@ -257,6 +262,11 @@ fn read_geometry(reader: &mut Reader<'_>) -> Option<RankGeometry> {
             bytes: reader.u64()?,
         });
     }
+    let num_device_regions = reader.count()?;
+    let mut device_regions = Vec::with_capacity(num_device_regions.min(1 << 16));
+    for _ in 0..num_device_regions {
+        device_regions.push((reader.u64()?, reader.u64()?));
+    }
     let push = reader.option(read_str)?;
     let host = reader.option(|reader| {
         let address = reader.u64()?;
@@ -292,6 +302,7 @@ fn read_geometry(reader: &mut Reader<'_>) -> Option<RankGeometry> {
     Some(RankGeometry {
         session,
         device,
+        device_regions,
         host,
         push,
     })
@@ -560,6 +571,7 @@ mod tests {
                 page_stride: 4096,
                 bytes: 2048,
             }],
+            device_regions: vec![(1 << 40, 1 << 20)],
             host: Some(HostPool {
                 address: 1 << 41,
                 groups: vec![HostGroup {

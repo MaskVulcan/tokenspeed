@@ -751,17 +751,49 @@ def _local_checkpoint_code_files(model_dir: str) -> tuple[tuple[str, str], ...]:
     return tuple(found)
 
 
-_WEIGHT_SHARD_SAMPLE_BYTES = 64 * 1024  # 64 KiB; <= 256 KiB total read per shard.
+_WEIGHT_SHARD_SAMPLE_BYTES = 64 * 1024  # 64 KiB; <= 256 KiB for normal shards.
+_MAX_SAFETENSORS_HEADER_BYTES = 4 * 1024 * 1024  # 4 MiB cap on .safetensors JSON header.
+_PREAD_CHUNK_BYTES = 1024 * 1024  # 1 MiB max syscall slice for large headers.
+
+
+def _pread_into_hasher(
+    fd: int,
+    path: str,
+    hasher: "hashlib._Hash",
+    offset: int,
+    length: int,
+    *,
+    capture_prefix: int = 0,
+) -> bytes:
+    prefix = bytearray()
+    remaining = length
+    cursor = offset
+    while remaining > 0:
+        chunk = os.pread(fd, min(remaining, _PREAD_CHUNK_BYTES), cursor)
+        if not chunk:
+            raise OSError(
+                f"unexpected EOF reading weight shard {path} at offset {cursor}"
+            )
+        if len(prefix) < capture_prefix:
+            need = capture_prefix - len(prefix)
+            prefix.extend(chunk[:need])
+        hasher.update(chunk)
+        cursor += len(chunk)
+        remaining -= len(chunk)
+    return bytes(prefix)
 
 
 def _update_weight_shard_digest(hasher: "hashlib._Hash", path: str) -> None:
-    """Hash a weight shard's byte size, 64 KiB header, and 3 strided 64 KiB samples.
+    """Hash a weight shard's byte size, full `.safetensors` header (up to 4 MiB),
+    and strided 64 KiB tensor samples.
 
-    Reads at most ``256 KiB`` per shard (the entire file when ``size <= 256 KiB``,
-    else 4 disjoint ``64 KiB`` windows at ``0``, ``1/3``, ``2/3``, and ``tail``)
-    and never hashes ``mtime``. This keeps 100-shard startup fingerprinting under
-    ``50 ms`` across cluster mounts while preventing L3 KV collisions across
-    same-shape training checkpoints or quantization recalibrations, and raises
+    Reads the entire file when ``size <= 256 KiB``. For larger ``.safetensors``
+    shards, reads the 8-byte little-endian JSON header length (capped at
+    ``4 MiB``): when ``8 + header_len <= 64 KiB``, 4 disjoint ``64 KiB`` windows
+    (``256 KiB`` total) cover the full header plus 3 interior/tail tensor
+    samples; when ``8 + header_len > 64 KiB`` (e.g. large MoE shards), hashes
+    the entire JSON header up to ``4 MiB`` followed by strided ``64 KiB``
+    samples across the tensor payload. Never hashes ``mtime``, and raises
     ``FileNotFoundError`` / ``OSError`` on missing or broken shard symlinks.
     """
     st = os.stat(path)  # Follows symlinks; raises FileNotFoundError on broken links.
@@ -775,27 +807,57 @@ def _update_weight_shard_digest(hasher: "hashlib._Hash", path: str) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
         if size <= 4 * sample:
-            offsets = ((0, size),)
-        else:
-            span = size - sample
-            offsets = (
-                (0, sample),
-                (span // 3, sample),
-                ((span * 2) // 3, sample),
-                (span, sample),
+            _pread_into_hasher(fd, path, hasher, 0, size)
+            return
+        if path.endswith(".safetensors"):
+            head8 = _pread_into_hasher(
+                fd, path, hasher, 0, sample, capture_prefix=8
             )
-        for offset, length in offsets:
-            remaining = length
-            cursor = offset
-            while remaining > 0:
-                chunk = os.pread(fd, remaining, cursor)
-                if not chunk:
-                    raise OSError(
-                        f"unexpected EOF reading weight shard {path} at offset {cursor}"
+            raw_header_len = int.from_bytes(head8, "little")
+            capped_header_end = min(
+                size, 8 + min(raw_header_len, _MAX_SAFETENSORS_HEADER_BYTES)
+            )
+            if capped_header_end <= sample:
+                span = size - sample
+                tail_offsets = (
+                    (span // 3, sample),
+                    ((span * 2) // 3, sample),
+                    (span, sample),
+                )
+            else:
+                _pread_into_hasher(
+                    fd, path, hasher, sample, capped_header_end - sample
+                )
+                body_start = (
+                    8 + raw_header_len
+                    if 8 + raw_header_len < size
+                    else capped_header_end
+                )
+                body_start = max(body_start, capped_header_end)
+                body_size = size - body_start
+                if body_size <= 0:
+                    tail_offsets = ()
+                elif body_size <= 4 * sample:
+                    tail_offsets = ((body_start, body_size),)
+                else:
+                    body_span = body_size - sample
+                    tail_offsets = (
+                        (body_start, sample),
+                        (body_start + body_span // 3, sample),
+                        (body_start + (body_span * 2) // 3, sample),
+                        (body_start + body_span, sample),
                     )
-                hasher.update(chunk)
-                cursor += len(chunk)
-                remaining -= len(chunk)
+            for offset, length in tail_offsets:
+                _pread_into_hasher(fd, path, hasher, offset, length)
+            return
+        span = size - sample
+        for offset, length in (
+            (0, sample),
+            (span // 3, sample),
+            ((span * 2) // 3, sample),
+            (span, sample),
+        ):
+            _pread_into_hasher(fd, path, hasher, offset, length)
     finally:
         os.close(fd)
 
@@ -869,6 +931,10 @@ def _local_checkpoint_fingerprint(
     _verify_index_weight_map_shards(
         model_dir, load_format=load_format, extra_weight_files=extra_weight_files
     )
+    if load_format != "dummy" and not selected_weights and not extra_weight_files:
+        raise FileNotFoundError(
+            f"no weight files matching load_format={load_format!r} found in {model_dir}"
+        )
     for rel, path in _local_checkpoint_code_files(model_dir):
         hasher.update(rel.encode())
         _update_file_digest(hasher, path)

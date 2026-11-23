@@ -112,6 +112,26 @@ impl PageWriter for EngineWriter {
     }
 }
 
+/// Reason a peer Disk push did not land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushFailure {
+    /// Holder rejected the push at queue admission (`MAX_QUEUED_PUSHES` full)
+    /// before touching Disk or RDMA; treated as a benign miss, not a fault.
+    Busy,
+    /// Transport error, timeout, or holder Disk/RDMA failure.
+    Failed(String),
+}
+
+impl PushFailure {
+    /// Human-readable description for logs/legacy callers.
+    pub fn into_message(self) -> String {
+        match self {
+            PushFailure::Busy => "the holder push queue is full".to_owned(),
+            PushFailure::Failed(message) => message,
+        }
+    }
+}
+
 /// What a reader's reads push through: its endpoint, in production.
 pub trait PagePusher: Send + Sync {
     /// Ask the holder rank at `endpoint` to push `items` into the memory
@@ -125,6 +145,19 @@ pub trait PagePusher: Send + Sync {
         budget: Duration,
         items: Vec<PushItem>,
     ) -> Result<(), String>;
+
+    /// Like [`PagePusher::push`], distinguishing benign queue-full backpressure
+    /// (`PushFailure::Busy`) from transport/data-plane faults.
+    fn push_checked(
+        &self,
+        endpoint: &str,
+        session: &str,
+        budget: Duration,
+        items: Vec<PushItem>,
+    ) -> Result<(), PushFailure> {
+        self.push(endpoint, session, budget, items)
+            .map_err(PushFailure::Failed)
+    }
 }
 
 /// A holder rank's Disk pages, as its pushes read them.
@@ -159,6 +192,7 @@ enum Message {
     Done {
         job: u64,
         ok: bool,
+        busy: bool,
     },
     Cancelled {
         job: u64,
@@ -198,9 +232,10 @@ impl Message {
                 out.bytes(reply_to.as_bytes());
                 CANCEL
             }
-            Message::Done { job, ok } => {
+            Message::Done { job, ok, busy } => {
                 out.u64(*job);
                 out.flag(*ok);
+                out.flag(*busy);
                 DONE
             }
             Message::Cancelled { job } => {
@@ -255,10 +290,16 @@ impl Message {
                 job: reader.u64()?,
                 reply_to: text(&mut reader)?,
             },
-            DONE => Message::Done {
-                job: reader.u64()?,
-                ok: reader.flag()?,
-            },
+            DONE => {
+                let job = reader.u64()?;
+                let ok = reader.flag()?;
+                let busy = if reader.is_empty() {
+                    false
+                } else {
+                    reader.flag()?
+                };
+                Message::Done { job, ok, busy }
+            }
             CANCELLED => Message::Cancelled { job: reader.u64()? },
             _ => return None,
         };
@@ -441,6 +482,7 @@ struct JobGuard {
     key: JobKey,
     running: Arc<Running>,
     ok: bool,
+    busy: bool,
 }
 
 impl Drop for JobGuard {
@@ -458,6 +500,7 @@ impl Drop for JobGuard {
                 &Message::Done {
                     job: self.key.job,
                     ok: self.ok,
+                    busy: self.busy,
                 },
             );
             if let Some(acknowledge) = ack {
@@ -569,6 +612,7 @@ impl Holder {
                     &Message::Done {
                         job: key.job,
                         ok: false,
+                        busy: false,
                     },
                 );
             }
@@ -590,6 +634,7 @@ impl Holder {
                         &Message::Done {
                             job: key.job,
                             ok: false,
+                            busy: false,
                         },
                     );
                 }
@@ -603,6 +648,7 @@ impl Holder {
             key,
             running,
             ok: false,
+            busy: false,
         };
         let queued = QueuedPush {
             guard,
@@ -612,8 +658,16 @@ impl Holder {
         };
         let queue = self.queue.lock();
         if let Some(tx) = queue.as_ref() {
-            if let Err(error) = tx.try_send(queued) {
-                tracing::warn!(%error, "peer push queue full or closed; rejecting");
+            if let Err(mut rejected) = tx.try_send(queued) {
+                match &mut rejected {
+                    mpsc::TrySendError::Full(queued) => {
+                        queued.guard.busy = true;
+                        tracing::warn!("peer push queue full; rejecting with busy backpressure");
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        tracing::warn!("peer push queue closed; rejecting");
+                    }
+                }
             }
         }
     }
@@ -670,12 +724,32 @@ impl HolderState {
             return false;
         }
 
-        // Pre-validate every item before issuing any disk read or RDMA write.
-        let mut ranges = Vec::with_capacity(items.len());
+        // Pre-validate every item before issuing any disk read or RDMA write,
+        // and group MR-split PushItems by unique `(group, block)` so each Disk
+        // block is read from NVMe once regardless of how many destination MRs
+        // its fields span on the reader.
+        struct UniqueBlock<'a> {
+            range: ts_l3::Range,
+            batches: Vec<&'a [PushSpan]>,
+        }
+        let mut blocks: Vec<UniqueBlock<'_>> = Vec::with_capacity(items.len());
+        let mut block_index: HashMap<(u32, i32), usize> = HashMap::with_capacity(items.len());
         for item in items {
             match self.source.disk_layout.owned_range(item.group, item.block) {
                 Ok(Some(range)) if validate_spans(&item.spans, range.size as u64) => {
-                    ranges.push(range);
+                    if item.spans.is_empty() {
+                        continue;
+                    }
+                    if let Some(&idx) = block_index.get(&(item.group, item.block)) {
+                        blocks[idx].batches.push(&item.spans);
+                    } else {
+                        let idx = blocks.len();
+                        block_index.insert((item.group, item.block), idx);
+                        blocks.push(UniqueBlock {
+                            range,
+                            batches: vec![&item.spans],
+                        });
+                    }
                 }
                 _ => {
                     tracing::warn!(
@@ -700,12 +774,7 @@ impl HolderState {
         };
         loop {
             // Reads go ahead of the writes, as many as the ring has slots for.
-            while next < items.len() && !stopped(ok) {
-                if items[next].spans.is_empty() {
-                    next += 1;
-                    written += 1;
-                    continue;
-                }
+            while next < blocks.len() && !stopped(ok) {
                 let slot = if inflight.is_empty() {
                     self.slots.take(deadline, &job.cancelled)
                 } else {
@@ -713,7 +782,7 @@ impl HolderState {
                 };
                 let Some(slot_guard) = slot else { break };
                 let slot_idx = slot_guard.index();
-                let range = ranges[next];
+                let range = blocks[next].range;
                 let done = done.clone();
                 let index = next;
                 let submitted = self.source.executor.submit(
@@ -776,32 +845,43 @@ impl HolderState {
             ok &= read;
             if !stopped(ok) {
                 let base = (ring + slot_idx * self.source.slot_bytes) as u64;
-                let spans = Spans {
-                    sources: items[index]
-                        .spans
-                        .iter()
-                        .map(|span| base + span.offset)
-                        .collect(),
-                    destinations: items[index].spans.iter().map(|span| span.address).collect(),
-                    lengths: items[index].spans.iter().map(|span| span.length).collect(),
-                    host_bytes: 0,
-                };
-                let write_ns = profile::now_ns();
-                match self.source.writer.write(session, &spans) {
-                    Ok(()) => written += 1,
-                    Err(error) => {
-                        tracing::warn!(%error, "peer push write failed");
+                let mut block_ok = true;
+                for batch_spans in &blocks[index].batches {
+                    if stopped(ok) {
+                        block_ok = false;
                         ok = false;
+                        break;
+                    }
+                    let spans = Spans {
+                        sources: batch_spans.iter().map(|span| base + span.offset).collect(),
+                        destinations: batch_spans.iter().map(|span| span.address).collect(),
+                        lengths: batch_spans.iter().map(|span| span.length).collect(),
+                        host_bytes: 0,
+                    };
+                    let write_ns = profile::now_ns();
+                    match self.source.writer.write(session, &spans) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "peer push write failed");
+                            block_ok = false;
+                            ok = false;
+                        }
+                    }
+                    if let Some(lane) = &lane {
+                        lane.record(profile::HOST, "write".into(), write_ns, profile::now_ns());
+                    }
+                    if !block_ok {
+                        break;
                     }
                 }
-                if let Some(lane) = &lane {
-                    lane.record(profile::HOST, "write".into(), write_ns, profile::now_ns());
+                if block_ok {
+                    written += 1;
                 }
             } else {
                 ok = false;
             }
         }
-        let landed = ok && written == items.len() && !job.cancelled.load(Ordering::Acquire);
+        let landed = ok && written == blocks.len() && !job.cancelled.load(Ordering::Acquire);
         if let Some(lane) = &lane {
             let bytes: u64 = items
                 .iter()
@@ -813,7 +893,7 @@ impl HolderState {
                 profile::HOST,
                 format!(
                     "Peer push to {session}: {} blocks, {:.1} MiB, {outcome}",
-                    items.len(),
+                    blocks.len(),
                     bytes as f64 / (1 << 20) as f64
                 )
                 .into(),
@@ -896,7 +976,11 @@ impl PushEndpoint {
                                     None => send(
                                         &sockets,
                                         &reply_to,
-                                        &Message::Done { job, ok: false },
+                                        &Message::Done {
+                                            job,
+                                            ok: false,
+                                            busy: false,
+                                        },
                                     ),
                                 }
                             }
@@ -982,10 +1066,21 @@ impl PagePusher for PushEndpoint {
         budget: Duration,
         items: Vec<PushItem>,
     ) -> Result<(), String> {
+        self.push_checked(endpoint, session, budget, items)
+            .map_err(PushFailure::into_message)
+    }
+
+    fn push_checked(
+        &self,
+        endpoint: &str,
+        session: &str,
+        budget: Duration,
+        items: Vec<PushItem>,
+    ) -> Result<(), PushFailure> {
         let sockets = self
             .sockets
             .as_ref()
-            .ok_or_else(|| "push endpoint is closed".to_owned())?;
+            .ok_or_else(|| PushFailure::Failed("push endpoint is closed".to_owned()))?;
         let budget = budget.min(MAX_PUSH_BUDGET);
         let job = self.next_job.fetch_add(1, Ordering::Relaxed);
         let (answered, answers) = mpsc::channel();
@@ -1001,16 +1096,24 @@ impl PagePusher for PushEndpoint {
             budget_us: u64::try_from(budget.as_micros()).unwrap_or(u64::MAX),
             items,
         };
-        let (host, port) = split_endpoint(endpoint).map_err(|error| error.to_string())?;
+        let (host, port) =
+            split_endpoint(endpoint).map_err(|error| PushFailure::Failed(error.to_string()))?;
         sockets
             .send(host, port, request.frames())
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| PushFailure::Failed(error.to_string()))?;
         // The holder's answer may trail its budget by a network round trip.
         match answers.recv_timeout(budget.saturating_add(Duration::from_secs(1))) {
             Ok(Message::Done { ok: true, .. }) => return Ok(()),
-            Ok(Message::Done { ok: false, .. }) => {
-                return Err("the holder could not push".to_owned())
-            }
+            Ok(Message::Done {
+                ok: false,
+                busy: true,
+                ..
+            }) => return Err(PushFailure::Busy),
+            Ok(Message::Done {
+                ok: false,
+                busy: false,
+                ..
+            }) => return Err(PushFailure::Failed("the holder could not push".to_owned())),
             _ => {}
         }
         let cancel = Message::Cancel {
@@ -1022,7 +1125,9 @@ impl PagePusher for PushEndpoint {
         while let Some(remaining) = wait_end.checked_duration_since(Instant::now()) {
             match answers.recv_timeout(remaining) {
                 Ok(Message::Cancelled { .. } | Message::Done { .. }) => {
-                    return Err("the push did not finish in its budget".to_owned())
+                    return Err(PushFailure::Failed(
+                        "the push did not finish in its budget".to_owned(),
+                    ))
                 }
                 Ok(_) => continue,
                 Err(_) => break,
@@ -1035,10 +1140,10 @@ impl PagePusher for PushEndpoint {
             cancel_wait_s = CANCEL_WAIT.as_secs(),
             "peer push timed out and cancellation went unacknowledged; reader quarantine must outlive in-flight writes"
         );
-        Err(
+        Err(PushFailure::Failed(
             "the push did not finish in its budget, and its cancellation went unacknowledged"
                 .to_owned(),
-        )
+        ))
     }
 }
 
@@ -1100,11 +1205,32 @@ mod tests {
                 job: 3,
                 reply_to: "[::1]:7200".into(),
             },
-            Message::Done { job: 3, ok: true },
+            Message::Done {
+                job: 3,
+                ok: true,
+                busy: false,
+            },
+            Message::Done {
+                job: 4,
+                ok: false,
+                busy: true,
+            },
             Message::Cancelled { job: 3 },
         ] {
             assert_eq!(Message::decode(&message.frames()), Some(message));
         }
+        // Legacy 2-field `Done { job, ok }` frame without `busy` defaults `busy` to `false`.
+        let mut legacy = Writer::new();
+        legacy.u64(99);
+        legacy.flag(false);
+        assert_eq!(
+            Message::decode(&[Bytes::from_static(DONE), Bytes::from(legacy.finish())]),
+            Some(Message::Done {
+                job: 99,
+                ok: false,
+                busy: false,
+            })
+        );
         assert_eq!(
             Message::decode(&[Bytes::from_static(b"?"), Bytes::new()]),
             None
@@ -1198,5 +1324,233 @@ mod tests {
         let r2 = Running::new();
         assert_eq!(r2.finish(), None);
         assert_eq!(r2.cancel("reader-2".into()), Some("reader-2".into()));
+    }
+
+    #[test]
+    fn split_mr_push_items_deduplicate_nvme_reads_and_queue_full_sets_busy() {
+        use std::{path::PathBuf, sync::atomic::AtomicUsize};
+        use ts_disk::{Backend, DiskFile, ExecutorConfig, Memory};
+        use ts_l3::{GroupLayout, HostLayout};
+
+        const BLOCK: usize = 4096;
+        struct TempDisk(PathBuf);
+        impl Drop for TempDisk {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let dir = std::env::var_os("TS_DISK_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let temp = TempDisk(dir.join(format!(
+            "ts-push-dedup-{}-{}.bin",
+            std::process::id(),
+            profile::now_ns()
+        )));
+        let disk_file = DiskFile::create(&temp.0, (4 * BLOCK) as u64).unwrap();
+        let ring = Arc::new(Memory::map(2 * BLOCK).unwrap());
+        let mut seed_mem = Memory::map(BLOCK).unwrap();
+        let pattern: Vec<u8> = (0..BLOCK).map(|i| ((i * 7 + 3) & 0xff) as u8).collect();
+        seed_mem.write_at(0, &pattern);
+
+        let executor = Arc::new(
+            ts_disk::Executor::start(
+                disk_file,
+                &[
+                    (ring.address(), ring.size()),
+                    (seed_mem.address(), seed_mem.size()),
+                ],
+                ExecutorConfig {
+                    backend: Backend::Psync,
+                    queue_depth: 2,
+                    write_queue_depth: 1,
+                    max_io_bytes: 1 << 20,
+                    write_bytes_per_second: 1 << 30,
+                },
+            )
+            .unwrap(),
+        );
+
+        // Seed Disk block 1 (`file_offset = 0`, 1-based block id 1 in `HostLayout`).
+        let (seeded_tx, seeded_rx) = mpsc::channel();
+        executor
+            .submit(
+                Job {
+                    direction: Direction::Write,
+                    ios: vec![Io {
+                        file_offset: 0,
+                        address: seed_mem.address(),
+                        len: BLOCK,
+                    }],
+                },
+                move |report| {
+                    let _ = seeded_tx.send(report.outcome);
+                },
+            )
+            .unwrap();
+        assert_eq!(seeded_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+        assert_eq!(executor.stats().read_jobs, 0);
+
+        struct RecordingWriter {
+            ring: Arc<Memory>,
+            calls: Mutex<Vec<Vec<(u64, Vec<u8>)>>>,
+            hold: (std::sync::Mutex<bool>, std::sync::Condvar),
+            entered: AtomicUsize,
+        }
+
+        impl PageWriter for RecordingWriter {
+            fn write(&self, _session: &str, spans: &Spans) -> Result<(), String> {
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                let held = self.hold.0.lock().unwrap();
+                let _held = self.hold.1.wait_while(held, |blocked| *blocked).unwrap();
+                let mut batch = Vec::new();
+                for ((&src, &dst), &len) in spans
+                    .sources
+                    .iter()
+                    .zip(&spans.destinations)
+                    .zip(&spans.lengths)
+                {
+                    let mut bytes = vec![0u8; len as usize];
+                    self.ring.read_at(src as usize - self.ring.address(), &mut bytes);
+                    batch.push((dst, bytes));
+                }
+                self.calls.lock().push(batch);
+                Ok(())
+            }
+        }
+
+        let writer = Arc::new(RecordingWriter {
+            ring: ring.clone(),
+            calls: Mutex::new(Vec::new()),
+            hold: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+            entered: AtomicUsize::new(0),
+        });
+
+        let holder_ep = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 1).unwrap();
+        holder_ep
+            .serve(PushSource {
+                executor: executor.clone(),
+                disk_layout: HostLayout {
+                    groups: vec![GroupLayout {
+                        packing: 1,
+                        block_bytes: BLOCK,
+                        shard_count: 1,
+                    }],
+                    lcm_block_bytes: BLOCK,
+                    num_lcm_blocks: 4,
+                    owner_rank: 0,
+                    tp_rank: 0,
+                },
+                writer: writer.clone(),
+                ring: ring.clone(),
+                slot_bytes: BLOCK,
+            })
+            .unwrap();
+        let reader_ep = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 2).unwrap();
+
+        // 1. Submit 3 MR-split PushItems referencing the SAME `(group: 0, block: 1)`.
+        //    Holder MUST issue exactly ONE NVMe read (4096 bytes) and 3 MR-homogeneous writes!
+        let split_items = vec![
+            PushItem {
+                group: 0,
+                block: 1,
+                spans: vec![PushSpan {
+                    offset: 0,
+                    address: 100_000,
+                    length: 1024,
+                }],
+            },
+            PushItem {
+                group: 0,
+                block: 1,
+                spans: vec![PushSpan {
+                    offset: 1024,
+                    address: 200_000,
+                    length: 1024,
+                }],
+            },
+            PushItem {
+                group: 0,
+                block: 1,
+                spans: vec![PushSpan {
+                    offset: 2048,
+                    address: 300_000,
+                    length: 2048,
+                }],
+            },
+        ];
+        assert_eq!(
+            reader_ep.push_checked(
+                holder_ep.name(),
+                "reader-sess",
+                Duration::from_secs(5),
+                split_items,
+            ),
+            Ok(())
+        );
+        let stats = executor.stats();
+        assert_eq!(stats.read_jobs, 1, "expected 1 deduplicated NVMe read job, got {stats:?}");
+        assert_eq!(stats.read_bytes, BLOCK as u64);
+        let calls = writer.calls.lock().clone();
+        assert_eq!(calls.len(), 3, "expected 3 MR-homogeneous write batches");
+        assert_eq!(calls[0], vec![(100_000, pattern[0..1024].to_vec())]);
+        assert_eq!(calls[1], vec![(200_000, pattern[1024..2048].to_vec())]);
+        assert_eq!(calls[2], vec![(300_000, pattern[2048..4096].to_vec())]);
+
+        // 2. Saturate workers (2 slots => 2 workers) + MAX_QUEUED_PUSHES (8) so the
+        //    11th concurrent push receives `Err(PushFailure::Busy)` immediately!
+        *writer.hold.0.lock().unwrap() = true;
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for i in 0..(2 + MAX_QUEUED_PUSHES) {
+                let reader_ref = &reader_ep;
+                let target = holder_ep.name().to_owned();
+                handles.push(scope.spawn(move || {
+                    reader_ref.push_checked(
+                        &target,
+                        &format!("s-{i}"),
+                        Duration::from_secs(5),
+                        vec![PushItem {
+                            group: 0,
+                            block: 1,
+                            spans: vec![PushSpan {
+                                offset: 0,
+                                address: 500_000,
+                                length: 512,
+                            }],
+                        }],
+                    )
+                }));
+            }
+            let wait_start = Instant::now();
+            while writer.entered.load(Ordering::Acquire) < 2
+                || holder_ep.active_push_jobs() < 2 + MAX_QUEUED_PUSHES
+            {
+                assert!(wait_start.elapsed() < Duration::from_secs(5));
+                thread::sleep(Duration::from_millis(2));
+            }
+            let overflow = reader_ep.push_checked(
+                holder_ep.name(),
+                "s-overflow",
+                Duration::from_secs(5),
+                vec![PushItem {
+                    group: 0,
+                    block: 1,
+                    spans: vec![PushSpan {
+                        offset: 0,
+                        address: 500_000,
+                        length: 512,
+                    }],
+                }],
+            );
+            assert_eq!(overflow, Err(PushFailure::Busy));
+
+            *writer.hold.0.lock().unwrap() = false;
+            writer.hold.1.notify_all();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), Ok(()));
+            }
+        });
     }
 }

@@ -59,8 +59,8 @@ use ts_scheduler::{
 use crate::{
     codec::{Reader, Writer},
     peer::{
-        geometry::{push_items, read_spans, split_spans_by_mr, RankGeometry},
-        landing::{Action, Landing, Timeouts},
+        geometry::{push_items, read_batches, RankGeometry},
+        landing::{Action, HealthOutcome, Landing, ReadOutcome, Timeouts},
         net::{split_endpoint, Inbound, PeerNet},
         push::PagePusher,
         read::{PageReader, PushJob, ReadJob, Reads},
@@ -70,22 +70,37 @@ use crate::{
 };
 
 const READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
-const DEFAULT_HOLDER_FAIL_THRESHOLD: u32 = 3;
+/// Default consecutive holder faults before tripping lookup cooldown.
+pub const DEFAULT_HOLDER_FAIL_THRESHOLD: u32 = 3;
+/// Default holder lookup cooldown window in microseconds (`30.0s`).
+pub const DEFAULT_HOLDER_COOLDOWN_US: i64 = 30_000_000;
 const DEFAULT_HOLDER_COOLDOWN_S: f64 = 30.0;
 const COOLDOWN_WARN_INTERVAL_US: i64 = 5_000_000;
+/// Additional margin beyond `push_us` (`1s` RTT + `5s` `CANCEL_WAIT`) for half-open Disk probes.
+const PROBE_PUSH_MARGIN_US: i64 = 6_000_000;
 
-fn parse_disable_same_node_value(value: Option<&str>) -> bool {
-    value.is_some_and(|raw| {
-        matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+/// Resolve whether same-node peer lookups are disabled for `protocol` and
+/// optional `TOKENSPEED_PEER_DISABLE_SAME_NODE` value:
+/// - Defaults to `true` when `protocol == "ascend_direct"` (CANN 9.2 HIXL
+///   same-node pinned-Host `207000` defense-in-depth), else `false`.
+/// - Explicit `"0" | "false" | "no" | "off"` overrides to `false`.
+/// - Explicit `"1" | "true" | "yes" | "on"` overrides to `true`.
+pub fn resolve_disable_same_node(protocol: &str, value: Option<&str>) -> bool {
+    let default_on = protocol.trim().eq_ignore_ascii_case("ascend_direct");
+    let Some(raw) = value else {
+        return default_on;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default_on,
+    }
 }
 
-fn parse_disable_same_node_env() -> bool {
+/// Read `TOKENSPEED_PEER_DISABLE_SAME_NODE` with protocol-aware default.
+pub fn resolve_disable_same_node_env(protocol: &str) -> bool {
     let raw = std::env::var("TOKENSPEED_PEER_DISABLE_SAME_NODE").ok();
-    parse_disable_same_node_value(raw.as_deref())
+    resolve_disable_same_node(protocol, raw.as_deref())
 }
 
 fn endpoint_host(endpoint: &str) -> Option<&str> {
@@ -115,7 +130,8 @@ fn same_peer_host(a: &str, b: &str) -> bool {
     }
 }
 
-fn parse_holder_circuit_breaker_values(
+/// Parse `(holder_fail_threshold, holder_cooldown_us)` from environment strings.
+pub fn parse_holder_circuit_breaker_values(
     threshold: Option<&str>,
     cooldown_s: Option<&str>,
 ) -> (u32, i64) {
@@ -129,7 +145,8 @@ fn parse_holder_circuit_breaker_values(
     (threshold, (cooldown_s * 1e6) as i64)
 }
 
-fn parse_holder_circuit_breaker_env() -> (u32, i64) {
+/// Parse `(holder_fail_threshold, holder_cooldown_us)` from process env.
+pub fn parse_holder_circuit_breaker_env() -> (u32, i64) {
     let threshold = std::env::var("TOKENSPEED_PEER_HOLDER_FAIL_THRESHOLD").ok();
     let cooldown_s = std::env::var("TOKENSPEED_PEER_HOLDER_COOLDOWN_S").ok();
     parse_holder_circuit_breaker_values(threshold.as_deref(), cooldown_s.as_deref())
@@ -139,8 +156,49 @@ fn parse_holder_circuit_breaker_env() -> (u32, i64) {
 struct HolderHealth {
     consecutive_failures: u32,
     cooldown_until_us: Option<i64>,
+    cooldown_started_us: Option<i64>,
+    last_recovered_us: Option<i64>,
     last_warn_us: Option<i64>,
     suppressed_since_warn: u64,
+}
+
+/// Replica-agreed policy parameters exchanged at startup (`ReplicaSettings`)
+/// so every TP/PP member enforces identical quarantine, circuit-breaker, and
+/// same-node rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaSettings {
+    /// Failed-read destination block quarantine window in microseconds.
+    pub quarantine_us: i64,
+    /// Consecutive holder faults before entering lookup cooldown (`0` disables).
+    pub holder_fail_threshold: u32,
+    /// Holder lookup cooldown duration in microseconds.
+    pub holder_cooldown_us: i64,
+    /// Whether same-host peer lookups are short-circuited on the reader.
+    pub disable_same_node: bool,
+}
+
+impl ReplicaSettings {
+    /// Encode for intra-replica `all_gather` / `broadcast`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Writer::new();
+        out.i64(self.quarantine_us);
+        out.u32(self.holder_fail_threshold);
+        out.i64(self.holder_cooldown_us);
+        out.flag(self.disable_same_node);
+        out.finish()
+    }
+
+    /// Decode from intra-replica `all_gather` / `broadcast`.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut reader = Reader::new(bytes);
+        let settings = Self {
+            quarantine_us: reader.i64()?,
+            holder_fail_threshold: reader.u32()?,
+            holder_cooldown_us: reader.i64()?,
+            disable_same_node: reader.flag()?,
+        };
+        reader.finish(settings)
+    }
 }
 
 /// What a replica's peer sharing runs with.
@@ -159,6 +217,12 @@ pub struct PeerSettings {
     pub timeouts: Timeouts,
     /// How long a holder keeps a lease's record past its last request.
     pub record_lifetime: Duration,
+    /// Consecutive holder faults before entering cooldown (`0` disables).
+    pub holder_fail_threshold: u32,
+    /// Holder cooldown window in microseconds.
+    pub holder_cooldown_us: i64,
+    /// Worker-side guard short-circuiting same-host peer lookups.
+    pub disable_same_node: bool,
 }
 
 impl PeerSettings {
@@ -201,7 +265,7 @@ struct Report {
     /// The first member's: the replies it received.
     replies: Vec<Reply>,
     /// This member's reads that ended, by landing request.
-    outcomes: Vec<(String, bool)>,
+    outcomes: Vec<(String, ReadOutcome)>,
 }
 
 impl Report {
@@ -217,9 +281,13 @@ impl Report {
             out.bytes(&reply.encode());
         }
         out.count(self.outcomes.len());
-        for (request, ok) in &self.outcomes {
+        for (request, outcome) in &self.outcomes {
             out.bytes(request.as_bytes());
-            out.flag(*ok);
+            out.u8(match outcome {
+                ReadOutcome::Failed => 0,
+                ReadOutcome::Ok => 1,
+                ReadOutcome::Busy => 2,
+            });
         }
         out.finish()
     }
@@ -241,7 +309,13 @@ impl Report {
         let mut outcomes = Vec::with_capacity(count.min(1 << 16));
         for _ in 0..count {
             let request = String::from_utf8(reader.bytes()?.to_vec()).ok()?;
-            outcomes.push((request, reader.flag()?));
+            let outcome = match reader.u8()? {
+                0 => ReadOutcome::Failed,
+                1 => ReadOutcome::Ok,
+                2 => ReadOutcome::Busy,
+                _ => return None,
+            };
+            outcomes.push((request, outcome));
         }
         reader.finish(Self {
             now_us,
@@ -454,14 +528,14 @@ pub struct Peer {
     read_metrics: Option<Arc<ts_metrics::PeerMetrics>>,
     // Only the endpoint owner measures logical attempts.
     lookup_times: HashMap<u64, (String, Instant, i64)>,
-    /// Unconditional lookup deadline tracker (`lease_id -> (holder, deadline_us)`),
+    /// Unconditional lookup deadline tracker (`lease_id -> (holder, started_us, deadline_us)`),
     /// kept identical across all replica members so lookup timeouts trip `holder_health`.
-    pending_lookups: BTreeMap<u64, (String, i64)>,
+    pending_lookups: BTreeMap<u64, (String, i64, i64)>,
     decisions: Vec<(String, &'static str)>,
     next_sample_us: i64,
     previous_totals: [u64; 2],
     /// Reads that could not be placed, to report as failed.
-    unplaced: Vec<(String, bool)>,
+    unplaced: Vec<(String, ReadOutcome)>,
     /// Per-holder physical read failure circuit-breaker state (mirrored across members).
     holder_health: HashMap<String, HolderHealth>,
     /// Consecutive physical read failures before entering cooldown (`0` disables).
@@ -498,8 +572,9 @@ impl Peer {
         let endpoint = listener
             .map(|listener| start_endpoint(&settings, replica, listener, scheduler))
             .transpose()?;
-        let (holder_fail_threshold, holder_cooldown_us) = parse_holder_circuit_breaker_env();
-        let disable_same_node = parse_disable_same_node_env();
+        let holder_fail_threshold = settings.holder_fail_threshold;
+        let holder_cooldown_us = settings.holder_cooldown_us;
+        let disable_same_node = settings.disable_same_node;
         Ok(Self {
             identity: settings.identity(),
             settings,
@@ -543,6 +618,20 @@ impl Peer {
     /// Override the worker-side same-node peer lookup guard.
     pub fn set_disable_same_node(&mut self, disable: bool) {
         self.disable_same_node = disable;
+    }
+
+    /// Whether the worker-side same-node lookup guard is active.
+    pub fn disable_same_node(&self) -> bool {
+        self.disable_same_node
+    }
+
+    /// Half-open probe guard duration in microseconds (`max(3 * answer_us, push_us + 6s)`).
+    pub fn probe_guard_us(&self) -> i64 {
+        self.settings
+            .timeouts
+            .answer_us
+            .saturating_mul(3)
+            .max(self.settings.timeouts.push_us.saturating_add(PROBE_PUSH_MARGIN_US))
     }
 
     /// Drain queued holder changes on the endpoint owner (empty on other members).
@@ -676,16 +765,17 @@ impl Peer {
             self.take_reply(reply, now_us, &mut events, &mut actions);
         }
         let mut timed_out_holders = Vec::new();
-        self.pending_lookups.retain(|_, (holder, deadline_us)| {
-            if now_us < *deadline_us {
-                true
-            } else {
-                timed_out_holders.push(holder.clone());
-                false
-            }
-        });
-        for holder in timed_out_holders {
-            self.record_holder_read_failure(&holder, now_us);
+        self.pending_lookups
+            .retain(|_, (holder, started_us, deadline_us)| {
+                if now_us < *deadline_us {
+                    true
+                } else {
+                    timed_out_holders.push((holder.clone(), *started_us));
+                    false
+                }
+            });
+        for (holder, started_us) in timed_out_holders {
+            self.record_holder_read_failure(&holder, started_us, now_us);
         }
         if let Some(metrics) = &self.metrics {
             self.lookup_times.retain(|_, (rid, start, deadline)| {
@@ -698,9 +788,9 @@ impl Peer {
             });
         }
         for (member, report) in reports.iter().enumerate() {
-            for (request, ok) in &report.outcomes {
+            for (request, outcome) in &report.outcomes {
                 if let Some(landing) = self.landings.get_mut(request) {
-                    if let Some(action) = landing.read(member, *ok, now_us) {
+                    if let Some(action) = landing.read(member, *outcome, now_us) {
                         actions.push((request.clone(), action));
                     }
                 }
@@ -714,6 +804,26 @@ impl Peer {
                 }
             }
         }
+        // Drain one-shot `HealthOutcome`s at the exact transition into
+        // `Phase::Quarantine` or `Phase::Done` (identically on every replica
+        // member) rather than waiting 30s+ for `Quarantine` expiry!
+        let mut health_updates = Vec::new();
+        for landing in self.landings.values_mut() {
+            if let Some(outcome) = landing.take_health_outcome() {
+                health_updates.push((landing.fetch().holder.clone(), outcome));
+            }
+        }
+        for (holder_name, outcome) in health_updates {
+            match outcome {
+                HealthOutcome::BenignMiss => {}
+                HealthOutcome::Success { .. } => {
+                    self.record_holder_read_success(&holder_name, now_us);
+                }
+                HealthOutcome::Fault { started_us } => {
+                    self.record_holder_read_failure(&holder_name, started_us, now_us);
+                }
+            }
+        }
         self.send(actions, now_us);
         let done: Vec<(String, i32)> = self
             .landings
@@ -724,12 +834,6 @@ impl Peer {
         for (request, num_tokens) in done {
             tracing::debug!(request, num_tokens, "peer landing done");
             let landing = self.landings.remove(&request).expect("finished landing");
-            let holder_name = landing.fetch().holder.clone();
-            if num_tokens == landing.fetch().end_tokens {
-                self.record_holder_read_success(&holder_name);
-            } else {
-                self.record_holder_read_failure(&holder_name, now_us);
-            }
             if self.metrics.is_some()
                 && self.member == 0
                 && num_tokens == landing.fetch().end_tokens
@@ -829,8 +933,10 @@ impl Peer {
                 }
                 continue;
             }
-            self.pending_lookups
-                .insert(lookup.lease.id, (lookup.holder.clone(), lookup.deadline_us));
+            self.pending_lookups.insert(
+                lookup.lease.id,
+                (lookup.holder.clone(), now_us, lookup.deadline_us),
+            );
             if let Some(endpoint) = &self.endpoint {
                 if self.metrics.is_some() {
                     self.lookup_times.insert(
@@ -1071,11 +1177,9 @@ impl Peer {
             let job = holder
                 .ok_or_else(|| "no layout of the holder".to_owned())
                 .and_then(|holder| {
-                    let spans = read_spans(holder, &self.geometry, &read_pages)
-                        .map_err(|error| error.to_string())?;
-                    let total_read_bytes = spans.total_bytes();
-                    let batches =
-                        split_spans_by_mr(&spans, holder.host.as_ref(), self.geometry.host.as_ref());
+                    let (total_read_bytes, batches) =
+                        read_batches(holder, &self.geometry, &read_pages)
+                            .map_err(|error| error.to_string())?;
                     let push = if disk_pages.is_empty() {
                         None
                     } else {
@@ -1115,13 +1219,13 @@ impl Peer {
                     // Nothing was posted: a failed read with no late writes,
                     // reported with the next round.
                     tracing::warn!(request, %error, "peer read not placed");
-                    self.unplaced.push((request.clone(), false));
+                    self.unplaced.push((request.clone(), ReadOutcome::Failed));
                 }
             }
         }
     }
 
-    fn record_holder_read_success(&mut self, holder: &str) {
+    fn record_holder_read_success(&mut self, holder: &str, now_us: i64) {
         if let Some(health) = self.holder_health.get_mut(holder) {
             if health.consecutive_failures > 0 || health.cooldown_until_us.is_some() {
                 if self.member == 0 {
@@ -1131,22 +1235,38 @@ impl Peer {
                         "peer holder read succeeded; resetting failure circuit breaker"
                     );
                 }
+                if health.cooldown_until_us.is_some() {
+                    health.last_recovered_us = Some(now_us);
+                }
                 health.consecutive_failures = 0;
                 health.cooldown_until_us = None;
+                health.cooldown_started_us = None;
                 health.suppressed_since_warn = 0;
             }
         }
     }
 
-    fn record_holder_read_failure(&mut self, holder: &str, now_us: i64) {
+    fn record_holder_read_failure(&mut self, holder: &str, started_us: i64, now_us: i64) {
         if self.holder_fail_threshold == 0 {
             return;
         }
         let health = self.holder_health.entry(holder.to_owned()).or_default();
+        // Ignore stale in-flight faults initiated before the holder recovered
+        // or before the active cooldown epoch began.
+        if health
+            .last_recovered_us
+            .is_some_and(|recovered_us| started_us < recovered_us)
+            || health
+                .cooldown_started_us
+                .is_some_and(|cd_started_us| started_us < cd_started_us)
+        {
+            return;
+        }
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         if health.consecutive_failures >= self.holder_fail_threshold {
             let until = now_us.saturating_add(self.holder_cooldown_us);
             health.cooldown_until_us = Some(until);
+            health.cooldown_started_us = Some(now_us);
             health.last_warn_us = Some(now_us);
             health.suppressed_since_warn = 0;
             if self.member == 0 {
@@ -1165,6 +1285,7 @@ impl Peer {
         if self.holder_fail_threshold == 0 {
             return false;
         }
+        let probe_guard_us = self.probe_guard_us();
         let Some(health) = self.holder_health.get_mut(holder) else {
             return false;
         };
@@ -1191,9 +1312,8 @@ impl Peer {
             true
         } else {
             // Cooldown expired: allow a single half-open probe and re-arm a
-            // probe guard window (`3 * answer_us`) so concurrent lookups do not
-            // stampede before the probe completes and clears `holder_health`.
-            let probe_guard_us = self.settings.timeouts.answer_us.saturating_mul(3);
+            // probe guard window (`max(3 * answer_us, push_us + 6s)`) so
+            // concurrent lookups do not flood the holder during a 16s Disk push.
             health.cooldown_until_us = Some(now_us.saturating_add(probe_guard_us));
             false
         }
@@ -1291,13 +1411,28 @@ mod tests {
 
     #[test]
     fn disable_same_node_env_parser_and_host_comparison() {
-        assert!(!parse_disable_same_node_value(None));
-        assert!(!parse_disable_same_node_value(Some("0")));
-        assert!(!parse_disable_same_node_value(Some("false")));
-        assert!(parse_disable_same_node_value(Some("1")));
-        assert!(parse_disable_same_node_value(Some(" true ")));
-        assert!(parse_disable_same_node_value(Some("YES")));
-        assert!(parse_disable_same_node_value(Some("On")));
+        // Default ON for `ascend_direct`, default OFF for `rdma`, and explicit `=0` / `=1` overrides!
+        assert!(resolve_disable_same_node("ascend_direct", None));
+        assert!(resolve_disable_same_node("ASCEND_DIRECT", Some("")));
+        assert!(!resolve_disable_same_node("ascend_direct", Some("0")));
+        assert!(!resolve_disable_same_node("ascend_direct", Some("false")));
+        assert!(!resolve_disable_same_node("ascend_direct", Some("off")));
+        assert!(!resolve_disable_same_node("ascend_direct", Some("no")));
+
+        assert!(!resolve_disable_same_node("rdma", None));
+        assert!(!resolve_disable_same_node("rdma", Some("0")));
+        assert!(resolve_disable_same_node("rdma", Some("1")));
+        assert!(resolve_disable_same_node("rdma", Some(" true ")));
+        assert!(resolve_disable_same_node("rdma", Some("YES")));
+        assert!(resolve_disable_same_node("rdma", Some("On")));
+
+        let rep = ReplicaSettings {
+            quarantine_us: 66_000_000,
+            holder_fail_threshold: 4,
+            holder_cooldown_us: 15_000_000,
+            disable_same_node: true,
+        };
+        assert_eq!(ReplicaSettings::decode(&rep.encode()), Some(rep));
 
         assert!(same_peer_host("10.255.6.58:7100", "10.255.6.58:7100/15"));
         assert!(same_peer_host("10.255.6.58:7100/3", "10.255.6.58:7200/0"));

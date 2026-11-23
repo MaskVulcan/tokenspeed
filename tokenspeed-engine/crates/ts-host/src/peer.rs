@@ -37,9 +37,11 @@ use ts_control::{
     peer::{
         geometry::{DeviceField, HostGroup, HostPool, RankGeometry},
         landing::Timeouts,
+        parse_holder_circuit_breaker_env,
         push::{EngineWriter, PushEndpoint, PushSource},
         read::EngineReader,
-        Peer, PeerFence, PeerListener, PeerSettings,
+        resolve_disable_same_node_env, Peer, PeerFence, PeerListener, PeerSettings,
+        ReplicaSettings,
     },
 };
 use ts_scheduler::Scheduler;
@@ -88,6 +90,7 @@ pub struct Settings {
     ib_device: String,
     regions: Vec<(usize, usize)>,
     device: Vec<DeviceField>,
+    device_regions: Vec<(u64, u64)>,
     host: HostPool,
 }
 
@@ -139,6 +142,20 @@ impl Settings {
                 }
             }
         }
+        let host_total_bytes: u64 = region_lengths.iter().copied().sum();
+        let mut device_regions: Vec<(u64, u64)> = geometry
+            .getattr("device_regions")
+            .and_then(|attr| attr.extract())
+            .unwrap_or_default();
+        if device_regions.is_empty() {
+            let host_end = host_address.saturating_add(host_total_bytes);
+            for &(addr, len) in &regions {
+                let addr_u64 = addr as u64;
+                if len > 0 && (addr_u64 < host_address || addr_u64 >= host_end) {
+                    device_regions.push((addr_u64, len as u64));
+                }
+            }
+        }
         let host = HostPool {
             address: host_address,
             groups: host
@@ -156,6 +173,21 @@ impl Settings {
                 .collect::<PyResult<Vec<_>>>()?,
             region_lengths,
         };
+        let protocol: String = settings.getattr("protocol")?.extract()?;
+        let (env_threshold, env_cooldown_us) = parse_holder_circuit_breaker_env();
+        let holder_fail_threshold: u32 = settings
+            .getattr("holder_fail_threshold")
+            .and_then(|attr| attr.extract())
+            .unwrap_or(env_threshold);
+        let holder_cooldown_us: i64 = settings
+            .getattr("holder_cooldown_s")
+            .and_then(|attr| attr.extract::<f64>())
+            .map(micros)
+            .unwrap_or(env_cooldown_us);
+        let disable_same_node: bool = settings
+            .getattr("disable_same_node")
+            .and_then(|attr| attr.extract())
+            .unwrap_or_else(|_| resolve_disable_same_node_env(&protocol));
         Ok(Some(Self {
             peer: PeerSettings {
                 name: settings.getattr("name")?.extract()?,
@@ -173,6 +205,9 @@ impl Settings {
                         .extract::<f64>()?
                         .max(0.0),
                 ),
+                holder_fail_threshold,
+                holder_cooldown_us,
+                disable_same_node,
             },
             node_leaders: settings.getattr("node_leaders")?.extract()?,
             bind_host: settings.getattr("bind_host")?.extract()?,
@@ -180,10 +215,11 @@ impl Settings {
             push_host: settings.getattr("push_host")?.extract()?,
             library: PathBuf::from(settings.getattr("library")?.extract::<String>()?),
             local_ip: settings.getattr("local_ip")?.extract()?,
-            protocol: settings.getattr("protocol")?.extract()?,
+            protocol,
             ib_device: settings.getattr("ib_device")?.extract()?,
             regions,
             device,
+            device_regions,
             host,
         }))
     }
@@ -194,7 +230,7 @@ impl Settings {
 /// rank has a Disk tier, the replica's geometries gathered over `mesh` (every
 /// member of `replica` calls this), and `outbox` connected to the reads.
 pub fn start(
-    settings: Settings,
+    mut settings: Settings,
     mesh: &mut Mesh,
     replica: &Group,
     scheduler: Arc<Mutex<Scheduler>>,
@@ -248,6 +284,7 @@ pub fn start(
     let local = RankGeometry {
         session: engine.session_id().to_owned(),
         device: settings.device,
+        device_regions: settings.device_regions,
         host: Some(settings.host),
         push: Some(push.name().to_owned()),
     };
@@ -259,6 +296,28 @@ pub fn start(
         .map(|bytes| RankGeometry::decode(bytes))
         .collect::<Option<Vec<_>>>()
         .ok_or("a replica member's peer geometry does not decode")?;
+    if replica.size() > 1 {
+        let local_replica_settings = ReplicaSettings {
+            quarantine_us: settings.peer.timeouts.quarantine_us,
+            holder_fail_threshold: settings.peer.holder_fail_threshold,
+            holder_cooldown_us: settings.peer.holder_cooldown_us,
+            disable_same_node: settings.peer.disable_same_node,
+        };
+        let payload = if replica.index() == 0 {
+            local_replica_settings.encode()
+        } else {
+            Vec::new()
+        };
+        let shared = mesh
+            .broadcast(replica, 0, payload)
+            .map_err(|error| error.to_string())?;
+        let agreed = ReplicaSettings::decode(&shared)
+            .ok_or("replica peer settings broadcast did not decode")?;
+        settings.peer.timeouts.quarantine_us = agreed.quarantine_us;
+        settings.peer.holder_fail_threshold = agreed.holder_fail_threshold;
+        settings.peer.holder_cooldown_us = agreed.holder_cooldown_us;
+        settings.peer.disable_same_node = agreed.disable_same_node;
+    }
     tracing::debug!(
         regions = ?settings
             .regions

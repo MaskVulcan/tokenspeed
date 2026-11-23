@@ -36,6 +36,8 @@ the same parallel layout, member by member.
 
 from __future__ import annotations
 
+import math
+import os
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -72,6 +74,83 @@ PUSH_TIMEOUT_S = 10.0
 # request's admission.
 HOST_LANDING_BLOCKS_FRACTION = 0.5
 HOST_READY_S = 5.0
+DEVICE_SOFT_PIN_FLOOR_S = 8.0
+DEFAULT_HOLDER_FAIL_THRESHOLD = 3
+DEFAULT_HOLDER_COOLDOWN_S = 30.0
+
+
+def _parse_positive_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        return default
+    if not math.isfinite(value) or value <= 0.0:
+        return default
+    return value
+
+
+def resolve_quarantine_s(push_timeout_s: float = PUSH_TIMEOUT_S) -> float:
+    """Resolve failed-landing quarantine duration from effective transfer timeouts.
+
+    Reads effective ``MC_TRANSFER_TIMEOUT`` (seconds; Mooncake C++ defaults to
+    ``60.0`` when unset/invalid) and ``ASCEND_TRANSFER_TIMEOUT`` (milliseconds;
+    defaults to ``10000.0`` ms -> ``10.0`` s). A holder push worker dequeuing
+    just under ``push_timeout_s`` can block in synchronous ``ts_mooncake_write``
+    across 2 transport attempts (`2 * max(mc_s, ascend_s)`). Including a ``10s``
+    safety margin and subtracting the ``1s`` RTT margin + ``5s`` ``CANCEL_WAIT``
+    reader wait (`6s`), ``quarantine_s`` is at least ``QUARANTINE_S`` (`30.0s`
+    for `10s / 10000ms`, scaling automatically to `66.0s` under Hulk's
+    ``ASCEND_TRANSFER_TIMEOUT=31000``).
+    """
+    mc_s = _parse_positive_float_env("MC_TRANSFER_TIMEOUT", 60.0)
+    ascend_s = _parse_positive_float_env("ASCEND_TRANSFER_TIMEOUT", 10000.0) / 1000.0
+    needed_s = 2.0 * max(mc_s, ascend_s) + max(0.0, float(push_timeout_s)) - 6.0
+    return max(QUARANTINE_S, needed_s)
+
+
+def resolve_disable_same_node(protocol: str) -> bool:
+    """Resolve worker-side same-node peer lookup guard.
+
+    Defaults to ``True`` under ``ascend_direct`` (CANN 9.2 HIXL pinned-Host
+    same-node ``207000`` guard), while honoring explicit
+    ``TOKENSPEED_PEER_DISABLE_SAME_NODE=0`` opt-out and ``=1`` opt-in.
+    """
+    default_on = str(protocol).strip().lower() == "ascend_direct"
+    raw = os.environ.get("TOKENSPEED_PEER_DISABLE_SAME_NODE")
+    if raw is None or not raw.strip():
+        return default_on
+    lowered = raw.strip().lower()
+    if lowered in ("1", "true", "yes", "on"):
+        return True
+    if lowered in ("0", "false", "no", "off"):
+        return False
+    return default_on
+
+
+def resolve_holder_circuit_breaker() -> tuple[int, float]:
+    """Resolve ``(holder_fail_threshold, holder_cooldown_s)`` from environment."""
+    raw_threshold = os.environ.get("TOKENSPEED_PEER_HOLDER_FAIL_THRESHOLD")
+    threshold = DEFAULT_HOLDER_FAIL_THRESHOLD
+    if raw_threshold is not None and raw_threshold.strip():
+        try:
+            parsed = int(raw_threshold.strip())
+            if parsed >= 0:
+                threshold = parsed
+        except ValueError:
+            pass
+    raw_cooldown = os.environ.get("TOKENSPEED_PEER_HOLDER_COOLDOWN_S")
+    cooldown_s = DEFAULT_HOLDER_COOLDOWN_S
+    if raw_cooldown is not None and raw_cooldown.strip():
+        try:
+            parsed_cd = float(raw_cooldown.strip())
+            if math.isfinite(parsed_cd) and parsed_cd >= 0.0:
+                cooldown_s = parsed_cd
+        except ValueError:
+            pass
+    return threshold, cooldown_s
 
 
 def peer_incarnation() -> int:
@@ -124,7 +203,10 @@ def peer_scheduler_config(
     if not host and landing_tier != "device":
         raise ValueError(f"unknown peer landing tier {landing_tier!r}")
     answer_timeout_s = max(0.0, answer_timeout_ms / 1000.0)
-    soft_pin_s = max(SOFT_PIN_S, 2.0 * answer_timeout_s + 2.0)
+    if host:
+        soft_pin_s = max(SOFT_PIN_S, 2.0 * answer_timeout_s + 2.0)
+    else:
+        soft_pin_s = max(DEVICE_SOFT_PIN_FLOOR_S, 6.0 * answer_timeout_s)
     host_ready_s = max(HOST_READY_S, answer_timeout_s + 5.0)
     return PeerConfig(
         name=name,
@@ -185,6 +267,7 @@ class PeerGeometry:
     device: tuple[PeerDeviceField, ...]
     host: PeerHostPool
     regions: tuple[tuple[int, int], ...]
+    device_regions: tuple[tuple[int, int], ...] = ()
 
 
 def peer_host_regions(
@@ -278,6 +361,9 @@ def build_peer_geometry(
         host_storage.host_lcm_block_bytes,
         host_region_planner,
     )
+    normalized_device_regions = tuple(
+        (int(address), int(length)) for address, length in device_regions
+    )
     return PeerGeometry(
         device=tuple(device),
         host=PeerHostPool(
@@ -286,9 +372,10 @@ def build_peer_geometry(
             region_lengths=tuple(int(length) for _, length in host_regions),
         ),
         regions=(
-            *((int(address), int(length)) for address, length in device_regions),
+            *normalized_device_regions,
             *host_regions,
         ),
+        device_regions=normalized_device_regions,
     )
 
 
@@ -338,3 +425,6 @@ class PeerSharingSettings:
     protocol: str
     ib_device: str
     geometry: PeerGeometry
+    holder_fail_threshold: int = DEFAULT_HOLDER_FAIL_THRESHOLD
+    holder_cooldown_s: float = DEFAULT_HOLDER_COOLDOWN_S
+    disable_same_node: bool = False

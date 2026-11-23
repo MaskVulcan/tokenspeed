@@ -708,6 +708,8 @@ class TestStorageKeyTest:
             os.makedirs(cycle)
             with open(os.path.join(cycle, "config.json"), "w") as handle:
                 handle.write("{}")
+            with open(os.path.join(cycle, "model.safetensors"), "wb") as handle:
+                handle.write(b"weights")
             os.symlink(cycle, os.path.join(cycle, "loop"))
             assert self._checkpoint_id(
                 cycle,
@@ -715,6 +717,110 @@ class TestStorageKeyTest:
                 hf_config=SimpleNamespace(),
                 revision="",
             ).startswith("local-")
+
+    def test_checkpoint_id_hashes_full_safetensors_header_and_fails_closed_on_empty_weights(
+        self,
+    ):
+        import struct
+
+        from tokenspeed.runtime.cache.l3 import identity as l3_identity
+        from tokenspeed.runtime.cache.l3.factory import _resolved_model_loader_extra_config
+
+        with (
+            tempfile.TemporaryDirectory() as hdr_a,
+            tempfile.TemporaryDirectory() as hdr_b,
+            tempfile.TemporaryDirectory() as empty_dir,
+            tempfile.TemporaryDirectory() as sharded_a,
+            tempfile.TemporaryDirectory() as sharded_b,
+        ):
+            # 1. `.safetensors` with a 200 KiB JSON header (> 64 KiB sample size) in a 2 GiB sparse file:
+            #    a 1-byte tensor-offset/dtype edit at 150 KiB inside the JSON header MUST change the ID!
+            header_len = 200 * 1024
+            size_2gib = 2 * 1024 * 1024 * 1024
+            base_json = bytearray(b'{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}')
+            base_json.extend(b" " * (header_len - len(base_json)))
+            edited_json = bytearray(base_json)
+            edited_json[150 * 1024] = ord("\n")
+
+            for directory, hdr_bytes in ((hdr_a, base_json), (hdr_b, edited_json)):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write('{"model_type":"x"}')
+                shard = os.path.join(directory, "model.safetensors")
+                with open(shard, "wb") as handle:
+                    handle.write(struct.pack("<Q", header_len))
+                    handle.write(hdr_bytes)
+                    handle.truncate(size_2gib)
+
+            id_hdr_a = self._checkpoint_id(
+                hdr_a,
+                load_format="safetensors",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            id_hdr_b = self._checkpoint_id(
+                hdr_b,
+                load_format="safetensors",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            assert id_hdr_a != id_hdr_b
+
+            # 2. Local checkpoint with zero matched weights must fail closed unless load_format == "dummy".
+            with open(os.path.join(empty_dir, "config.json"), "w") as handle:
+                handle.write('{"model_type":"x"}')
+            l3_identity._local_checkpoint_fingerprint.cache_clear()
+            with pytest.raises(FileNotFoundError, match="no weight files matching"):
+                self._checkpoint_id(
+                    empty_dir,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                )
+            with pytest.raises(FileNotFoundError, match="no weight files matching"):
+                self._checkpoint_id(
+                    empty_dir,
+                    load_format="safetensors",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                )
+            assert self._checkpoint_id(
+                empty_dir,
+                load_format="dummy",
+                hf_config=SimpleNamespace(),
+                revision="",
+            ).endswith(":dummy")
+
+            # 3. `factory._resolved_model_loader_extra_config` parses JSON string / dict
+            #    and wires custom `sharded_state` pattern into `l3_checkpoint_id`.
+            raw_cfg = '{"pattern":"custom-rank-{rank}-part-{part}.bin"}'
+            parsed = _resolved_model_loader_extra_config(
+                SimpleNamespace(model_loader_extra_config=raw_cfg)
+            )
+            assert parsed == {"pattern": "custom-rank-{rank}-part-{part}.bin"}
+            for directory, payload in ((sharded_a, b"rank0-v1"), (sharded_b, b"rank0-v2")):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write('{"model_type":"x"}')
+                with open(
+                    os.path.join(directory, "custom-rank-0-part-0.bin"), "wb"
+                ) as handle:
+                    handle.write(payload)
+            id_sharded_a = l3_checkpoint_id(
+                sharded_a,
+                hf_config=SimpleNamespace(),
+                revision="",
+                load_format="sharded_state",
+                model_loader_extra_config=parsed,
+                ext_yaml="",
+            )
+            id_sharded_b = l3_checkpoint_id(
+                sharded_b,
+                hf_config=SimpleNamespace(),
+                revision="",
+                load_format="sharded_state",
+                model_loader_extra_config=parsed,
+                ext_yaml="",
+            )
+            assert id_sharded_a != id_sharded_b
 
     def test_checkpoint_id_uses_selected_load_format_weight_files(self):
         with tempfile.TemporaryDirectory() as directory:

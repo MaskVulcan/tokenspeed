@@ -863,6 +863,7 @@ mod ffi {
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_completed_prompts(plan: &ExecutionPlan) -> Vec<String>;
         fn plan_needs_device(plan: &ExecutionPlan) -> bool;
+        fn plan_has_pages_to_copy(plan: &ExecutionPlan) -> bool;
         fn plan_remote_decode(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_remote_prefill(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_forward_transfer(plan: &ExecutionPlan) -> Vec<TransferBatchView>;
@@ -993,7 +994,11 @@ pub fn python_module(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyModule
         "execute",
         pyo3::wrap_pyfunction!(execute_scheduler_module, py)?,
     )?;
-    py.run(c"execute(module)", Some(&scope), None)?;
+    py.run(
+        c"import sys; sys.meta_path[:] = [f for f in sys.meta_path if 'tokenspeed_scheduler' not in getattr(f, 'pkgs', ())]; execute(module)",
+        Some(&scope),
+        None,
+    )?;
     modules.set_item(NAME, &module)?;
     Ok(module)
 }
@@ -1491,6 +1496,13 @@ impl ExecutionPlan {
     /// Storage operations are the L3 executor's, not the data plane's.
     pub fn needs_device(&self) -> bool {
         ffi::plan_needs_device(&self.0)
+    }
+
+    /// Whether the plan relocates or copies any Device cache blocks
+    /// (`pages_to_copy`), whose destinations enter `PrefixCacheIndex` during
+    /// `next_execution_plan` before `copy_cache_pages` runs on the device.
+    pub fn has_pages_to_copy(&self) -> bool {
+        ffi::plan_has_pages_to_copy(&self.0)
     }
 
     /// P role: the prompts whose KV goes to their decode node now.

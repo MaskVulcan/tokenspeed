@@ -149,6 +149,7 @@ fn geometry(base: u64) -> RankGeometry {
             page_stride: PAGE_BYTES,
             bytes: PAGE_BYTES,
         }],
+        device_regions: Vec::new(),
         host: None,
         push: None,
     }
@@ -193,6 +194,9 @@ fn settings(name: &str, weight_version: &str) -> PeerSettings {
             push_us: 1_000_000,
         },
         record_lifetime: Duration::from_secs(5),
+        holder_fail_threshold: 3,
+        holder_cooldown_us: 30_000_000,
+        disable_same_node: false,
     }
 }
 
@@ -1253,4 +1257,696 @@ fn disable_same_node_guard_short_circuits_same_host_lookups_cleanly() {
     assert_eq!((prefix, landings.len()), (0, 0));
     assert_eq!(reader.decisions, vec![("r-same-host".into(), "same_node_disabled")]);
     assert_eq!(reader.peer.holder_cooldown_state(&holder.name), (0, None));
+}
+
+#[test]
+fn normal_pin_lru_evictions_under_30s_quarantine_never_trip_holder_cooldown() {
+    let arena = Arena::new(200_000);
+    let (incoming, received) = mpsc::channel();
+    let proxy = PeerNet::start("127.0.0.1", 0, incoming).unwrap();
+    let holder_name = format!("127.0.0.1:{}", proxy.port());
+    let holder_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let holder_endpoint = format!("127.0.0.1:{}", holder_listener.port());
+    let mut holder = Replica::with_listener(
+        settings(&holder_name, "v1"),
+        holder_listener,
+        HOLDER_BASE,
+        &arena,
+        "Fused",
+    );
+
+    // Realistic production quarantine_us = 30s (30_000_000 us) on reader!
+    let reader_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let reader_name = format!("127.0.0.1:{}", reader_listener.port());
+    let mut reader_settings = settings(&reader_name, "v1");
+    reader_settings.timeouts.quarantine_us = 30_000_000;
+    reader_settings.holder_fail_threshold = 3;
+    reader_settings.holder_cooldown_us = 30_000_000;
+    let mut reader = Replica::with_listener(
+        reader_settings,
+        reader_listener,
+        READER_BASE,
+        &arena,
+        "Fused",
+    );
+
+    // 3x normal soft-pin evictions before `Pin` arrives (`Pin { held: false, trusted: true }`
+    // followed by `Release { held: false, trusted: true }`) must emit `BenignMiss`, NOT `Fault`!
+    for idx in 0..3 {
+        let prefix: Vec<i32> = ((idx + 1) * 3000..(idx + 1) * 3000 + 6 * PAGE).collect();
+        holder_computes(&mut holder, &prefix, &arena);
+
+        let rid = format!("lru-evict-{idx}");
+        let mut prompt = prefix;
+        prompt.extend(70_000..70_000 + PAGE);
+        reader
+            .scheduler
+            .lock()
+            .submit_requests(&[spec(&rid, prompt, &holder_name)])
+            .unwrap();
+
+        let start = Instant::now();
+        let hit = loop {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            for frames in received.try_iter() {
+                let Inbound::Request(message) = Inbound::decode(&frames).unwrap() else {
+                    panic!("proxy only receives requests");
+                };
+                if matches!(message, Request::Pin { .. }) {
+                    // Simulate normal LRU cache eviction of the soft-pinned prefix
+                    // on a busy holder before `Request::Pin` is serviced.
+                    holder.scheduler.lock().clear_cache();
+                }
+                proxy.request(&holder_endpoint, &message).unwrap();
+            }
+            holder.round();
+            let (rows, _) = reader.round();
+            if let Some((_, p)) = rows.into_iter().find(|(id, _)| id == &rid) {
+                break p;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(hit, 0, "evicted soft-pin must fall back cleanly to local compute");
+        assert_eq!(
+            reader.peer.holder_cooldown_state(&holder_name),
+            (0, None),
+            "normal Pin(held=false, trusted=true) LRU eviction must NEVER increment holder failures"
+        );
+        reader.advance(&[
+            event(ForwardEventKind::ExtendResult, &rid, vec![7]),
+            event(ForwardEventKind::Finish, &rid, Vec::new()),
+        ]);
+        reader.round();
+    }
+
+    // 4th request without eviction still lands full prefix immediately.
+    let prefix4: Vec<i32> = (20_000..20_000 + 6 * PAGE).collect();
+    holder_computes(&mut holder, &prefix4, &arena);
+    let mut prompt4 = prefix4;
+    prompt4.extend(71_000..71_000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("after-evicts", prompt4, &holder_name)])
+        .unwrap();
+    let start = Instant::now();
+    let hit4 = loop {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        for frames in received.try_iter() {
+            let Inbound::Request(message) = Inbound::decode(&frames).unwrap() else {
+                panic!("proxy only receives requests");
+            };
+            proxy.request(&holder_endpoint, &message).unwrap();
+        }
+        holder.round();
+        let (rows, _) = reader.round();
+        if let Some((_, p)) = rows.into_iter().find(|(id, _)| id == "after-evicts") {
+            break p;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(hit4 >= 5 * PAGE);
+}
+
+#[test]
+fn three_rdma_faults_trip_cooldown_immediately_without_waiting_for_30s_quarantine() {
+    use ts_control::peer::{geometry::Spans, read::PageReader};
+
+    struct AlwaysFailReader;
+    impl PageReader for AlwaysFailReader {
+        fn read(&self, _session: &str, _spans: &Spans) -> Result<(), String> {
+            Err("simulated RDMA/ADXL transfer timeout".to_owned())
+        }
+    }
+
+    let arena = Arena::new(200_000);
+    let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
+
+    let reader_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let reader_name = format!("127.0.0.1:{}", reader_listener.port());
+    let mut reader_settings = settings(&reader_name, "v1");
+    // Realistic 30-second production quarantine!
+    reader_settings.timeouts.quarantine_us = 30_000_000;
+    reader_settings.holder_fail_threshold = 3;
+    reader_settings.holder_cooldown_us = 30_000_000;
+
+    let reader_sched = Arc::new(Mutex::new(scheduler(
+        &reader_name,
+        1,
+        "Fused",
+        Landing::Device,
+    )));
+    let reader_peer = Peer::start(
+        reader_settings,
+        0,
+        vec![geometry(READER_BASE)],
+        Some(reader_listener),
+        reader_sched.clone(),
+        Arc::new(AlwaysFailReader),
+        Arc::new(NoPushes),
+    )
+    .unwrap();
+    let mut reader = Replica {
+        name: reader_name,
+        scheduler: reader_sched,
+        peer: reader_peer,
+        decisions: Vec::new(),
+        landed: Vec::new(),
+    };
+
+    let t0 = Instant::now();
+    for idx in 0..3 {
+        let prefix: Vec<i32> = ((idx + 1) * 4000..(idx + 1) * 4000 + 6 * PAGE).collect();
+        holder_computes(&mut holder, &prefix, &arena);
+        let rid = format!("imm-fault-{idx}");
+        let mut prompt = prefix;
+        prompt.extend(72_000..72_000 + PAGE);
+        reader
+            .scheduler
+            .lock()
+            .submit_requests(&[spec(&rid, prompt, &holder.name)])
+            .unwrap();
+        // `imm-fault-{idx}` enters its 30s destination-buffer `Phase::Quarantine`
+        // (keeping its HBM blocks quarantined against late DMA), AND `HealthOutcome::Fault`
+        // MUST be drained immediately on that exact tick without waiting 30s!
+        let step_start = Instant::now();
+        while reader.peer.holder_cooldown_state(&holder.name).0 < (idx + 1) as u32 {
+            assert!(
+                step_start.elapsed() < Duration::from_secs(3),
+                "fault {idx} did not increment holder_health immediately while entering 30s Quarantine"
+            );
+            holder.round();
+            reader.round();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            reader.peer.holder_cooldown_state(&holder.name).0,
+            (idx + 1) as u32,
+            "HealthOutcome::Fault must be recorded on the exact tick Landing enters Quarantine"
+        );
+    }
+
+    // All 3 landings are STILL inside their 30s Quarantine (`elapsed << 30s` and
+    // `landing_requests == 3`), yet holder cooldown is already active!
+    assert!(
+        t0.elapsed() < Duration::from_secs(3),
+        "cooldown must trip immediately without waiting 30s for Quarantine expiry, took {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(reader.scheduler.lock().peer_stats().landing_requests, 3);
+    assert!(reader.peer.holder_cooldown_state(&holder.name).1.is_some());
+
+    // 4th request is immediately suppressed with `holder_cooldown` and prefills locally!
+    reader.enable_logical_metrics();
+    let prompt4: Vec<i32> = (40_000..40_000 + 6 * PAGE).collect();
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("imm-suppressed", prompt4, &holder.name)])
+        .unwrap();
+    let (hit4, _) = rounds_until_prefill(&mut reader, None, "imm-suppressed");
+    assert_eq!(hit4, 0);
+    assert!(reader
+        .decisions
+        .contains(&("imm-suppressed".into(), "holder_cooldown")));
+}
+
+#[test]
+fn stale_quarantined_and_inflight_faults_from_before_recovery_never_ghost_retrip_cooldown() {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Condvar,
+    };
+    use ts_control::peer::{geometry::Spans, read::PageReader};
+
+    // First 3 reads fail immediately; the 4th pre-recovery read blocks until
+    // AFTER the holder recovers, then fails; the 5th+ (recovery probe) succeeds!
+    struct StaleFaultReader {
+        arena: Arena,
+        calls: AtomicUsize,
+        release_stale: (std::sync::Mutex<bool>, Condvar),
+        stale_waiting: AtomicBool,
+    }
+
+    impl PageReader for StaleFaultReader {
+        fn read(&self, session: &str, spans: &Spans) -> Result<(), String> {
+            let idx = self.calls.fetch_add(1, Ordering::SeqCst);
+            if idx < 3 {
+                return Err(format!("initial fault {idx}"));
+            }
+            if idx == 3 {
+                self.stale_waiting.store(true, Ordering::Release);
+                let guard = self.release_stale.0.lock().unwrap();
+                let _guard = self
+                    .release_stale
+                    .1
+                    .wait_while(guard, |released| !*released)
+                    .unwrap();
+                return Err("late pre-recovery fault arriving after recovery".to_owned());
+            }
+            self.arena.read(session, spans)
+        }
+    }
+
+    let arena = Arena::new(300_000);
+    let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
+    // Give holder plenty of pages and compute 6 distinct 4-page prefixes.
+    let prefixes: Vec<Vec<i32>> = (0..6)
+        .map(|k| ((k + 1) * 5000..(k + 1) * 5000 + 4 * PAGE).collect())
+        .collect();
+    for p in &prefixes {
+        holder_computes(&mut holder, p, &arena);
+    }
+
+    let custom_reader = Arc::new(StaleFaultReader {
+        arena: arena.clone(),
+        calls: AtomicUsize::new(0),
+        release_stale: (std::sync::Mutex::new(false), Condvar::new()),
+        stale_waiting: AtomicBool::new(false),
+    });
+    let reader_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let reader_name = format!("127.0.0.1:{}", reader_listener.port());
+    let mut reader_settings = settings(&reader_name, "v1");
+    // Quarantine (350 ms) outlives Cooldown (100 ms), modeling the exact
+    // 30s quarantine vs 14s recovery race AND testing quarantine expiry!
+    reader_settings.timeouts.quarantine_us = 350_000;
+    reader_settings.holder_fail_threshold = 3;
+    reader_settings.holder_cooldown_us = 100_000;
+
+    let reader_sched = Arc::new(Mutex::new(scheduler(
+        &reader_name,
+        1,
+        "Fused",
+        Landing::Device,
+    )));
+    let reader_peer = Peer::start(
+        reader_settings,
+        0,
+        vec![geometry(READER_BASE)],
+        Some(reader_listener),
+        reader_sched.clone(),
+        custom_reader.clone(),
+        Arc::new(NoPushes),
+    )
+    .unwrap();
+    let mut reader = Replica {
+        name: reader_name,
+        scheduler: reader_sched,
+        peer: reader_peer,
+        decisions: Vec::new(),
+        landed: Vec::new(),
+    };
+
+    // Submit 4 concurrent requests at `t = 0`: all 4 pass lookup before cooldown trips!
+    // `g0..g2` fail immediately and trip cooldown while entering 350ms Quarantine;
+    // `g3` blocks in `StaleFaultReader` (`started_us` is from `t = 0`, before cooldown & recovery!).
+    let specs: Vec<RequestSpec> = (0..4)
+        .map(|k| {
+            let mut prompt = prefixes[k].clone();
+            let base = 75_000 + k as i32 * 100;
+            prompt.extend(base..base + PAGE);
+            spec(&format!("g{k}"), prompt, &holder.name)
+        })
+        .collect();
+    reader.scheduler.lock().submit_requests(&specs).unwrap();
+
+    let start = Instant::now();
+    while reader.peer.holder_cooldown_state(&holder.name).1.is_none()
+        || !custom_reader.stale_waiting.load(Ordering::Acquire)
+    {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        holder.round();
+        let (rows, _) = reader.round();
+        for (rid, _) in rows {
+            reader.advance(&[
+                event(ForwardEventKind::ExtendResult, &rid, vec![7]),
+                event(ForwardEventKind::Finish, &rid, Vec::new()),
+            ]);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(reader.peer.holder_cooldown_state(&holder.name).0, 3);
+
+    // Wait 130ms for cooldown (100ms) to expire while `g0..g2` are STILL in 350ms Quarantine!
+    std::thread::sleep(Duration::from_millis(130));
+
+    // Send recovery probe `g-probe`: it succeeds (`calls == 4`) and resets health to `(0, None)`!
+    let mut probe_prompt = prefixes[4].clone();
+    probe_prompt.extend(76_000..76_000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("g-probe", probe_prompt, &holder.name)])
+        .unwrap();
+    let (probe_hit, _) = rounds_until_prefill(&mut reader, Some(&mut holder), "g-probe");
+    assert!(probe_hit >= 3 * PAGE, "recovery probe must land prefix");
+    assert_eq!(reader.peer.holder_cooldown_state(&holder.name), (0, None));
+    reader.advance(&[
+        event(ForwardEventKind::ExtendResult, "g-probe", vec![7]),
+        event(ForwardEventKind::Finish, "g-probe", Vec::new()),
+    ]);
+    reader.round();
+
+    // Now release `g3` (pre-recovery in-flight fault!) AND wait past 350ms so
+    // ALL quarantined landings (`g0..g3`) expire and get drained from `Peer.landings`!
+    *custom_reader.release_stale.0.lock().unwrap() = true;
+    custom_reader.release_stale.1.notify_all();
+    let (g3_hit, _) = rounds_until_prefill(&mut reader, Some(&mut holder), "g3");
+    assert_eq!(g3_hit, 0);
+    reader.advance(&[
+        event(ForwardEventKind::ExtendResult, "g3", vec![7]),
+        event(ForwardEventKind::Finish, "g3", Vec::new()),
+    ]);
+
+    std::thread::sleep(Duration::from_millis(380));
+    for _ in 0..5 {
+        holder.round();
+        reader.round();
+    }
+    assert_eq!(
+        reader.peer.holder_cooldown_state(&holder.name),
+        (0, None),
+        "neither Quarantine expiry of g0..g2 nor late pre-recovery fault g3 may increment failures or re-trip cooldown"
+    );
+}
+
+#[test]
+fn half_open_probe_guard_spans_disk_push_window() {
+    use ts_control::peer::{geometry::Spans, read::PageReader};
+
+    struct FailReader;
+    impl PageReader for FailReader {
+        fn read(&self, _session: &str, _spans: &Spans) -> Result<(), String> {
+            Err("fault".to_owned())
+        }
+    }
+
+    let arena = Arena::new(200_000);
+    let (incoming, received) = mpsc::channel();
+    let proxy = PeerNet::start("127.0.0.1", 0, incoming).unwrap();
+    let holder_name = format!("127.0.0.1:{}", proxy.port());
+    let holder_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let holder_endpoint = format!("127.0.0.1:{}", holder_listener.port());
+    let mut holder = Replica::with_listener(
+        settings(&holder_name, "v1"),
+        holder_listener,
+        HOLDER_BASE,
+        &arena,
+        "Fused",
+    );
+    let prefix: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &prefix, &arena);
+
+    let reader_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let reader_name = format!("127.0.0.1:{}", reader_listener.port());
+    let mut reader_settings = settings(&reader_name, "v1");
+    // Production answer_us = 50ms, push_us = 10s -> probe_guard_us = 16s (>> 3 * 50ms = 150ms!).
+    reader_settings.timeouts.answer_us = 50_000;
+    reader_settings.timeouts.push_us = 10_000_000;
+    reader_settings.timeouts.quarantine_us = 30_000_000;
+    reader_settings.holder_fail_threshold = 2;
+    reader_settings.holder_cooldown_us = 80_000;
+
+    let reader_sched = Arc::new(Mutex::new(scheduler(
+        &reader_name,
+        1,
+        "Fused",
+        Landing::Device,
+    )));
+    let reader_peer = Peer::start(
+        reader_settings,
+        0,
+        vec![geometry(READER_BASE)],
+        Some(reader_listener),
+        reader_sched.clone(),
+        Arc::new(FailReader),
+        Arc::new(NoPushes),
+    )
+    .unwrap();
+    let mut reader = Replica {
+        name: reader_name,
+        scheduler: reader_sched,
+        peer: reader_peer,
+        decisions: Vec::new(),
+        landed: Vec::new(),
+    };
+
+    reader.enable_logical_metrics();
+
+    // Trip cooldown with 2 RDMA faults (while both stay parked in their 30s Quarantine!).
+    for idx in 0..2i32 {
+        let rid = format!("pg-fault-{idx}");
+        let mut prompt = prefix.clone();
+        prompt.extend((77_000 + idx * 100)..(77_000 + idx * 100 + PAGE));
+        reader
+            .scheduler
+            .lock()
+            .submit_requests(&[spec(&rid, prompt, &holder_name)])
+            .unwrap();
+        let start = Instant::now();
+        while reader.peer.holder_cooldown_state(&holder_name).0 < (idx + 1) as u32 {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            for frames in received.try_iter() {
+                let Inbound::Request(msg) = Inbound::decode(&frames).unwrap() else {
+                    panic!("expected request");
+                };
+                proxy.request(&holder_endpoint, &msg).unwrap();
+            }
+            holder.round();
+            reader.round();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    assert!(reader.peer.holder_cooldown_state(&holder_name).1.is_some());
+
+    // Wait 100ms for cooldown (80ms) to expire; launch 1st half-open probe and hold proxy
+    // (simulating an in-flight Disk push taking > 150ms).
+    std::thread::sleep(Duration::from_millis(100));
+    reader.decisions.clear();
+    let mut probe1 = prefix.clone();
+    probe1.extend(78_000..78_000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("pg-probe-1", probe1, &holder_name)])
+        .unwrap();
+    reader.round();
+
+    // Sleep 220ms (> old `3 * answer_us = 150ms`, but < `push_us + 6s = 16s`!):
+    // a 2nd lookup arriving during the Disk push window MUST still be suppressed!
+    std::thread::sleep(Duration::from_millis(220));
+    let mut probe2 = prefix;
+    probe2.extend(79_000..79_000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("pg-probe-2", probe2, &holder_name)])
+        .unwrap();
+    let (hit2, _) = rounds_until_prefill(&mut reader, None, "pg-probe-2");
+    assert_eq!(hit2, 0);
+    assert!(
+        reader
+            .decisions
+            .contains(&("pg-probe-2".into(), "holder_cooldown")),
+        "second probe at +220ms must still be suppressed by 16s Disk push probe_guard_us, got {:?}",
+        reader.decisions
+    );
+}
+
+#[test]
+fn push_busy_backpressure_is_benign_miss_and_ascend_direct_defaults_same_node_off() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use ts_control::peer::{push::PushFailure, resolve_disable_same_node, wire::Stamp};
+    use ts_scheduler::{PeerAnswerKind, PeerAnswerView, PeerPageView};
+
+    // Verify `resolve_disable_same_node` defaults ON for `ascend_direct` and honors `=0`.
+    assert!(resolve_disable_same_node("ascend_direct", None));
+    assert!(!resolve_disable_same_node("ascend_direct", Some("0")));
+    assert!(!resolve_disable_same_node("rdma", None));
+    assert!(resolve_disable_same_node("rdma", Some("1")));
+
+    struct BusyPusher {
+        calls: Arc<AtomicUsize>,
+    }
+    impl PagePusher for BusyPusher {
+        fn push(&self, _: &str, _: &str, _: Duration, _: Vec<PushItem>) -> Result<(), String> {
+            Err("push queue busy".into())
+        }
+        fn push_checked(
+            &self,
+            _: &str,
+            _: &str,
+            _: Duration,
+            _: Vec<PushItem>,
+        ) -> Result<(), PushFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(PushFailure::Busy)
+        }
+    }
+
+    let arena = Arena::new(200_000);
+    let (incoming, received) = mpsc::channel();
+    let proxy = PeerNet::start("127.0.0.1", 0, incoming).unwrap();
+    let holder_name = format!("127.0.0.1:{}", proxy.port());
+    let holder_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let holder_endpoint = format!("127.0.0.1:{}", holder_listener.port());
+    let mut holder_geom = geometry_with_host(HOLDER_BASE, READER_HOST_BASE);
+    holder_geom.push = Some("127.0.0.1:9".to_owned());
+    let mut holder = Replica::with_landing(
+        settings(&holder_name, "v1"),
+        holder_listener,
+        holder_geom,
+        &arena,
+        "Fused",
+        Landing::Device,
+    );
+
+    // Query `holder`'s real `Stamp` once via `Request::Layout` so synthesized Disk-tier
+    // `Pin`/`Release` answers carry the exact namespace identity `Peer` expects.
+    let (probe_tx, probe_rx) = mpsc::channel();
+    let probe_net = PeerNet::start("127.0.0.1", 0, probe_tx).unwrap();
+    probe_net
+        .request(
+            &holder_endpoint,
+            &Request::Layout {
+                reply_to: format!("127.0.0.1:{}", probe_net.port()),
+            },
+        )
+        .unwrap();
+    let holder_stamp: Stamp = match Inbound::decode(
+        &probe_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+    )
+    .unwrap()
+    {
+        Inbound::Reply(Reply::Layout { stamp, .. }) => stamp,
+        other => panic!("expected Layout reply, got {other:?}"),
+    };
+
+    let reader_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let reader_name = format!("127.0.0.1:{}", reader_listener.port());
+    let mut reader_settings = settings(&reader_name, "v1");
+    reader_settings.timeouts.quarantine_us = 30_000_000;
+    reader_settings.holder_fail_threshold = 2;
+    let reader_sched = Arc::new(Mutex::new(scheduler(
+        &reader_name,
+        1,
+        "Fused",
+        Landing::Device,
+    )));
+    let busy_calls = Arc::new(AtomicUsize::new(0));
+    let reader_peer = Peer::start(
+        reader_settings,
+        0,
+        vec![geometry(READER_BASE)],
+        Some(reader_listener),
+        reader_sched.clone(),
+        Arc::new(arena.clone()),
+        Arc::new(BusyPusher {
+            calls: busy_calls.clone(),
+        }),
+    )
+    .unwrap();
+    let mut reader = Replica {
+        name: reader_name,
+        scheduler: reader_sched,
+        peer: reader_peer,
+        decisions: Vec::new(),
+        landed: Vec::new(),
+    };
+
+    // Proxy intercepts `Request::Pin` so the reply advertises Disk blocks matching
+    // the reader's `PeerFetchView` (driving `BusyPusher::push_checked -> Err(PushFailure::Busy)`),
+    // while forwarding `Layout` and `Lookup` normally.
+    for idx in 0..3 {
+        let prefix: Vec<i32> = ((idx + 1) * 6000..(idx + 1) * 6000 + 6 * PAGE).collect();
+        holder_computes(&mut holder, &prefix, &arena);
+        let rid = format!("busy-push-{idx}");
+        let mut prompt = prefix;
+        prompt.extend(85_000..85_000 + PAGE);
+        reader
+            .scheduler
+            .lock()
+            .submit_requests(&[spec(&rid, prompt, &holder_name)])
+            .unwrap();
+        let start = Instant::now();
+        let mut expected_end_tokens = 6 * PAGE;
+        let mut expected_slots = 6i32;
+        let hit = loop {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            for frames in received.try_iter() {
+                let Inbound::Request(msg) = Inbound::decode(&frames).unwrap() else {
+                    panic!("expected request");
+                };
+                if let Request::Pin { lease } = &msg {
+                    let pages = (0..expected_slots)
+                        .map(|slot| PeerPageView {
+                            group_id: 0,
+                            slot,
+                            tier: PeerTier::Disk,
+                            block_id: slot + 1,
+                        })
+                        .collect();
+                    proxy
+                        .reply(
+                            &lease.reader,
+                            &Reply::Answer {
+                                stamp: holder_stamp.clone(),
+                                answer: PeerAnswerView {
+                                    lease: lease.clone(),
+                                    kind: PeerAnswerKind::Pin,
+                                    num_tokens: expected_end_tokens,
+                                    pages,
+                                    held: true,
+                                },
+                            },
+                        )
+                        .unwrap();
+                } else if let Request::Release { lease, .. } = &msg {
+                    proxy
+                        .reply(
+                            &lease.reader,
+                            &Reply::Answer {
+                                stamp: holder_stamp.clone(),
+                                answer: PeerAnswerView {
+                                    lease: lease.clone(),
+                                    kind: PeerAnswerKind::Release,
+                                    num_tokens: 0,
+                                    pages: Vec::new(),
+                                    held: true,
+                                },
+                            },
+                        )
+                        .unwrap();
+                } else {
+                    proxy.request(&holder_endpoint, &msg).unwrap();
+                }
+            }
+            holder.round();
+            let (rows, fetches) = reader.round();
+            if let Some(f) = fetches.first() {
+                expected_end_tokens = f.end_tokens;
+                expected_slots = f.destinations.len() as i32;
+            }
+            if let Some((_, p)) = rows.into_iter().find(|(id, _)| id == &rid) {
+                break p;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(hit, 0, "busy push backpressure must fall back to local compute");
+        assert_eq!(
+            busy_calls.load(Ordering::SeqCst),
+            idx as usize + 1,
+            "BusyPusher::push_checked must actually be invoked"
+        );
+        assert_eq!(
+            reader.peer.holder_cooldown_state(&holder_name),
+            (0, None),
+            "MAX_QUEUED_PUSHES busy backpressure must map to BenignMiss and never trip cooldown"
+        );
+        reader.advance(&[
+            event(ForwardEventKind::ExtendResult, &rid, vec![7]),
+            event(ForwardEventKind::Finish, &rid, Vec::new()),
+        ]);
+        reader.round();
+    }
 }

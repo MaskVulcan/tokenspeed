@@ -855,6 +855,15 @@ bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
     return false;
 }
 
+bool plan_has_pages_to_copy(const tokenspeed::ExecutionPlan& plan) {
+    for (const auto& [group_id, pairs] : plan.pages_to_copy) {
+        if (!pairs.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 rust::Vec<ForwardBatchView> plan_remote_decode(const tokenspeed::ExecutionPlan& plan) {
     return optional_batch(plan.remote_decode);
 }
