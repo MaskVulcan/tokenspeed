@@ -157,9 +157,64 @@ impl Ring {
         let mut free: Vec<usize> = (0..self.depth).rev().collect();
         let mut retries: VecDeque<InFlight> = VecDeque::new();
         let mut armed = false;
+        let mut to_issue: Vec<InFlight> = Vec::with_capacity(self.depth);
+        let mut outcomes: Vec<(Chunk, Result<(), IoError>)> = Vec::with_capacity(self.depth);
         loop {
+            let sq_space = {
+                let submission = self.ring.submission();
+                let avail = submission.capacity().saturating_sub(submission.len());
+                if armed {
+                    avail
+                } else {
+                    avail.saturating_sub(1)
+                }
+            };
+            let max_issue = free.len().min(sq_space);
+            to_issue.clear();
             {
                 let mut queues = shared.queues.lock();
+                while to_issue.len() < max_issue {
+                    let inflight = match retries.pop_front() {
+                        Some(inflight) => inflight,
+                        None => match queues.next(shared.limits) {
+                            Some(chunk) => InFlight {
+                                chunk,
+                                done: 0,
+                                retries: 0,
+                            },
+                            None => break,
+                        },
+                    };
+                    to_issue.push(inflight);
+                }
+                if queues.closing()
+                    && queues.drained()
+                    && retries.is_empty()
+                    && to_issue.is_empty()
+                    && free.len() == self.depth
+                {
+                    break;
+                }
+            }
+            // Compute write CRC32C outside `shared.queues` to avoid holding
+            // the dispatch mutex during hashing.
+            for inflight in &to_issue {
+                if inflight.chunk.direction == Direction::Write
+                    && inflight.done == 0
+                    && inflight.retries == 0
+                {
+                    // SAFETY: the chunk lies in registered memory that stays
+                    // mapped until the executor closes.
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(
+                            inflight.chunk.address as *const u8,
+                            inflight.chunk.len,
+                        )
+                    };
+                    shared.checksums.record(inflight.chunk.file_offset, slice);
+                }
+            }
+            {
                 let mut submission = self.ring.submission();
                 if !armed && !submission.is_full() {
                     let read = opcode::Read::new(
@@ -173,22 +228,8 @@ impl Ring {
                     unsafe { submission.push(&read) }.expect("the ring has room for the wake-up");
                     armed = true;
                 }
-                while !submission.is_full() {
-                    let Some(&slot) = free.last() else {
-                        break;
-                    };
-                    let inflight = match retries.pop_front() {
-                        Some(inflight) => inflight,
-                        None => match queues.next(shared.limits) {
-                            Some(chunk) => InFlight {
-                                chunk,
-                                done: 0,
-                                retries: 0,
-                            },
-                            None => break,
-                        },
-                    };
-                    free.pop();
+                for inflight in to_issue.drain(..) {
+                    let slot = free.pop().expect("free slot reserved for to_issue");
                     let req = request(self.fd, inflight, self.fixed_buffers)
                         .user_data(slot as u64);
                     // SAFETY: the chunk lies in registered memory that stays
@@ -196,14 +237,6 @@ impl Ring {
                     unsafe { submission.push(&req) }
                         .expect("the ring has an entry for every slot");
                     slots[slot] = Some(inflight);
-                }
-                drop(submission);
-                if queues.closing()
-                    && queues.drained()
-                    && retries.is_empty()
-                    && free.len() == self.depth
-                {
-                    break;
                 }
             }
             if let Err(error) = self.ring.submit_and_wait(1) {
@@ -225,72 +258,94 @@ impl Ring {
                 .completion()
                 .map(|completion| (completion.user_data(), completion.result()))
                 .collect();
-            let mut finished = Vec::new();
-            {
-                let mut queues = shared.queues.lock();
-                for (user_data, result) in completions {
-                    if user_data == WAKE_UP {
-                        armed = false;
-                        continue;
+            outcomes.clear();
+            for (user_data, result) in completions {
+                if user_data == WAKE_UP {
+                    armed = false;
+                    continue;
+                }
+                let slot = usize::try_from(user_data).expect("a slot index");
+                let mut inflight = slots[slot]
+                    .take()
+                    .expect("a completion of an issued request");
+                free.push(slot);
+                if result == -libc::EINTR || result == -libc::EAGAIN {
+                    if inflight.retries < MAX_TRANSIENT_RETRIES {
+                        inflight.retries += 1;
+                        retries.push_back(inflight);
+                    } else {
+                        if inflight.chunk.direction == Direction::Write {
+                            shared
+                                .checksums
+                                .invalidate(inflight.chunk.file_offset, inflight.chunk.len);
+                        }
+                        outcomes.push((inflight.chunk, Err(IoError::Os(-result))));
                     }
-                    let slot = usize::try_from(user_data).expect("a slot index");
-                    let mut inflight = slots[slot]
-                        .take()
-                        .expect("a completion of an issued request");
-                    free.push(slot);
-                    if result == -libc::EINTR || result == -libc::EAGAIN {
-                        if inflight.retries < MAX_TRANSIENT_RETRIES {
-                            inflight.retries += 1;
-                            retries.push_back(inflight);
+                    continue;
+                }
+                let remaining = inflight.chunk.len - inflight.done;
+                let outcome = match usize::try_from(result) {
+                    Err(_) => Err(IoError::Os(-result)),
+                    Ok(0) => Err(IoError::Short {
+                        expected: inflight.chunk.len,
+                        done: inflight.done,
+                    }),
+                    Ok(n) if n < remaining => {
+                        let next_done = inflight.done + n;
+                        if n % ALIGNMENT != 0 {
+                            // O_DIRECT cannot resume from an unaligned offset.
+                            Err(IoError::Short {
+                                expected: inflight.chunk.len,
+                                done: next_done,
+                            })
                         } else {
-                            finished.extend(
-                                queues.finish(inflight.chunk, Err(IoError::Os(-result))),
-                            );
+                            inflight.done = next_done;
+                            inflight.retries = 0;
+                            retries.push_back(inflight);
+                            continue;
                         }
-                        continue;
                     }
-                    let remaining = inflight.chunk.len - inflight.done;
-                    match usize::try_from(result) {
-                        Err(_) => {
-                            finished.extend(
-                                queues.finish(inflight.chunk, Err(IoError::Os(-result))),
-                            );
-                        }
-                        Ok(0) => {
-                            finished.extend(queues.finish(
-                                inflight.chunk,
-                                Err(IoError::Short {
-                                    expected: inflight.chunk.len,
-                                    done: inflight.done,
-                                }),
-                            ));
-                        }
-                        Ok(n) if n < remaining => {
-                            let next_done = inflight.done + n;
-                            if n % ALIGNMENT != 0 {
-                                // O_DIRECT cannot resume from an unaligned offset.
-                                finished.extend(queues.finish(
-                                    inflight.chunk,
-                                    Err(IoError::Short {
-                                        expected: inflight.chunk.len,
-                                        done: next_done,
-                                    }),
-                                ));
-                            } else {
-                                inflight.done = next_done;
-                                inflight.retries = 0;
-                                retries.push_back(inflight);
+                    Ok(n) if n == remaining => {
+                        if inflight.chunk.direction == Direction::Read {
+                            // SAFETY: the read just completed into registered
+                            // memory that stays mapped until close.
+                            let slice = unsafe {
+                                std::slice::from_raw_parts(
+                                    inflight.chunk.address as *const u8,
+                                    inflight.chunk.len,
+                                )
+                            };
+                            match shared.checksums.verify(inflight.chunk.file_offset, slice) {
+                                Ok(()) => Ok(()),
+                                Err((expected, actual)) => {
+                                    tracing::error!(
+                                        file_offset = inflight.chunk.file_offset,
+                                        len = inflight.chunk.len,
+                                        expected = format_args!("{expected:#010x}"),
+                                        actual = format_args!("{actual:#010x}"),
+                                        "disk read CRC32C mismatch; dropping corrupted chunk"
+                                    );
+                                    Err(IoError::ChecksumMismatch { expected, actual })
+                                }
                             }
-                        }
-                        Ok(n) if n == remaining => {
-                            finished.extend(queues.finish(inflight.chunk, Ok(())));
-                        }
-                        Ok(_) => {
-                            finished.extend(
-                                queues.finish(inflight.chunk, Err(IoError::Os(libc::EIO))),
-                            );
+                        } else {
+                            Ok(())
                         }
                     }
+                    Ok(_) => Err(IoError::Os(libc::EIO)),
+                };
+                if outcome.is_err() && inflight.chunk.direction == Direction::Write {
+                    shared
+                        .checksums
+                        .invalidate(inflight.chunk.file_offset, inflight.chunk.len);
+                }
+                outcomes.push((inflight.chunk, outcome));
+            }
+            let mut finished = Vec::new();
+            if !outcomes.is_empty() {
+                let mut queues = shared.queues.lock();
+                for (chunk, outcome) in outcomes.drain(..) {
+                    finished.extend(queues.finish(chunk, outcome));
                 }
             }
             shared.work.notify_all();

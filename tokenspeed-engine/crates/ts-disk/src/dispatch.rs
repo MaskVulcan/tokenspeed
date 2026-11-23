@@ -34,7 +34,21 @@ use std::{
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::executor::{Direction, IoError, JobReport, Pressure, Stats};
+use crate::{
+    checksum::ChecksumTable,
+    executor::{Direction, IoError, JobReport, Pressure, Stats},
+};
+
+/// Consecutive OS-level I/O errors before tripping the disk circuit breaker.
+pub(crate) const MAX_CONSECUTIVE_DISK_ERRORS: u32 = 8;
+
+/// Read-latency AIMD window and thresholds (microseconds) for adaptive write
+/// concurrency throttling.
+const AIMD_WINDOW: Duration = Duration::from_millis(100);
+const AIMD_MIN_SAMPLES: usize = 8;
+const AIMD_MAX_SAMPLES: usize = 64;
+const AIMD_HIGH_US: u32 = 2_000;
+const AIMD_LOW_US: u32 = 1_000;
 
 /// What a job runs once it ended: its report.
 pub(crate) type Done = Box<dyn FnOnce(JobReport) + Send>;
@@ -58,6 +72,8 @@ pub(crate) struct Chunk {
     pub address: usize,
     pub len: usize,
     pub buffer: u16,
+    /// When the chunk was dispatched to the backend (for read-latency AIMD).
+    pub issued_at: Option<Instant>,
 }
 
 struct JobEntry {
@@ -91,6 +107,85 @@ pub(crate) struct Limits {
     pub write_depth: usize,
 }
 
+/// Closed-loop AIMD controller that halves background write concurrency when
+/// foreground read p99 exceeds [`AIMD_HIGH_US`] and recovers additively once
+/// read p99 drops below [`AIMD_LOW_US`].
+struct ReadLatencyAimd {
+    samples_us: [u32; AIMD_MAX_SAMPLES],
+    len: usize,
+    cursor: usize,
+    window_start: Option<Instant>,
+    effective_write_depth: Option<usize>,
+}
+
+impl Default for ReadLatencyAimd {
+    fn default() -> Self {
+        Self {
+            samples_us: [0; AIMD_MAX_SAMPLES],
+            len: 0,
+            cursor: 0,
+            window_start: None,
+            effective_write_depth: None,
+        }
+    }
+}
+
+impl ReadLatencyAimd {
+    fn effective_write_depth(&self, limits: Limits, reads_pending: bool) -> usize {
+        let current = self
+            .effective_write_depth
+            .unwrap_or(limits.write_depth)
+            .min(limits.write_depth);
+        // When foreground reads are completely idle, keep at least 1 write slot
+        // open so background cleaning does not stall permanently after a burst.
+        if reads_pending {
+            current
+        } else {
+            current.max(1).min(limits.write_depth)
+        }
+    }
+
+    fn record_read(&mut self, latency: Duration, now: Instant, max_write_depth: usize) {
+        let window_start = *self.window_start.get_or_insert(now);
+        let us = u32::try_from(latency.as_micros()).unwrap_or(u32::MAX);
+        if self.len < AIMD_MAX_SAMPLES {
+            self.samples_us[self.len] = us;
+            self.len += 1;
+        } else {
+            self.samples_us[self.cursor] = us;
+            self.cursor = (self.cursor + 1) % AIMD_MAX_SAMPLES;
+        }
+        if now.saturating_duration_since(window_start) < AIMD_WINDOW || self.len < AIMD_MIN_SAMPLES
+        {
+            return;
+        }
+        self.samples_us[..self.len].sort_unstable();
+        let p99_idx = (self.len * 99) / 100;
+        let p99_us = self.samples_us[p99_idx];
+        let cap = max_write_depth.max(1);
+        let cur = self.effective_write_depth.unwrap_or(cap).min(cap);
+        let next = if p99_us > AIMD_HIGH_US {
+            cur / 2
+        } else if p99_us < AIMD_LOW_US {
+            (cur + 1).min(cap)
+        } else {
+            cur
+        };
+        if next != cur {
+            tracing::debug!(
+                read_p99_us = p99_us,
+                prev_write_depth = cur,
+                next_write_depth = next,
+                "adjusted disk write concurrency via read-p99 AIMD"
+            );
+        }
+        self.effective_write_depth = Some(next);
+        self.len = 0;
+        self.cursor = 0;
+        self.window_start = Some(now);
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Queues {
     jobs: BTreeMap<u64, JobEntry>,
@@ -103,6 +198,10 @@ pub(crate) struct Queues {
     next_job: u64,
     closing: bool,
     broken: bool,
+    degraded: bool,
+    consecutive_os_errors: u32,
+    last_write_depth: usize,
+    aimd: ReadLatencyAimd,
     stats: Stats,
 }
 
@@ -147,14 +246,22 @@ impl Queues {
 
     /// The next chunk to issue within `limits`, now counted in flight.
     pub(crate) fn next(&mut self, limits: Limits) -> Option<Chunk> {
-        if self.broken || self.inflight_reads + self.inflight_writes >= limits.depth {
+        if self.broken
+            || self.degraded
+            || self.inflight_reads + self.inflight_writes >= limits.depth
+        {
             return None;
         }
-        let chunk = match self.reads.pop_front() {
+        self.last_write_depth = limits.write_depth;
+        let reads_pending = !self.reads.is_empty() || self.inflight_reads > 0;
+        let write_depth = self.aimd.effective_write_depth(limits, reads_pending);
+        let mut chunk = match self.reads.pop_front() {
             Some(chunk) => chunk,
-            None if self.inflight_writes < limits.write_depth => self.writes.pop_front()?,
+            None if self.inflight_writes < write_depth => self.writes.pop_front()?,
             None => return None,
         };
+        let now = Instant::now();
+        chunk.issued_at = Some(now);
         match chunk.direction {
             Direction::Read => self.inflight_reads += 1,
             Direction::Write => self.inflight_writes += 1,
@@ -163,21 +270,44 @@ impl Queues {
         let entry = self.jobs.get_mut(&chunk.job).expect("a queued chunk's job");
         entry.queued -= 1;
         entry.inflight += 1;
-        entry.issued_at.get_or_insert_with(Instant::now);
+        entry.issued_at.get_or_insert(now);
         Some(chunk)
     }
 
-    /// A chunk retired with `result`; returns its job if that ended.
-    pub(crate) fn finish(
-        &mut self,
-        chunk: Chunk,
-        result: Result<(), IoError>,
-    ) -> Option<(Done, JobReport)> {
+    /// A chunk retired with `result`; returns all jobs that ended (usually 0
+    /// or 1, or more if this error tripped the degraded circuit breaker).
+    pub(crate) fn finish(&mut self, chunk: Chunk, result: Result<(), IoError>) -> Finished {
+        self.finish_at(chunk, result, Instant::now())
+    }
+
+    fn finish_at(&mut self, chunk: Chunk, result: Result<(), IoError>, now: Instant) -> Finished {
         match chunk.direction {
             Direction::Read => self.inflight_reads -= 1,
             Direction::Write => self.inflight_writes -= 1,
         }
         self.inflight_bytes -= chunk.len as u64;
+        let mut tripped_errno = None;
+        match &result {
+            Ok(()) => {
+                self.consecutive_os_errors = 0;
+                if chunk.direction == Direction::Read {
+                    if let Some(issued) = chunk.issued_at {
+                        self.aimd.record_read(
+                            now.saturating_duration_since(issued),
+                            now,
+                            self.last_write_depth,
+                        );
+                    }
+                }
+            }
+            Err(IoError::Os(errno)) => {
+                self.consecutive_os_errors = self.consecutive_os_errors.saturating_add(1);
+                if !self.degraded && self.consecutive_os_errors >= MAX_CONSECUTIVE_DISK_ERRORS {
+                    tripped_errno = Some(*errno);
+                }
+            }
+            Err(_) => {}
+        }
         let entry = self
             .jobs
             .get_mut(&chunk.job)
@@ -191,7 +321,41 @@ impl Queues {
                 self.drop_queued(chunk.job);
             }
         }
-        self.end_if_retired(chunk.job)
+        let mut finished = Vec::new();
+        if let Some(done) = self.end_if_retired(chunk.job) {
+            finished.push(done);
+        }
+        if let Some(errno) = tripped_errno {
+            finished.extend(self.trip_degraded(errno));
+        }
+        finished
+    }
+
+    /// Trip the circuit breaker after consecutive OS I/O errors: stop issuing
+    /// new work and fail all queued unissued chunks while letting in-flight
+    /// requests retire safely.
+    fn trip_degraded(&mut self, errno: i32) -> Finished {
+        self.degraded = true;
+        tracing::error!(
+            consecutive_errors = self.consecutive_os_errors,
+            errno,
+            "disk tier hit consecutive OS I/O error threshold; tripping circuit breaker into degraded mode"
+        );
+        let jobs: Vec<u64> = self.jobs.keys().copied().collect();
+        let mut finished = Vec::new();
+        for job in jobs {
+            if let Some(entry) = self.jobs.get_mut(&job) {
+                entry.error.get_or_insert(IoError::Os(errno));
+                if entry.queued > 0 {
+                    entry.queued = 0;
+                    self.drop_queued(job);
+                }
+            }
+            if let Some(done) = self.end_if_retired(job) {
+                finished.push(done);
+            }
+        }
+        finished
     }
 
     /// Stop issuing `job`'s chunks; returns it if nothing of it is in flight.
@@ -228,6 +392,10 @@ impl Queues {
 
     pub(crate) fn broken(&self) -> bool {
         self.broken
+    }
+
+    pub(crate) fn degraded(&self) -> bool {
+        self.degraded
     }
 
     /// No chunk waits to be issued.
@@ -312,6 +480,8 @@ pub(crate) struct Shared {
     pub(crate) limits: Limits,
     /// The io_uring thread's wake-up: it waits in the kernel, not on `work`.
     pub(crate) eventfd: Option<OwnedFd>,
+    /// In-memory CRC32C table for end-to-end chunk integrity verification.
+    pub(crate) checksums: ChecksumTable,
 }
 
 impl Shared {
@@ -321,6 +491,7 @@ impl Shared {
             work: Condvar::new(),
             limits,
             eventfd,
+            checksums: ChecksumTable::new(),
         }
     }
 
@@ -417,6 +588,7 @@ mod tests {
             address: 0,
             len,
             buffer: 0,
+            issued_at: None,
         }
     }
 
@@ -473,12 +645,12 @@ mod tests {
         );
         let first = queues.next(LIMITS).unwrap();
         let second = queues.next(LIMITS).unwrap();
-        assert!(queues.finish(first, Err(IoError::Os(libc::EIO))).is_none());
+        assert!(queues.finish(first, Err(IoError::Os(libc::EIO))).is_empty());
         // The third chunk is no longer issued: the job failed.
         assert_eq!(queues.next(LIMITS), None);
-        let (done, report) = queues
-            .finish(second, Err(IoError::Os(libc::ENOSPC)))
-            .unwrap();
+        let mut finished = queues.finish(second, Err(IoError::Os(libc::ENOSPC)));
+        assert_eq!(finished.len(), 1);
+        let (done, report) = finished.pop().unwrap();
         done(report);
         assert_eq!(*seen.lock(), vec![Err(IoError::Os(libc::EIO))]);
         assert_eq!(queues.stats().failed_jobs, 1);
@@ -497,7 +669,9 @@ mod tests {
         let issued = queues.next(LIMITS).unwrap();
         assert!(queues.cancel(job).is_none());
         assert!(queues.drained());
-        let (_, report) = queues.finish(issued, Ok(())).unwrap();
+        let mut finished = queues.finish(issued, Ok(()));
+        assert_eq!(finished.len(), 1);
+        let (_, report) = finished.pop().unwrap();
         assert_eq!(report.outcome, Err(IoError::Cancelled));
         assert!(report.queued.is_some_and(|queued| queued <= report.elapsed));
     }
@@ -529,5 +703,103 @@ mod tests {
         let wait = bucket.take(100, start).unwrap_err();
         assert!((wait.as_secs_f64() - 0.1).abs() < 1e-9);
         assert_eq!(bucket.take(100, start + Duration::from_millis(100)), Ok(()));
+    }
+
+    #[test]
+    fn aimd_throttles_writes_on_high_read_p99_and_recovers_on_low_p99() {
+        let limits = Limits {
+            depth: 8,
+            write_depth: 4,
+        };
+        let mut aimd = ReadLatencyAimd::default();
+        let start = Instant::now();
+        assert_eq!(aimd.effective_write_depth(limits, true), 4);
+
+        // Feed 8 slow reads (5 ms) spanning the 100 ms window -> halve 4 -> 2.
+        for i in 0..AIMD_MIN_SAMPLES {
+            let t = start + Duration::from_millis((i as u64 + 1) * 15);
+            aimd.record_read(Duration::from_micros(5_000), t, limits.write_depth);
+        }
+        assert_eq!(aimd.effective_write_depth(limits, true), 2);
+
+        // Another slow window -> halve 2 -> 1.
+        let t2 = start + Duration::from_millis(200);
+        for i in 0..AIMD_MIN_SAMPLES {
+            let t = t2 + Duration::from_millis((i as u64 + 1) * 15);
+            aimd.record_read(Duration::from_micros(4_000), t, limits.write_depth);
+        }
+        assert_eq!(aimd.effective_write_depth(limits, true), 1);
+
+        // Another slow window -> halve 1 -> 0 while reads are pending, but keep
+        // 1 slot when reads are completely idle so background cleaning never
+        // deadlocks.
+        let t3 = start + Duration::from_millis(400);
+        for i in 0..AIMD_MIN_SAMPLES {
+            let t = t3 + Duration::from_millis((i as u64 + 1) * 15);
+            aimd.record_read(Duration::from_micros(4_000), t, limits.write_depth);
+        }
+        assert_eq!(aimd.effective_write_depth(limits, true), 0);
+        assert_eq!(aimd.effective_write_depth(limits, false), 1);
+
+        // Fast read window (200 us) -> additive recovery 0 -> 1.
+        let t4 = start + Duration::from_millis(600);
+        for i in 0..AIMD_MIN_SAMPLES {
+            let t = t4 + Duration::from_millis((i as u64 + 1) * 15);
+            aimd.record_read(Duration::from_micros(200), t, limits.write_depth);
+        }
+        assert_eq!(aimd.effective_write_depth(limits, true), 1);
+    }
+
+    #[test]
+    fn circuit_breaker_trips_after_consecutive_os_errors_and_fails_queued_jobs() {
+        let mut queues = Queues::default();
+        let now = Instant::now();
+        // Queue one extra job that will remain unissued when the breaker trips.
+        let (done_queued, seen_queued) = recorder();
+        queues.admit(Direction::Write, [chunk(Direction::Write, 1)], done_queued, now);
+        queues.release_write();
+
+        // Fail MAX_CONSECUTIVE_DISK_ERRORS reads consecutively.
+        let mut last_finished = Vec::new();
+        for _ in 0..MAX_CONSECUTIVE_DISK_ERRORS {
+            let (done, _) = recorder();
+            queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done, now);
+            let issued = queues.next(LIMITS).unwrap();
+            last_finished = queues.finish(issued, Err(IoError::Os(libc::EIO)));
+        }
+        assert!(queues.degraded());
+        assert!(queues.drained());
+        // Both the triggering read and the queued write were reported.
+        assert_eq!(last_finished.len(), 2);
+        report(last_finished);
+        assert_eq!(*seen_queued.lock(), vec![Err(IoError::Os(libc::EIO))]);
+        // No more work is dispatched once degraded.
+        let (done_after, _) = recorder();
+        queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done_after, now);
+        assert_eq!(queues.next(LIMITS), None);
+    }
+
+    #[test]
+    fn successful_io_resets_consecutive_os_error_counter() {
+        let mut queues = Queues::default();
+        let now = Instant::now();
+        for _ in 0..(MAX_CONSECUTIVE_DISK_ERRORS - 1) {
+            let (done, _) = recorder();
+            queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done, now);
+            let issued = queues.next(LIMITS).unwrap();
+            let _ = queues.finish(issued, Err(IoError::Os(libc::EIO)));
+        }
+        assert!(!queues.degraded());
+        // One healthy completion resets the streak.
+        let (done, _) = recorder();
+        queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done, now);
+        let issued = queues.next(LIMITS).unwrap();
+        let _ = queues.finish(issued, Ok(()));
+        // Another error does not trip the breaker.
+        let (done, _) = recorder();
+        queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done, now);
+        let issued = queues.next(LIMITS).unwrap();
+        let _ = queues.finish(issued, Err(IoError::Os(libc::EIO)));
+        assert!(!queues.degraded());
     }
 }

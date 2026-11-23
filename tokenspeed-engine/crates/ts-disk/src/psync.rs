@@ -24,6 +24,7 @@
 use std::{io, os::fd::RawFd, thread};
 
 use crate::{
+    checksum::ChecksumTable,
     dispatch::{self, Chunk, Shared},
     executor::{Direction, IoError},
     file::{DiskFile, ALIGNMENT},
@@ -47,14 +48,47 @@ pub(crate) fn run(shared: &Shared, file: &DiskFile) {
                 shared.work.wait(&mut queues);
             }
         };
-        let result = transfer(file.raw_fd(), chunk);
+        let result = transfer(file.raw_fd(), chunk, &shared.checksums);
         let finished = shared.queues.lock().finish(chunk, result);
         shared.work.notify_all();
-        dispatch::report(finished.into_iter().collect());
+        dispatch::report(finished);
     }
 }
 
-fn transfer(fd: RawFd, chunk: Chunk) -> Result<(), IoError> {
+fn transfer(fd: RawFd, chunk: Chunk, checksums: &ChecksumTable) -> Result<(), IoError> {
+    if chunk.direction == Direction::Write {
+        // SAFETY: the chunk lies in memory the executor's caller keeps mapped
+        // (`Executor::start`).
+        let slice = unsafe { std::slice::from_raw_parts(chunk.address as *const u8, chunk.len) };
+        checksums.record(chunk.file_offset, slice);
+    }
+    let result = transfer_raw(fd, chunk);
+    match (chunk.direction, &result) {
+        (Direction::Write, Err(_)) => {
+            checksums.invalidate(chunk.file_offset, chunk.len);
+        }
+        (Direction::Read, Ok(())) => {
+            // SAFETY: the read just completed into registered memory that stays
+            // mapped until close.
+            let slice =
+                unsafe { std::slice::from_raw_parts(chunk.address as *const u8, chunk.len) };
+            if let Err((expected, actual)) = checksums.verify(chunk.file_offset, slice) {
+                tracing::error!(
+                    file_offset = chunk.file_offset,
+                    len = chunk.len,
+                    expected = format_args!("{expected:#010x}"),
+                    actual = format_args!("{actual:#010x}"),
+                    "disk read CRC32C mismatch; dropping corrupted chunk"
+                );
+                return Err(IoError::ChecksumMismatch { expected, actual });
+            }
+        }
+        _ => {}
+    }
+    result
+}
+
+fn transfer_raw(fd: RawFd, chunk: Chunk) -> Result<(), IoError> {
     let base_offset =
         libc::off_t::try_from(chunk.file_offset).expect("files are below 2^63 bytes");
     let mut moved = 0usize;

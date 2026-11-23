@@ -116,6 +116,15 @@ pub enum IoError {
     /// issued. What was issued retired.
     #[error("the disk job was cancelled")]
     Cancelled,
+    /// A completed read did not match the CRC32C recorded when the chunk was
+    /// written, indicating silent data corruption on the storage device.
+    #[error("disk checksum mismatch: expected {expected:#010x}, got {actual:#010x}")]
+    ChecksumMismatch {
+        /// CRC32C recorded on write.
+        expected: u32,
+        /// CRC32C computed on read.
+        actual: u32,
+    },
 }
 
 /// The queues' state.
@@ -276,6 +285,7 @@ impl Pieces {
                 address,
                 len,
                 buffer: u16::try_from(index).expect("pieces fit u16"),
+                issued_at: None,
             });
             file_offset += len as u64;
             address += len;
@@ -434,7 +444,7 @@ impl Executor {
             );
         }
         let mut queues = self.shared.queues.lock();
-        if queues.closing() {
+        if queues.closing() || queues.degraded() {
             return Err(SubmitError::Closed);
         }
         let id = queues.admit(job.direction, chunks, Box::new(done), Instant::now());
@@ -466,6 +476,18 @@ impl Executor {
     /// so those jobs never report and their memory stays held.
     pub fn broken(&self) -> bool {
         self.shared.queues.lock().broken()
+    }
+
+    /// Whether the circuit breaker tripped after consecutive OS I/O errors;
+    /// new submissions are refused while in-flight requests finish retiring.
+    pub fn degraded(&self) -> bool {
+        self.shared.queues.lock().degraded()
+    }
+
+    /// Enable or disable in-memory CRC32C verification on chunk writes and
+    /// reads (enabled by default).
+    pub fn set_verify_checksums(&self, enabled: bool) {
+        self.shared.checksums.set_enabled(enabled);
     }
 
     /// Cancel what is queued, wait up to `timeout` for what is in flight to

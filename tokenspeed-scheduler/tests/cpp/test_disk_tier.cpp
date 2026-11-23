@@ -859,5 +859,36 @@ TEST(DiskTierConfigTest, DiskBlockIdsMustFitInt32) {
     EXPECT_THROW(config.Validate(), std::invalid_argument);
 }
 
+TEST(DiskTierTest, CleaningSkipsShortBranchesBelowMinCleanTokens) {
+    DiskConfig limits = Limits();
+    limits.min_clean_tokens = 12;  // Requires at least 3 pages of kGrain=4.
+    DiskTierCache cache(FullOnly(), /*disk_parents=*/16, limits);
+    const Prompt short_prompt(2, 1);  // 8 tokens < 12.
+    const std::vector<CacheKey> short_keys = cache.OnHostOnly(short_prompt);
+    cache.disks.QueueCleaning(short_keys);
+    cache.disks.StartCleaning();
+    EXPECT_TRUE(cache.disks.TakeCommands().empty());
+    EXPECT_EQ(cache.disks.DroppedCleanings(), 2u);
+
+    const Prompt long_prompt(4, 2);  // 16 tokens >= 12.
+    const std::vector<CacheKey> long_keys = cache.OnHostOnly(long_prompt);
+    // Queueing the leaf tip (token 16) still cleans all 4 ancestor pages.
+    const DiskOperation write = cache.Clean(std::span{long_keys}.last(1));
+    EXPECT_EQ(write.group_ids.size(), 4u);
+}
+
+TEST(DiskTierTest, CleaningSkipsSingleHitEntriesWhenReuseIsRequired) {
+    DiskConfig limits = Limits();
+    limits.require_reuse_for_cleaning = true;
+    DiskTierCache cache(FullOnly(), /*disk_parents=*/16, limits);
+    const Prompt prompt(2, 1);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    // Freshly published entries have `was_acquired == false`.
+    cache.disks.QueueCleaning(keys);
+    cache.disks.StartCleaning();
+    EXPECT_TRUE(cache.disks.TakeCommands().empty());
+    EXPECT_EQ(cache.disks.DroppedCleanings(), 2u);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

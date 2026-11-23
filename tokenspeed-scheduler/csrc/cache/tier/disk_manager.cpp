@@ -39,6 +39,9 @@ void DiskConfig::Validate() const {
     if (max_write_host_blocks > max_host_blocks) {
         throw std::invalid_argument("Disk tier write credits must not exceed its Host credits");
     }
+    if (min_clean_tokens < 0) {
+        throw std::invalid_argument("Disk tier min_clean_tokens must be non-negative");
+    }
 }
 
 DiskTransferManager::DiskTransferManager(CacheCoordinator& coordinator, DiskConfig config)
@@ -210,6 +213,26 @@ void DiskTransferManager::StartCleaning() {
         return keys;
     };
 
+    // Admission filter applied to the branch tip (`cleaning_.front()`): skips
+    // short branches and single-hit cold tails without breaking ancestor chains
+    // of qualifying long/reused branches.
+    const auto rejected_by_admission = [&](const CacheKey& key) {
+        if (config_.min_clean_tokens == 0 && !config_.require_reuse_for_cleaning) return false;
+        const auto loc = store.LocationOf(host_pool, key.group_id, key);
+        if (!loc) return true;
+        const auto meta = store.Groups()[key.group_id].Index().MetadataFor(host_pool, *loc);
+        if (!meta) return true;
+        if (config_.require_reuse_for_cleaning && !meta->eviction.was_acquired) return true;
+        if (config_.min_clean_tokens > 0 && meta->eviction.logical_block_index >= 0) {
+            const std::int32_t group_granularity = store.Groups()[key.group_id].Spec().block_granularity;
+            const std::int64_t span = group_granularity > 0 ? group_granularity : store.PrefixGranularity();
+            const std::int64_t branch_tokens =
+                (static_cast<std::int64_t>(meta->eviction.logical_block_index) + 1) * span;
+            if (branch_tokens < config_.min_clean_tokens) return true;
+        }
+        return false;
+    };
+
     Ticket ticket{.kind = DiskOpKind::kWrite};
     std::unordered_set<CacheKey, CacheKeyHash> chosen;
     while (!cleaning_.empty() && ticket.keys.size() < credits) {
@@ -217,6 +240,11 @@ void DiskTransferManager::StartCleaning() {
         const BoundaryTree::Node* node = store.Boundaries().Find(front.content_hash);
         if (node == nullptr || !dirty(front) || skip_cleaning(front) || chosen.contains(front)) {
             cleaning_.pop_front();
+            continue;
+        }
+        if (rejected_by_admission(front)) {
+            cleaning_.pop_front();
+            ++dropped_cleanings_;
             continue;
         }
         // The pages above it first, nearest the root first, so a cleaned page

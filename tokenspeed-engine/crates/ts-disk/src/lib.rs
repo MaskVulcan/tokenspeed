@@ -40,6 +40,7 @@
 // writes memory by address.
 #![allow(unsafe_code)]
 
+mod checksum;
 mod dispatch;
 pub mod executor;
 pub mod file;
