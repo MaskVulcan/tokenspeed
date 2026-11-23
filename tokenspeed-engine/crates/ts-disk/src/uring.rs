@@ -37,17 +37,27 @@ use io_uring::{opcode, squeue, types, IoUring};
 use crate::{
     dispatch::{self, Chunk, Shared},
     executor::{Direction, IoError, Pieces},
-    file::DiskFile,
+    file::{DiskFile, ALIGNMENT},
 };
 
 /// The user data of the eventfd read; requests use their slot index.
 const WAKE_UP: u64 = u64::MAX;
+
+/// Upper bound on transient `EINTR`/`EAGAIN` retries per chunk so a broken
+/// device cannot livelock `Executor::close`.
+const MAX_TRANSIENT_RETRIES: u8 = 16;
+
+/// Linux `ioprio` encoding (`class << 13 | level`): foreground reads run at
+/// best-effort level 0, background cleaning writes at idle class.
+const IOPRIO_READ: u16 = 2 << 13;
+const IOPRIO_WRITE: u16 = 3 << 13;
 
 /// One in-flight request in a ring slot, tracking progress across short I/Os.
 #[derive(Clone, Copy)]
 struct InFlight {
     chunk: Chunk,
     done: usize,
+    retries: u8,
 }
 
 pub(crate) struct Ring {
@@ -55,6 +65,29 @@ pub(crate) struct Ring {
     fd: RawFd,
     depth: usize,
     fixed_buffers: bool,
+    r_disabled: bool,
+}
+
+fn build_ring(entries: u32) -> io::Result<(IoUring, bool)> {
+    // Linux >= 6.1: bind single-issuer ownership when `Ring::run` activates on
+    // its dedicated worker thread, avoiding cross-thread kernel ring locks.
+    match IoUring::builder()
+        .setup_single_issuer()
+        .setup_defer_taskrun()
+        .setup_r_disabled()
+        .build(entries)
+    {
+        Ok(ring) => return Ok((ring, true)),
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
+        Err(error) => return Err(error),
+    }
+    // Linux 5.19..6.0 fallback: cooperative task_work without IPI interrupts.
+    match IoUring::builder().setup_coop_taskrun().build(entries) {
+        Ok(ring) => return Ok((ring, false)),
+        Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
+        Err(error) => return Err(error),
+    }
+    Ok((IoUring::new(entries)?, false))
 }
 
 impl Ring {
@@ -62,7 +95,7 @@ impl Ring {
         // One entry beyond the requests for the armed wake-up read.
         let entries = u32::try_from((depth + 1).next_power_of_two())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let ring = IoUring::new(entries)?;
+        let (ring, r_disabled) = build_ring(entries)?;
         let buffers: Vec<libc::iovec> = pieces
             .iter()
             .map(|(start, end)| libc::iovec {
@@ -73,19 +106,21 @@ impl Ring {
         // SAFETY: the executor's caller keeps the memory mapped until close
         // succeeds (`Executor::start`), and a failed close leaks this ring.
         // Fall back to ordinary direct-I/O Read/Write when fixed-buffer
-        // registration hits RLIMIT_MEMLOCK (ENOMEM) or VM_PFNMAP/THP (EFAULT/EINVAL).
+        // registration hits RLIMIT_MEMLOCK (ENOMEM/EPERM), VM_PFNMAP/THP
+        // (EFAULT/EINVAL), or buffer count limits (E2BIG).
         let fixed_buffers = match unsafe { ring.submitter().register_buffers(&buffers) } {
             Ok(()) => true,
             Err(error)
                 if matches!(
                     error.raw_os_error(),
-                    Some(libc::ENOMEM | libc::EFAULT | libc::EINVAL)
+                    Some(libc::ENOMEM | libc::EFAULT | libc::EINVAL | libc::E2BIG | libc::EPERM)
                 ) =>
             {
                 tracing::warn!(
                     %error,
                     pieces = buffers.len(),
-                    "io_uring register_buffers failed; falling back to non-fixed O_DIRECT ops"
+                    "io_uring register_buffers failed (check RLIMIT_MEMLOCK / THP); \
+                     falling back to non-fixed O_DIRECT ops"
                 );
                 false
             }
@@ -96,10 +131,20 @@ impl Ring {
             fd: file.raw_fd(),
             depth,
             fixed_buffers,
+            r_disabled,
         })
     }
 
     pub(crate) fn run(mut self, shared: &Shared) {
+        if self.r_disabled {
+            if let Err(error) = self.ring.submitter().register_enable_rings() {
+                tracing::error!(%error, "io_uring register_enable_rings failed");
+                let finished = shared.queues.lock().break_down();
+                shared.wake();
+                dispatch::report(finished);
+                return;
+            }
+        }
         let eventfd = shared
             .eventfd
             .as_ref()
@@ -116,7 +161,7 @@ impl Ring {
             {
                 let mut queues = shared.queues.lock();
                 let mut submission = self.ring.submission();
-                if !armed {
+                if !armed && !submission.is_full() {
                     let read = opcode::Read::new(
                         types::Fd(eventfd),
                         (&mut *counter as *mut u64).cast(),
@@ -128,11 +173,18 @@ impl Ring {
                     unsafe { submission.push(&read) }.expect("the ring has room for the wake-up");
                     armed = true;
                 }
-                while let Some(&slot) = free.last() {
+                while !submission.is_full() {
+                    let Some(&slot) = free.last() else {
+                        break;
+                    };
                     let inflight = match retries.pop_front() {
                         Some(inflight) => inflight,
                         None => match queues.next(shared.limits) {
-                            Some(chunk) => InFlight { chunk, done: 0 },
+                            Some(chunk) => InFlight {
+                                chunk,
+                                done: 0,
+                                retries: 0,
+                            },
                             None => break,
                         },
                     };
@@ -187,7 +239,14 @@ impl Ring {
                         .expect("a completion of an issued request");
                     free.push(slot);
                     if result == -libc::EINTR || result == -libc::EAGAIN {
-                        retries.push_back(inflight);
+                        if inflight.retries < MAX_TRANSIENT_RETRIES {
+                            inflight.retries += 1;
+                            retries.push_back(inflight);
+                        } else {
+                            finished.extend(
+                                queues.finish(inflight.chunk, Err(IoError::Os(-result))),
+                            );
+                        }
                         continue;
                     }
                     let remaining = inflight.chunk.len - inflight.done;
@@ -207,11 +266,29 @@ impl Ring {
                             ));
                         }
                         Ok(n) if n < remaining => {
-                            inflight.done += n;
-                            retries.push_back(inflight);
+                            let next_done = inflight.done + n;
+                            if n % ALIGNMENT != 0 {
+                                // O_DIRECT cannot resume from an unaligned offset.
+                                finished.extend(queues.finish(
+                                    inflight.chunk,
+                                    Err(IoError::Short {
+                                        expected: inflight.chunk.len,
+                                        done: next_done,
+                                    }),
+                                ));
+                            } else {
+                                inflight.done = next_done;
+                                inflight.retries = 0;
+                                retries.push_back(inflight);
+                            }
+                        }
+                        Ok(n) if n == remaining => {
+                            finished.extend(queues.finish(inflight.chunk, Ok(())));
                         }
                         Ok(_) => {
-                            finished.extend(queues.finish(inflight.chunk, Ok(())));
+                            finished.extend(
+                                queues.finish(inflight.chunk, Err(IoError::Os(libc::EIO))),
+                            );
                         }
                     }
                 }
@@ -234,19 +311,23 @@ fn request(fd: RawFd, inflight: InFlight, fixed_buffers: bool) -> squeue::Entry 
         (Direction::Read, true) => {
             opcode::ReadFixed::new(types::Fd(fd), address as *mut u8, len, chunk.buffer)
                 .offset(file_offset)
+                .ioprio(IOPRIO_READ)
                 .build()
         }
         (Direction::Write, true) => {
             opcode::WriteFixed::new(types::Fd(fd), address as *const u8, len, chunk.buffer)
                 .offset(file_offset)
+                .ioprio(IOPRIO_WRITE)
                 .build()
         }
         (Direction::Read, false) => opcode::Read::new(types::Fd(fd), address as *mut u8, len)
             .offset(file_offset)
+            .ioprio(IOPRIO_READ)
             .build(),
         (Direction::Write, false) => {
             opcode::Write::new(types::Fd(fd), address as *const u8, len)
                 .offset(file_offset)
+                .ioprio(IOPRIO_WRITE)
                 .build()
         }
     }

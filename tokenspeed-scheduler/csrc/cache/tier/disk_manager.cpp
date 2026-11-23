@@ -109,18 +109,23 @@ DiskOperation DiskTransferManager::command(std::uint64_t id, const Ticket& ticke
     return op;
 }
 
-StorageLease DiskTransferManager::StartRead(const PromptPrefix& prompt) {
-    if (operations_.size() >= static_cast<std::size_t>(config_.max_operations)) return {};
+DiskTransferManager::ReadStartResult DiskTransferManager::TryStartRead(const PromptPrefix& prompt) {
+    if (!HasReadCredits()) return {.retryable = true};
     const std::size_t held = NumHeldHostBlocks();
     const auto limit = static_cast<std::size_t>(config_.max_host_blocks);
-    if (held >= limit) return {};
     const std::vector<CacheKey> hits = coordinator_.Disk().PrefixHits(prompt);
-    if (hits.empty()) return {};
+    if (hits.empty()) return {.retryable = false};
     // The Disk's keys stand in as Host hits for the Host-suffix probe; every
     // key the boundary needs and the Host lacks is then one the Disk holds.
-    StorageReservation reservation = coordinator_.Storage().ReserveStoragePrefix(
-        prompt, hits, std::min(limit - held, static_cast<std::size_t>(config_.max_blocks_per_operation)));
-    if (reservation.keys.empty()) return {};
+    const std::size_t available_blocks = limit - held;
+    const auto max_op_blocks = static_cast<std::size_t>(config_.max_blocks_per_operation);
+    StorageReservation reservation =
+        coordinator_.Storage().ReserveStoragePrefix(prompt, hits, std::min(available_blocks, max_op_blocks));
+    if (reservation.keys.empty()) {
+        // If Host-block credits were partially consumed by other in-flight
+        // operations, let the caller retry once credits return.
+        return {.retryable = available_blocks < max_op_blocks && held > 0};
+    }
     Ticket ticket{.kind = DiskOpKind::kRead,
                   .keys = std::move(reservation.keys),
                   .host_blocks = std::move(reservation.blocks),
@@ -136,7 +141,11 @@ StorageLease DiskTransferManager::StartRead(const PromptPrefix& prompt) {
     const std::uint64_t id = nextId();
     commands_.push_back(command(id, ticket));
     operations_.emplace(id, std::move(ticket));
-    return StorageLease{*this, id};
+    return {.lease = StorageLease{*this, id}, .retryable = false};
+}
+
+StorageLease DiskTransferManager::StartRead(const PromptPrefix& prompt) {
+    return TryStartRead(prompt).lease;
 }
 
 void DiskTransferManager::QueueCleaning(std::span<const CacheKey> keys) {
@@ -180,12 +189,23 @@ void DiskTransferManager::StartCleaning() {
         return coordinator_.Host().ContainsHostCachedBlock(key) && !coordinator_.Disk().ContainsDiskCachedBlock(key) &&
                !writing.contains(key);
     };
-    // The dirty Host entries of a boundary node, every group's.
+    const auto skip_cleaning = [&](const CacheKey& key) {
+        const auto loc = store.LocationOf(host_pool, key.group_id, key);
+        if (!loc) return true;
+        const auto meta = store.Groups()[key.group_id].Index().MetadataFor(host_pool, *loc);
+        return !meta || coordinator_.Evictor().IsDemotedEntry(*meta) ||
+               meta->eviction.last_access_epoch == CacheStore::kSupersededAccessEpoch;
+    };
+    // The dirty Host entries of a boundary node, every group's. Skip demoted or
+    // superseded State checkpoints, while keeping ancestor KV entries needed by
+    // non-demoted descendants so no prefix gap opens.
     const auto dirty_keys_of = [&](const BoundaryTree::Node& node) {
         std::vector<CacheKey> keys;
         for (const CacheStore::NodeEntry& entry : store.NodeEntries(host_pool, node)) {
             std::optional<CacheKey> key = store.Groups()[entry.group_id].Index().KeyOf(host_pool, entry.location);
-            if (key && dirty(*key)) keys.push_back(std::move(*key));
+            if (!key || !dirty(*key)) continue;
+            if (store.GroupIsState(entry.group_id) && skip_cleaning(*key)) continue;
+            keys.push_back(std::move(*key));
         }
         return keys;
     };
@@ -195,7 +215,7 @@ void DiskTransferManager::StartCleaning() {
     while (!cleaning_.empty() && ticket.keys.size() < credits) {
         const CacheKey front = cleaning_.front();
         const BoundaryTree::Node* node = store.Boundaries().Find(front.content_hash);
-        if (node == nullptr || !dirty(front) || chosen.contains(front)) {
+        if (node == nullptr || !dirty(front) || skip_cleaning(front) || chosen.contains(front)) {
             cleaning_.pop_front();
             continue;
         }

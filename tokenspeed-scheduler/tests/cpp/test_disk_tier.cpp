@@ -814,5 +814,50 @@ TEST(DiskTierTest, CleaningReservesOperationSlotsForForegroundReads) {
     EXPECT_TRUE(cache.disks.HasReadCredits());
 }
 
+TEST(DiskTierTest, TryStartReadMarksPartialHostCreditExhaustionRetryable) {
+    DiskConfig limits = Limits();
+    limits.max_operations = 4;
+    limits.max_blocks_per_operation = 8;
+    limits.max_host_blocks = 5;
+    limits.max_write_host_blocks = 5;
+    DiskTierCache cache(FullAndState(), /*disk_parents=*/16, limits);
+    const Prompt first(3, 1);
+    const Prompt second(3, 2);
+    const std::vector<CacheKey> first_keys = cache.OnHostOnly(first);
+    const std::vector<CacheKey> second_keys = cache.OnHostOnly(second);
+    const DiskOperation w1 = cache.Clean(first_keys);
+    cache.disks.Complete(cache::DiskDone{.op_id = w1.op_id, .success = true});
+    const DiskOperation w2 = cache.Clean(second_keys);
+    cache.disks.Complete(cache::DiskDone{.op_id = w2.op_id, .success = true});
+    cache.EvictFromHost(first_keys);
+    cache.EvictFromHost(second_keys);
+
+    // First read consumes 4 of 5 Host blocks, leaving 1 block (< 4 needed for
+    // the second Full+State prompt).
+    const DiskTransferManager::ReadStartResult r1 = cache.disks.TryStartRead(first.Prefix());
+    ASSERT_TRUE(r1.lease);
+    const DiskTransferManager::ReadStartResult r2 = cache.disks.TryStartRead(second.Prefix());
+    EXPECT_FALSE(r2.lease);
+    EXPECT_TRUE(r2.retryable);
+}
+
+TEST(DiskTierConfigTest, DiskBlockIdsMustFitInt32) {
+    SchedulerConfig config{};
+    config.prefix_granularity = 4;
+    config.device_allocator.total_pages = 9;
+    config.host_allocator.total_pages = 9;
+    config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+    config.max_scheduled_tokens = 64;
+    config.max_batch_size = 4;
+    config.max_resident_requests = 4;
+    config.cache_groups.push_back(
+        CacheGroupConfig{.group_id = "full", .block_granularity = 4, .total_pages = 9, .attn_kind = AttnKind::kFull});
+    config.host_group_packing = {4};
+    SetTestSnapshotPool(config);
+    config.disk_allocator.total_pages = (std::numeric_limits<std::int32_t>::max() / 4) + 2;
+    config.disk_config = Limits();
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

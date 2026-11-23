@@ -21,13 +21,17 @@
 //! The thread-pool backend, for hosts whose policy refuses io_uring: each
 //! of `queue_depth` threads issues one blocking `pread`/`pwrite` at a time.
 
-use std::{io, os::fd::RawFd};
+use std::{io, os::fd::RawFd, thread};
 
 use crate::{
     dispatch::{self, Chunk, Shared},
     executor::{Direction, IoError},
-    file::DiskFile,
+    file::{DiskFile, ALIGNMENT},
 };
+
+/// Upper bound on transient `EINTR`/`EAGAIN` retries per chunk so a broken
+/// device cannot livelock `Executor::close`.
+const MAX_TRANSIENT_RETRIES: u8 = 16;
 
 pub(crate) fn run(shared: &Shared, file: &DiskFile) {
     loop {
@@ -54,6 +58,7 @@ fn transfer(fd: RawFd, chunk: Chunk) -> Result<(), IoError> {
     let base_offset =
         libc::off_t::try_from(chunk.file_offset).expect("files are below 2^63 bytes");
     let mut moved = 0usize;
+    let mut retries = 0u8;
     while moved < chunk.len {
         let remaining = chunk.len - moved;
         let offset = base_offset + moved as libc::off_t;
@@ -79,7 +84,11 @@ fn transfer(fd: RawFd, chunk: Chunk) -> Result<(), IoError> {
             let errno = io::Error::last_os_error()
                 .raw_os_error()
                 .unwrap_or(libc::EIO);
-            if errno == libc::EINTR || errno == libc::EAGAIN {
+            if (errno == libc::EINTR || errno == libc::EAGAIN) && retries < MAX_TRANSIENT_RETRIES {
+                retries += 1;
+                if errno == libc::EAGAIN {
+                    thread::yield_now();
+                }
                 continue;
             }
             return Err(IoError::Os(errno));
@@ -90,7 +99,19 @@ fn transfer(fd: RawFd, chunk: Chunk) -> Result<(), IoError> {
                 done: moved,
             });
         }
+        if done > remaining {
+            return Err(IoError::Os(libc::EIO));
+        }
         moved += done;
+        retries = 0;
+        // O_DIRECT cannot resume from an unaligned offset; report the real
+        // short I/O rather than letting the next syscall fail with EINVAL.
+        if moved < chunk.len && done % ALIGNMENT != 0 {
+            return Err(IoError::Short {
+                expected: chunk.len,
+                done: moved,
+            });
+        }
     }
     Ok(())
 }

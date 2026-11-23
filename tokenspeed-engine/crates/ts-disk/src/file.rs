@@ -80,10 +80,11 @@ impl DiskFile {
         if size == 0 || size % ALIGNMENT as u64 != 0 {
             return Err(FileError::Size(size));
         }
+        let is_dev_path = path.starts_with("/dev/");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(!is_dev_path)
             .truncate(false)
             .mode(0o600)
             .custom_flags(libc::O_DIRECT)
@@ -98,14 +99,16 @@ impl DiskFile {
         })?;
         if meta.file_type().is_block_device() {
             // Raw NVMe / LVM block devices do not support `fallocate`; verify
-            // the device capacity covers `size`.
-            let dev_size = block_device_size(file.as_raw_fd()).map_err(|source| {
-                FileError::Allocate {
+            // both device capacity and logical sector alignment up front.
+            let (dev_size, sector_size) =
+                block_device_geometry(file.as_raw_fd()).map_err(|source| FileError::Allocate {
                     path: path.to_owned(),
                     size,
                     source,
-                }
-            })?;
+                })?;
+            if sector_size > ALIGNMENT || size % sector_size as u64 != 0 {
+                return Err(FileError::Size(size));
+            }
             if dev_size < size {
                 return Err(FileError::Allocate {
                     path: path.to_owned(),
@@ -113,9 +116,10 @@ impl DiskFile {
                     source: io::Error::from_raw_os_error(libc::ENOSPC),
                 });
             }
-        } else {
-            // Allocate the extents now, so a write never fails for space and
-            // never pays for allocation.
+        } else if meta.len() < size {
+            // Allocate the extents once; skip `fallocate` when reusing an
+            // existing file that already covers `size` so written extents stay
+            // converted across restarts.
             // SAFETY: fallocate on a descriptor this function owns; no memory
             // is involved.
             if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, length) } != 0 {
@@ -149,18 +153,31 @@ impl DiskFile {
 }
 
 #[cfg(target_os = "linux")]
-fn block_device_size(fd: RawFd) -> io::Result<u64> {
-    // Linux `BLKGETSIZE64` = `_IOR(0x12, 114, size_t)` = 0x8008_1272.
-    const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
+fn block_device_geometry(fd: RawFd) -> io::Result<(u64, usize)> {
+    // `_IOR(0x12, 114, size_t)` for `BLKGETSIZE64`, `_IO(0x12, 104)` for `BLKSSZGET`.
+    const BLKGETSIZE64: libc::Ioctl = ((2u32 << 30)
+        | ((std::mem::size_of::<usize>() as u32) << 16)
+        | (0x12u32 << 8)
+        | 114) as libc::Ioctl;
+    const BLKSSZGET: libc::Ioctl = 0x1268 as libc::Ioctl;
     let mut bytes: u64 = 0;
     // SAFETY: `BLKGETSIZE64` writes a `u64` byte length into `bytes`.
-    if unsafe { libc::ioctl(fd, BLKGETSIZE64 as _, &mut bytes) } != 0 {
+    if unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut bytes) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(bytes)
+    let mut sector_size: libc::c_int = 0;
+    // SAFETY: `BLKSSZGET` writes a `c_int` logical sector size into `sector_size`.
+    if unsafe { libc::ioctl(fd, BLKSSZGET, &mut sector_size) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let align = usize::try_from(sector_size)
+        .ok()
+        .filter(|&s| s > 0 && s.is_power_of_two())
+        .unwrap_or(ALIGNMENT);
+    Ok((bytes, align))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn block_device_size(_fd: RawFd) -> io::Result<u64> {
+fn block_device_geometry(_fd: RawFd) -> io::Result<(u64, usize)> {
     Err(io::Error::from_raw_os_error(libc::ENOTSUP))
 }

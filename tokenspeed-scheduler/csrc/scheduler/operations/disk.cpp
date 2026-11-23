@@ -84,13 +84,19 @@ void Scheduler::prepareDisk(Request& request) {
 
     auto* admission = request.AdmissionResourcesPtr();
     if (admission == nullptr || admission->storage_prepared || !storage_allowed_) return;
+    // Decode receives its prompt from its PD peer.
+    if (config_.role == Role::kD) {
+        admission->storage_prepared = true;
+        return;
+    }
     // If Disk operation or Host-block credits are temporarily exhausted, leave
     // `storage_prepared` unset so a still-queued request can retry on a later
     // tick instead of permanently falling back to recomputation.
     if (!disk_transfers_->HasReadCredits()) return;
-    admission->storage_prepared = true;
-    // Decode receives its prompt from its PD peer.
-    if (config_.role == Role::kD) return;
+    if (coordinator_.Disk().NumDiskCachedBlocks() == 0) {
+        admission->storage_prepared = true;
+        return;
+    }
     const auto grain = config_.prefix_granularity;
     const auto max_tokens = cacheablePrefixTokens(request);
     const auto cached_hashes = request.PromptPrefixHashes(max_tokens / grain);
@@ -109,15 +115,23 @@ void Scheduler::prepareDisk(Request& request) {
                         .shared_prefix_tokens = request.SharedPrefixTokens()};
     const PrefixProbe probe = coordinator_.Prober().ProbePromptPrefix(prompt);
     const auto local = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
-    if (max_tokens - local < limits.min_prefetch_tokens) return;
+    if (max_tokens - local < limits.min_prefetch_tokens) {
+        admission->storage_prepared = true;
+        return;
+    }
     prompt.prepared_keys = probe.group_keys;
-    StorageLease lease = disk_transfers_->StartRead(prompt);
-    if (!lease) return;
+    DiskTransferManager::ReadStartResult started = disk_transfers_->TryStartRead(prompt);
+    if (!started.lease) {
+        if (!started.retryable) admission->storage_prepared = true;
+        return;
+    }
+    admission->storage_prepared = true;
     spdlog::debug("[Disk] rid={} op_id={} local_tokens={} bound_tokens={} prefetch read enqueued", request.Id(),
-                  lease.OperationId(), local, max_tokens);
+                  started.lease.OperationId(), local, max_tokens);
     const auto deadline =
         storage_now_us_ + std::min(limits.wait_timeout_us, std::numeric_limits<std::int64_t>::max() - storage_now_us_);
-    request.Apply(fsm::StartPrefetchEvent{std::move(lease), deadline, std::move(hashes), max_tokens, std::move(tail)});
+    request.Apply(
+        fsm::StartPrefetchEvent{std::move(started.lease), deadline, std::move(hashes), max_tokens, std::move(tail)});
 }
 
 }  // namespace tokenspeed
