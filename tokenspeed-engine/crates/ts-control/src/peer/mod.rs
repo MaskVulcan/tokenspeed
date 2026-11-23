@@ -61,7 +61,7 @@ use crate::{
     peer::{
         geometry::{push_items, read_spans, split_spans_by_mr, RankGeometry},
         landing::{Action, Landing, Timeouts},
-        net::{Inbound, PeerNet},
+        net::{split_endpoint, Inbound, PeerNet},
         push::PagePusher,
         read::{PageReader, PushJob, ReadJob, Reads},
         servicer::{empty_event, Holder},
@@ -73,6 +73,47 @@ const READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 const DEFAULT_HOLDER_FAIL_THRESHOLD: u32 = 3;
 const DEFAULT_HOLDER_COOLDOWN_S: f64 = 30.0;
 const COOLDOWN_WARN_INTERVAL_US: i64 = 5_000_000;
+
+fn parse_disable_same_node_value(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn parse_disable_same_node_env() -> bool {
+    let raw = std::env::var("TOKENSPEED_PEER_DISABLE_SAME_NODE").ok();
+    parse_disable_same_node_value(raw.as_deref())
+}
+
+fn endpoint_host(endpoint: &str) -> Option<&str> {
+    let address = endpoint
+        .split_once('/')
+        .map_or(endpoint, |(address, _)| address);
+    let (host, _port) = split_endpoint(address).ok()?;
+    Some(host)
+}
+
+fn same_peer_host(a: &str, b: &str) -> bool {
+    let (Some(ha), Some(hb)) = (endpoint_host(a), endpoint_host(b)) else {
+        return false;
+    };
+    let canon_ip = |host: &str| -> Option<std::net::IpAddr> {
+        match host.parse::<std::net::IpAddr>().ok()? {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(std::net::IpAddr::V4)
+                .or(Some(std::net::IpAddr::V6(v6))),
+            ip => Some(ip),
+        }
+    };
+    match (canon_ip(ha), canon_ip(hb)) {
+        (Some(ia), Some(ib)) => ia == ib,
+        _ => ha.eq_ignore_ascii_case(hb),
+    }
+}
 
 fn parse_holder_circuit_breaker_values(
     threshold: Option<&str>,
@@ -413,6 +454,9 @@ pub struct Peer {
     read_metrics: Option<Arc<ts_metrics::PeerMetrics>>,
     // Only the endpoint owner measures logical attempts.
     lookup_times: HashMap<u64, (String, Instant, i64)>,
+    /// Unconditional lookup deadline tracker (`lease_id -> (holder, deadline_us)`),
+    /// kept identical across all replica members so lookup timeouts trip `holder_health`.
+    pending_lookups: BTreeMap<u64, (String, i64)>,
     decisions: Vec<(String, &'static str)>,
     next_sample_us: i64,
     previous_totals: [u64; 2],
@@ -424,7 +468,9 @@ pub struct Peer {
     holder_fail_threshold: u32,
     /// Holder cooldown window in microseconds.
     holder_cooldown_us: i64,
-    /// Synthetic miss answers for lookups short-circuited by holder cooldown.
+    /// Worker-side guard short-circuiting same-host peer lookups (`TOKENSPEED_PEER_DISABLE_SAME_NODE`).
+    disable_same_node: bool,
+    /// Synthetic miss answers for lookups short-circuited by holder cooldown or same-node guard.
     cooldown_answers: Vec<PeerEventView>,
 }
 
@@ -453,6 +499,7 @@ impl Peer {
             .map(|listener| start_endpoint(&settings, replica, listener, scheduler))
             .transpose()?;
         let (holder_fail_threshold, holder_cooldown_us) = parse_holder_circuit_breaker_env();
+        let disable_same_node = parse_disable_same_node_env();
         Ok(Self {
             identity: settings.identity(),
             settings,
@@ -472,6 +519,7 @@ impl Peer {
             metrics: None,
             read_metrics: None,
             lookup_times: HashMap::new(),
+            pending_lookups: BTreeMap::new(),
             decisions: Vec::new(),
             next_sample_us: 0,
             previous_totals: [0; 2],
@@ -480,6 +528,7 @@ impl Peer {
             holder_health: HashMap::new(),
             holder_fail_threshold,
             holder_cooldown_us,
+            disable_same_node,
             cooldown_answers: Vec::new(),
         })
     }
@@ -489,6 +538,45 @@ impl Peer {
     pub fn set_holder_circuit_breaker(&mut self, fail_threshold: u32, cooldown: Duration) {
         self.holder_fail_threshold = fail_threshold;
         self.holder_cooldown_us = i64::try_from(cooldown.as_micros()).unwrap_or(i64::MAX);
+    }
+
+    /// Override the worker-side same-node peer lookup guard.
+    pub fn set_disable_same_node(&mut self, disable: bool) {
+        self.disable_same_node = disable;
+    }
+
+    /// Drain queued holder changes on the endpoint owner (empty on other members).
+    pub fn take_holder_changes(&self) -> Vec<PeerEventView> {
+        self.endpoint
+            .as_ref()
+            .map_or_else(Vec::new, |endpoint| endpoint.holder.lock().take_changes())
+    }
+
+    /// Encode holder changes for intra-replica broadcast.
+    pub fn encode_changes(changes: &[PeerEventView]) -> Vec<u8> {
+        if changes.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Writer::new();
+        out.count(changes.len());
+        for change in changes {
+            write_change(&mut out, change);
+        }
+        out.finish()
+    }
+
+    /// Decode holder changes from intra-replica broadcast.
+    pub fn decode_changes(bytes: &[u8]) -> Result<Vec<PeerEventView>, PeerError> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut reader = Reader::new(bytes);
+        let count = reader.count().ok_or(PeerError::Report)?;
+        let mut changes = Vec::with_capacity(count.min(1 << 16));
+        for _ in 0..count {
+            changes.push(read_change(&mut reader).ok_or(PeerError::Report)?);
+        }
+        reader.finish(changes).ok_or(PeerError::Report)
     }
 
     /// Inspect `(consecutive_failures, cooldown_until_us)` for `holder`.
@@ -587,6 +675,18 @@ impl Peer {
         for reply in &first.replies {
             self.take_reply(reply, now_us, &mut events, &mut actions);
         }
+        let mut timed_out_holders = Vec::new();
+        self.pending_lookups.retain(|_, (holder, deadline_us)| {
+            if now_us < *deadline_us {
+                true
+            } else {
+                timed_out_holders.push(holder.clone());
+                false
+            }
+        });
+        for holder in timed_out_holders {
+            self.record_holder_read_failure(&holder, now_us);
+        }
         if let Some(metrics) = &self.metrics {
             self.lookup_times.retain(|_, (rid, start, deadline)| {
                 if now_us < *deadline {
@@ -597,24 +697,13 @@ impl Peer {
                 false
             });
         }
-        let mut read_results: Vec<(String, bool)> = Vec::new();
         for (member, report) in reports.iter().enumerate() {
             for (request, ok) in &report.outcomes {
                 if let Some(landing) = self.landings.get_mut(request) {
                     if let Some(action) = landing.read(member, *ok, now_us) {
-                        if let Action::SendRelease { demote } = action {
-                            read_results.push((landing.fetch().holder.clone(), demote));
-                        }
                         actions.push((request.clone(), action));
                     }
                 }
-            }
-        }
-        for (holder, ok) in read_results {
-            if ok {
-                self.record_holder_read_success(&holder);
-            } else {
-                self.record_holder_read_failure(&holder, now_us);
             }
         }
         for (request, landing) in &mut self.landings {
@@ -635,6 +724,12 @@ impl Peer {
         for (request, num_tokens) in done {
             tracing::debug!(request, num_tokens, "peer landing done");
             let landing = self.landings.remove(&request).expect("finished landing");
+            let holder_name = landing.fetch().holder.clone();
+            if num_tokens == landing.fetch().end_tokens {
+                self.record_holder_read_success(&holder_name);
+            } else {
+                self.record_holder_read_failure(&holder_name, now_us);
+            }
             if self.metrics.is_some()
                 && self.member == 0
                 && num_tokens == landing.fetch().end_tokens
@@ -704,6 +799,21 @@ impl Peer {
         }
         self.send(actions, now_us);
         for lookup in lookups {
+            if self.disable_same_node && same_peer_host(&lookup.holder, &self.settings.name) {
+                self.cooldown_answers.push(PeerEventView {
+                    kind: PeerEventKind::LookupAnswered,
+                    lease: lookup.lease,
+                    num_tokens: 0,
+                    ..empty_event()
+                });
+                if self.member == 0 {
+                    self.decisions.push((lookup.request_id, "same_node_disabled"));
+                    if let Some(metrics) = &self.metrics {
+                        metrics.stage("lookup", "same_node_disabled", 0.0);
+                    }
+                }
+                continue;
+            }
             if self.is_holder_in_cooldown(&lookup.holder, now_us) {
                 self.cooldown_answers.push(PeerEventView {
                     kind: PeerEventKind::LookupAnswered,
@@ -719,6 +829,8 @@ impl Peer {
                 }
                 continue;
             }
+            self.pending_lookups
+                .insert(lookup.lease.id, (lookup.holder.clone(), lookup.deadline_us));
             if let Some(endpoint) = &self.endpoint {
                 if self.metrics.is_some() {
                     self.lookup_times.insert(
@@ -757,6 +869,9 @@ impl Peer {
         self.identity = self.settings.identity();
         self.layouts.clear();
         self.asked.clear();
+        self.pending_lookups.clear();
+        self.holder_health.clear();
+        self.cooldown_answers.clear();
         if let Some(endpoint) = &self.endpoint {
             endpoint.holder.lock().set_identity(self.identity.clone());
         }
@@ -796,6 +911,7 @@ impl Peer {
                 let trusted = self.trust(stamp);
                 match answer.kind {
                     PeerAnswerKind::Lookup => {
+                        self.pending_lookups.remove(&answer.lease.id);
                         if let (Some(metrics), Some((rid, start, _))) =
                             (&self.metrics, self.lookup_times.remove(&answer.lease.id))
                         {
@@ -1074,9 +1190,11 @@ impl Peer {
             }
             true
         } else {
-            // Cooldown expired: allow a half-open probe; keep consecutive_failures
-            // until the probe succeeds so a still-broken holder re-enters cooldown.
-            health.cooldown_until_us = None;
+            // Cooldown expired: allow a single half-open probe and re-arm a
+            // probe guard window (`3 * answer_us`) so concurrent lookups do not
+            // stampede before the probe completes and clears `holder_health`.
+            let probe_guard_us = self.settings.timeouts.answer_us.saturating_mul(3);
+            health.cooldown_until_us = Some(now_us.saturating_add(probe_guard_us));
             false
         }
     }
@@ -1106,6 +1224,13 @@ fn start_endpoint(
             .spawn(move || {
                 for frames in received {
                     match Inbound::decode(&frames) {
+                        Ok(Inbound::Request(Request::Layout { reply_to })) => {
+                            let reply = holder.lock().layout_reply();
+                            let Some(net) = net.upgrade() else { return };
+                            if let Err(error) = net.reply(&reply_to, &reply) {
+                                tracing::warn!(to = reply_to, %error, "peer layout reply not sent");
+                            }
+                        }
                         Ok(Inbound::Request(request)) => {
                             // Waits while the control thread runs a round's
                             // scheduler work; answers between rounds.
@@ -1162,5 +1287,24 @@ mod tests {
             parse_holder_circuit_breaker_values(Some("2"), Some("NaN")),
             (2, 30_000_000)
         );
+    }
+
+    #[test]
+    fn disable_same_node_env_parser_and_host_comparison() {
+        assert!(!parse_disable_same_node_value(None));
+        assert!(!parse_disable_same_node_value(Some("0")));
+        assert!(!parse_disable_same_node_value(Some("false")));
+        assert!(parse_disable_same_node_value(Some("1")));
+        assert!(parse_disable_same_node_value(Some(" true ")));
+        assert!(parse_disable_same_node_value(Some("YES")));
+        assert!(parse_disable_same_node_value(Some("On")));
+
+        assert!(same_peer_host("10.255.6.58:7100", "10.255.6.58:7100/15"));
+        assert!(same_peer_host("10.255.6.58:7100/3", "10.255.6.58:7200/0"));
+        assert!(!same_peer_host("10.255.6.58:7100/0", "10.255.110.178:7100/0"));
+        assert!(same_peer_host("[FD00:0::1]:7100/1", "[fd00::1]:7200/2"));
+        assert!(same_peer_host("[::ffff:10.0.0.5]:7100", "10.0.0.5:7100/7"));
+        assert!(!same_peer_host("bad-endpoint", "bad-endpoint"));
+        assert!(!same_peer_host("", "10.0.0.1:7100"));
     }
 }

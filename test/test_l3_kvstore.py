@@ -361,17 +361,19 @@ class TestStorageKeyTest:
             tempfile.TemporaryDirectory() as first,
             tempfile.TemporaryDirectory() as second,
             tempfile.TemporaryDirectory() as third,
+            tempfile.TemporaryDirectory() as fourth,
         ):
             for directory, payload in (
                 (first, b"aaa"),
                 (second, b"bbbb"),
-                (third, b"ccc"),
+                (third, b"aaa"),
+                (fourth, b"ccc"),
             ):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(payload)
-            # Differing mtimes with identical (name, size) must keep the same deployment_id.
+            # Differing mtimes with identical (name, size, sampled bytes) keep the same deployment_id.
             os.utime(os.path.join(first, "model.safetensors"), (1_700_000_000, 1_700_000_000))
             os.utime(os.path.join(third, "model.safetensors"), (1_700_009_999, 1_700_009_999))
             with mock.patch.object(
@@ -397,15 +399,100 @@ class TestStorageKeyTest:
                     hf_config=SimpleNamespace(),
                     revision="",
                 )
-            # Only config.json (metadata) was byte-hashed; model.safetensors was stat-only.
+                fourth_id = self._checkpoint_id(
+                    fourth,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                )
+            # Only config.json (metadata) is full-file byte-hashed; shards use <= 256 KiB strided sampling.
             assert [call.args[1] for call in digest.call_args_list] == [
                 os.path.join(first, "config.json"),
                 os.path.join(second, "config.json"),
                 os.path.join(third, "config.json"),
+                os.path.join(fourth, "config.json"),
             ]
             assert first_id != second_id
             assert first_id == third_id
+            assert first_id != fourth_id
             assert first_id.startswith("local-")
+
+    def test_checkpoint_id_strided_shard_digest_catches_2gib_edits_and_broken_symlinks(self):
+        from tokenspeed.runtime.cache.l3 import identity as l3_identity
+
+        size_2gib = 2 * 1024 * 1024 * 1024
+        sample = 64 * 1024
+        span = size_2gib - sample
+        with (
+            tempfile.TemporaryDirectory() as base_dir,
+            tempfile.TemporaryDirectory() as mid_edit_dir,
+            tempfile.TemporaryDirectory() as tail_edit_dir,
+            tempfile.TemporaryDirectory() as broken_dir,
+        ):
+            for directory in (base_dir, mid_edit_dir, tail_edit_dir):
+                with open(os.path.join(directory, "config.json"), "w") as handle:
+                    handle.write('{"model_type":"x"}')
+                shard_path = os.path.join(directory, "model-00001-of-00001.safetensors")
+                with open(shard_path, "wb") as handle:
+                    handle.truncate(size_2gib)
+                    handle.seek(0)
+                    handle.write(b"\x10\x00\x00\x00\x00\x00\x00\x00{\"w\":{\"shape\":[]}}")
+            # Edit 1 byte inside the 1/3 interior sample and 1 byte inside the tail sample (exact same 2 GiB size!).
+            with open(os.path.join(mid_edit_dir, "model-00001-of-00001.safetensors"), "r+b") as handle:
+                handle.seek(span // 3 + 1234)
+                handle.write(b"\x7f")
+            with open(os.path.join(tail_edit_dir, "model-00001-of-00001.safetensors"), "r+b") as handle:
+                handle.seek(size_2gib - 17)
+                handle.write(b"\x9a")
+
+            bytes_read = 0
+            orig_pread = os.pread
+
+            def counting_pread(fd, n, off):
+                nonlocal bytes_read
+                chunk = orig_pread(fd, n, off)
+                bytes_read += len(chunk)
+                return chunk
+
+            with mock.patch.object(os, "pread", side_effect=counting_pread):
+                id_base = self._checkpoint_id(
+                    base_dir,
+                    load_format="safetensors",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                )
+            assert bytes_read == 4 * sample  # <= 256 KiB exact!
+            id_mid = self._checkpoint_id(
+                mid_edit_dir,
+                load_format="safetensors",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            id_tail = self._checkpoint_id(
+                tail_edit_dir,
+                load_format="safetensors",
+                hf_config=SimpleNamespace(),
+                revision="",
+            )
+            assert id_base != id_mid
+            assert id_base != id_tail
+            assert id_mid != id_tail
+
+            # Dangling weight symlink must raise FileNotFoundError rather than silently hashing empty.
+            with open(os.path.join(broken_dir, "config.json"), "w") as handle:
+                handle.write('{"model_type":"x"}')
+            os.symlink(
+                os.path.join(broken_dir, "missing.safetensors"),
+                os.path.join(broken_dir, "model.safetensors"),
+            )
+            l3_identity._local_checkpoint_fingerprint.cache_clear()
+            with pytest.raises(FileNotFoundError):
+                self._checkpoint_id(
+                    broken_dir,
+                    load_format="auto",
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                )
 
     def test_checkpoint_id_does_not_trust_hex_basename_outside_hf_snapshots(self):
         commit = "d" * 40

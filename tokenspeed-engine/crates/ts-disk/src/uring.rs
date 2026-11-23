@@ -64,6 +64,7 @@ struct InFlight {
     done: usize,
     retries: u8,
     write_crc: Option<u32>,
+    bounced: bool,
 }
 
 enum BufferMode {
@@ -103,6 +104,10 @@ pub(crate) struct Ring {
     max_io_bytes: usize,
     mode: BufferMode,
     r_disabled: bool,
+    #[cfg(test)]
+    async_from_slot: Option<usize>,
+    #[cfg(test)]
+    on_efault_retry: Option<Box<dyn FnMut(Chunk) + Send>>,
 }
 
 fn allocate_bounce_mode(ring: &IoUring, depth: usize, max_io_bytes: usize) -> io::Result<BufferMode> {
@@ -245,6 +250,10 @@ impl Ring {
             max_io_bytes,
             mode,
             r_disabled,
+            #[cfg(test)]
+            async_from_slot: None,
+            #[cfg(test)]
+            on_efault_retry: None,
         })
     }
 
@@ -264,6 +273,8 @@ impl Ring {
             max_io_bytes,
             mode: BufferMode::NonFixedCaller,
             r_disabled,
+            async_from_slot: None,
+            on_efault_retry: None,
         })
     }
 
@@ -280,6 +291,8 @@ impl Ring {
             max_io_bytes,
             mode,
             r_disabled,
+            async_from_slot: None,
+            on_efault_retry: None,
         })
     }
 
@@ -331,6 +344,7 @@ impl Ring {
                                 done: 0,
                                 retries: 0,
                                 write_crc: None,
+                                bounced: false,
                             },
                             None => break,
                         },
@@ -384,6 +398,7 @@ impl Ring {
                 }
                 for mut inflight in to_issue.drain(..) {
                     let slot = free.pop().expect("free slot reserved for to_issue");
+                    inflight.bounced = self.mode.is_bounce();
                     if let Some(bounce_addr) = self.mode.bounce_slot_addr(slot) {
                         let remaining = inflight.chunk.len - inflight.done;
                         debug_assert!(remaining <= self.max_io_bytes);
@@ -412,8 +427,16 @@ impl Ring {
                             }
                         }
                     }
-                    let req = request(self.fd, inflight, slot, &self.mode)
-                        .user_data(slot as u64);
+                    let req =
+                        request(self.fd, inflight, slot, &self.mode).user_data(slot as u64);
+                    #[cfg(test)]
+                    let req =
+                        if !inflight.bounced && self.async_from_slot.is_some_and(|min| slot >= min)
+                        {
+                            req.flags(squeue::Flags::ASYNC)
+                        } else {
+                            req
+                        };
                     // SAFETY: the chunk (or bounce slot) stays mapped; its slot
                     // keeps it until it completes.
                     unsafe { submission.push(&req) }
@@ -443,6 +466,7 @@ impl Ring {
                 .collect();
             outcomes.clear();
             let mut promote_to_bounce = false;
+            let mut efault_retries: Vec<InFlight> = Vec::new();
             for (user_data, result) in completions {
                 if user_data == WAKE_UP {
                     armed = false;
@@ -452,18 +476,26 @@ impl Ring {
                 let mut inflight = slots[slot]
                     .take()
                     .expect("a completion of an issued request");
-                let bounce_addr = self.mode.bounce_slot_addr(slot);
-                // If NonFixedCaller hits -EFAULT at runtime (e.g. ENOMEM hid a
-                // VM_PFNMAP region at setup), promote lazily to an unfixed bounce pool.
-                if result == -libc::EFAULT
-                    && matches!(self.mode, BufferMode::NonFixedCaller)
-                    && inflight.done == 0
-                    && inflight.retries == 0
-                {
+                let bounce_addr = if inflight.bounced {
+                    self.mode.bounce_slot_addr(slot)
+                } else {
+                    None
+                };
+                // Catch every pre-promotion NonFixedCaller SQE that hit -EFAULT
+                // (e.g. ENOMEM hid a VM_PFNMAP region at setup), even if an
+                // earlier CQE already promoted `self.mode` to `BufferMode::Bounce`.
+                if result == -libc::EFAULT && !inflight.bounced && inflight.done == 0 {
                     free.push(slot);
-                    promote_to_bounce = true;
-                    inflight.retries = 1;
-                    retries.push_back(inflight);
+                    #[cfg(test)]
+                    if let Some(hook) = self.on_efault_retry.as_mut() {
+                        hook(inflight.chunk);
+                    }
+                    if self.mode.is_bounce() {
+                        retries.push_back(inflight);
+                    } else {
+                        promote_to_bounce = true;
+                        efault_retries.push(inflight);
+                    }
                     continue;
                 }
                 if result == -libc::EINTR || result == -libc::EAGAIN {
@@ -566,21 +598,25 @@ impl Ring {
                 outcomes.push((inflight.chunk, outcome, chunk_crc));
             }
             if promote_to_bounce && matches!(self.mode, BufferMode::NonFixedCaller) {
-                match Memory::map(self.depth * self.max_io_bytes) {
-                    Ok(pool) => {
+                match allocate_bounce_mode(&self.ring, self.depth, self.max_io_bytes) {
+                    Ok(bounce_mode) => {
+                        let bounce_fixed =
+                            matches!(bounce_mode, BufferMode::Bounce { fixed: true, .. });
                         tracing::warn!(
-                            bounce_bytes = pool.size(),
+                            bounce_bytes = self.depth * self.max_io_bytes,
+                            bounce_fixed,
                             "io_uring non-fixed O_DIRECT hit EFAULT at runtime; switching to anonymous mmap bounce pool"
                         );
-                        self.mode = BufferMode::Bounce {
-                            pool,
-                            slot_size: self.max_io_bytes,
-                            fixed: false,
-                        };
+                        self.mode = bounce_mode;
                         shared.set_bounce_active();
+                        retries.extend(efault_retries);
                     }
                     Err(error) => {
+                        let errno = error.raw_os_error().unwrap_or(libc::ENOMEM);
                         tracing::error!(%error, "failed to allocate io_uring runtime bounce pool");
+                        for pending in efault_retries {
+                            outcomes.push((pending.chunk, Err(IoError::Os(errno)), None));
+                        }
                     }
                 }
             }
@@ -858,5 +894,257 @@ mod tests {
             assert!(ring.mode.is_bounce());
             ring
         });
+    }
+
+    #[test]
+    fn runtime_efault_promotion_preserves_inflight_non_bounced_reads_and_retries_all_siblings() {
+        // Reproduces TS-P0-1 (`RLIMIT_MEMLOCK < 75.5 GiB` -> `NonFixedCaller` startup
+        // with mixed anonymous `mmap` `push_ring` + `VM_PFNMAP` Host L2):
+        // (a) Non-bounced anonymous `mmap` reads in flight across runtime `Bounce`
+        //     promotion MUST NOT be zero-corrupted by the freshly mapped bounce pool.
+        // (b) `>= 8` (`MAX_CONSECUTIVE_DISK_ERRORS`) sibling `-EFAULT` SQEs — including
+        //     ones harvested *after* an earlier CQE already promoted `self.mode` to
+        //     `Bounce` — MUST retry cleanly without tripping `queues.degraded()`.
+        const DEPTH: usize = 16;
+        const ANON_CHUNKS: usize = 4;
+        const ANON_CHUNK_PAGES: usize = 64; // 256 KiB each (1 MiB total real NVMe DMA)
+        const EFAULT_CHUNKS: usize = 10; // >= MAX_CONSECUTIVE_DISK_ERRORS (8)
+        const MAX_CHUNK_BYTES: usize = ANON_CHUNK_PAGES * ALIGNMENT;
+
+        let total_pages = ANON_CHUNKS * ANON_CHUNK_PAGES + EFAULT_CHUNKS;
+        let scratch = ScratchFile::new("runtime-efault-mixed-promotion");
+        let file = DiskFile::create(&scratch.0, (total_pages * ALIGNMENT) as u64).unwrap();
+
+        let mut anon_mem = Memory::map(total_pages * ALIGNMENT).unwrap();
+        let golden: Vec<u8> = (0..total_pages * ALIGNMENT)
+            .map(|i| ((i / 17) as u8).wrapping_mul(37).wrapping_add(0x5B) | 1)
+            .collect();
+        anon_mem.write_at(0, &golden);
+
+        // Allocate 10 disjoint `PROT_READ` pages simulating `VM_PFNMAP` `-EFAULT` on
+        // `O_DIRECT` `Read` (`pin_user_pages_fast(FOLL_WRITE)` -> `-EFAULT`).
+        let efault_bytes = EFAULT_CHUNKS * ALIGNMENT;
+        let efault_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                efault_bytes,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(efault_ptr, libc::MAP_FAILED);
+        let efault_base = efault_ptr as usize;
+
+        let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(efd >= 0);
+        let eventfd = unsafe { OwnedFd::from_raw_fd(efd) };
+        let shared = Arc::new(Shared::new(
+            Limits {
+                depth: DEPTH,
+                write_depth: DEPTH,
+            },
+            Some(eventfd),
+        ));
+
+        let mut ring = Ring::new_non_fixed(&file, DEPTH, MAX_CHUNK_BYTES).unwrap();
+        assert!(matches!(ring.mode, BufferMode::NonFixedCaller));
+        // Slot 0 fails inline in `io_submit_sqes` and triggers `Bounce` promotion
+        // immediately while slots 1..14 (`IOSQE_ASYNC` via `io-wq`) are in flight!
+        ring.async_from_slot = Some(1);
+        let efault_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let efault_seen_hook = efault_seen.clone();
+        ring.on_efault_retry = Some(Box::new(move |chunk: Chunk| {
+            efault_seen_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Make just this chunk's disjoint page writable before its bounced retry.
+            let rc = unsafe {
+                libc::mprotect(
+                    chunk.address as *mut libc::c_void,
+                    chunk.len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            };
+            assert_eq!(rc, 0, "mprotect failed on retried EFAULT page");
+        }));
+
+        let worker_shared = shared.clone();
+        let worker = thread::spawn(move || ring.run(&worker_shared));
+
+        // Step 1: Write golden payload to disk (still in `NonFixedCaller` mode) so
+        // `shared.checksums` records valid CRC32Cs for every range.
+        let (w_tx, w_rx) = mpsc::channel();
+        {
+            let mut queues = shared.queues.lock();
+            let mut plans = Vec::new();
+            let mut chunks = Vec::new();
+            let mut io_idx = 0usize;
+            for k in 0..EFAULT_CHUNKS {
+                let off = k * ALIGNMENT;
+                plans.push(IoPlan {
+                    file_offset: off as u64,
+                    len: ALIGNMENT,
+                    chunks: 1,
+                });
+                chunks.push(Chunk {
+                    job: 0,
+                    direction: Direction::Write,
+                    file_offset: off as u64,
+                    address: anon_mem.address() + off,
+                    len: ALIGNMENT,
+                    buffer: 0,
+                    io_index: io_idx,
+                    chunk_index: 0,
+                    issued_at: None,
+                });
+                io_idx += 1;
+            }
+            for a in 0..ANON_CHUNKS {
+                let off = EFAULT_CHUNKS * ALIGNMENT + a * MAX_CHUNK_BYTES;
+                plans.push(IoPlan {
+                    file_offset: off as u64,
+                    len: MAX_CHUNK_BYTES,
+                    chunks: 1,
+                });
+                chunks.push(Chunk {
+                    job: 0,
+                    direction: Direction::Write,
+                    file_offset: off as u64,
+                    address: anon_mem.address() + off,
+                    len: MAX_CHUNK_BYTES,
+                    buffer: 0,
+                    io_index: io_idx,
+                    chunk_index: 0,
+                    issued_at: None,
+                });
+                io_idx += 1;
+            }
+            let n_writes = chunks.len();
+            queues.admit(
+                Direction::Write,
+                plans,
+                chunks,
+                Box::new(move |report: JobReport| w_tx.send(report.outcome).unwrap()),
+                Instant::now(),
+            );
+            for _ in 0..n_writes {
+                queues.release_write();
+            }
+        }
+        shared.wake();
+        assert_eq!(w_rx.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(()));
+        assert!(
+            !shared.is_bounce_active(),
+            "writes from RW anon_mem should keep NonFixedCaller active before mixed read"
+        );
+
+        // Step 2: Poison `anon_mem` read destinations with `0xDEADBEEF`, then admit
+        // 10 `-EFAULT` reads + 4 `anon_mem` reads in ONE atomic queue batch!
+        let anon_read_base = EFAULT_CHUNKS * ALIGNMENT;
+        let poison: Vec<u8> = (0..ANON_CHUNKS * MAX_CHUNK_BYTES)
+            .map(|i| [0xDE, 0xAD, 0xBE, 0xEF][i % 4])
+            .collect();
+        anon_mem.write_at(anon_read_base, &poison);
+
+        let (r_efault_tx, r_efault_rx) = mpsc::channel();
+        let (r_anon_tx, r_anon_rx) = mpsc::channel();
+        {
+            let mut queues = shared.queues.lock();
+            let mut efault_plans = Vec::new();
+            let mut efault_chunks = Vec::new();
+            for k in 0..EFAULT_CHUNKS {
+                let off = k * ALIGNMENT;
+                efault_plans.push(IoPlan {
+                    file_offset: off as u64,
+                    len: ALIGNMENT,
+                    chunks: 1,
+                });
+                efault_chunks.push(Chunk {
+                    job: 0,
+                    direction: Direction::Read,
+                    file_offset: off as u64,
+                    address: efault_base + off,
+                    len: ALIGNMENT,
+                    buffer: 0,
+                    io_index: k,
+                    chunk_index: 0,
+                    issued_at: None,
+                });
+            }
+            queues.admit(
+                Direction::Read,
+                efault_plans,
+                efault_chunks,
+                Box::new(move |report: JobReport| r_efault_tx.send(report.outcome).unwrap()),
+                Instant::now(),
+            );
+
+            let mut anon_plans = Vec::new();
+            let mut anon_chunks = Vec::new();
+            for a in 0..ANON_CHUNKS {
+                let off = anon_read_base + a * MAX_CHUNK_BYTES;
+                anon_plans.push(IoPlan {
+                    file_offset: off as u64,
+                    len: MAX_CHUNK_BYTES,
+                    chunks: 1,
+                });
+                anon_chunks.push(Chunk {
+                    job: 0,
+                    direction: Direction::Read,
+                    file_offset: off as u64,
+                    address: anon_mem.address() + off,
+                    len: MAX_CHUNK_BYTES,
+                    buffer: 0,
+                    io_index: a,
+                    chunk_index: 0,
+                    issued_at: None,
+                });
+            }
+            queues.admit(
+                Direction::Read,
+                anon_plans,
+                anon_chunks,
+                Box::new(move |report: JobReport| r_anon_tx.send(report.outcome).unwrap()),
+                Instant::now(),
+            );
+        }
+        shared.wake();
+
+        assert_eq!(
+            r_efault_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(()),
+            "all 10 -EFAULT sibling SQEs must retry cleanly via promoted bounce pool"
+        );
+        assert_eq!(
+            r_anon_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(()),
+            "in-flight non-bounced anon_mem reads must not be zero-corrupted or fail CRC32C"
+        );
+        assert!(shared.is_bounce_active());
+        assert_eq!(
+            efault_seen.load(std::sync::atomic::Ordering::Relaxed),
+            EFAULT_CHUNKS
+        );
+        {
+            let queues = shared.queues.lock();
+            assert!(!queues.degraded(), "runtime EFAULT promotion must not trip degraded()");
+            assert_eq!(queues.stats().failed_jobs, 0);
+        }
+
+        // Verify 0-bit match on both `anon_mem` and `efault_mem`!
+        let mut actual_anon = vec![0u8; ANON_CHUNKS * MAX_CHUNK_BYTES];
+        anon_mem.read_at(anon_read_base, &mut actual_anon);
+        assert_eq!(actual_anon, &golden[anon_read_base..]);
+
+        let actual_efault =
+            unsafe { std::slice::from_raw_parts(efault_ptr as *const u8, efault_bytes) };
+        assert_eq!(actual_efault, &golden[..efault_bytes]);
+
+        let _ = shared.queues.lock().close();
+        shared.wake();
+        worker.join().unwrap();
+        unsafe {
+            libc::munmap(efault_ptr, efault_bytes);
+        }
     }
 }

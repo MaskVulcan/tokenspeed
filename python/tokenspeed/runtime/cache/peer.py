@@ -57,9 +57,10 @@ SOFT_PIN_S = 2.0
 # their deadline, long before.
 HARD_PIN_S = 30.0
 # A reader whose read failed holds the landing's blocks this long before
-# reusing them, so a READ still in flight cannot land in another request's
-# block.
-QUARANTINE_S = 5.0
+# reusing them, so an in-flight READ or unacknowledged-cancel push WRITE
+# (paired with MC_TRANSFER_TIMEOUT=10 / ASCEND_TRANSFER_TIMEOUT=10000:
+# 11s + 5s + 30s = 46s > 2 * 10s) cannot land in another request's block.
+QUARANTINE_S = 30.0
 # A holder forgets a lease's record this long after its last request.
 RECORD_LIFETIME_S = HARD_PIN_S + 30.0
 # How long a holder may take to push its Disk pages into a reader's landing

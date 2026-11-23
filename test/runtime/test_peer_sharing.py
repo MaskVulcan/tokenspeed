@@ -37,6 +37,8 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 from tokenspeed.runtime.cache.host_storage import HostCacheStorage  # noqa: E402
 from tokenspeed.runtime.cache.peer import (  # noqa: E402
+    PUSH_TIMEOUT_S,
+    QUARANTINE_S,
     build_peer_geometry,
     peer_host_regions,
     peer_incarnation,
@@ -293,6 +295,13 @@ def test_host_landings_take_a_share_of_the_host_blocks():
     device = peer_scheduler_config(landing_tier="device", **common)
     assert device.landing_tier == ts.PeerLandingTier.Device
     assert (device.max_host_landing_blocks, device.host_ready_timeout_us) == (0, 0)
+
+
+def test_quarantine_exceeds_unacknowledged_push_cancel_retry_window():
+    # Paired with MC_TRANSFER_TIMEOUT=10s (up to 2 retries = 20s) and CANCEL_WAIT=5s:
+    # PUSH_TIMEOUT_S (10s) + 1s + CANCEL_WAIT (5s) + QUARANTINE_S (30s) = 46s > 20s.
+    assert QUARANTINE_S == 30.0
+    assert (PUSH_TIMEOUT_S + 1.0 + 5.0 + QUARANTINE_S) > 2.0 * 10.0
 
 
 def test_peer_scheduler_config_scales_soft_pin_and_host_ready_with_answer_timeout():

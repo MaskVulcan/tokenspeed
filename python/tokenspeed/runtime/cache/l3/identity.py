@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import re
+import stat
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -750,66 +751,147 @@ def _local_checkpoint_code_files(model_dir: str) -> tuple[tuple[str, str], ...]:
     return tuple(found)
 
 
-def _update_file_size_digest(hasher: "hashlib._Hash", path: str) -> None:
-    """Hash a weight shard's byte size without scanning its contents.
+_WEIGHT_SHARD_SAMPLE_BYTES = 64 * 1024  # 64 KiB; <= 256 KiB total read per shard.
 
-    Uses only ``os.path.getsize(path)`` (never ``mtime``, which can differ
-    across replicated cluster nodes or container mounts) so all ranks sharing a
-    checkpoint converge on the identical ``deployment_id`` in milliseconds
-    instead of scanning tens of gigabytes of ``*.safetensors`` on startup.
+
+def _update_weight_shard_digest(hasher: "hashlib._Hash", path: str) -> None:
+    """Hash a weight shard's byte size, 64 KiB header, and 3 strided 64 KiB samples.
+
+    Reads at most ``256 KiB`` per shard (the entire file when ``size <= 256 KiB``,
+    else 4 disjoint ``64 KiB`` windows at ``0``, ``1/3``, ``2/3``, and ``tail``)
+    and never hashes ``mtime``. This keeps 100-shard startup fingerprinting under
+    ``50 ms`` across cluster mounts while preventing L3 KV collisions across
+    same-shape training checkpoints or quantization recalibrations, and raises
+    ``FileNotFoundError`` / ``OSError`` on missing or broken shard symlinks.
     """
-    hasher.update(b"\0")
-    hasher.update(str(os.path.getsize(path)).encode())
-    hasher.update(b"\0")
+    st = os.stat(path)  # Follows symlinks; raises FileNotFoundError on broken links.
+    if not stat.S_ISREG(st.st_mode):
+        raise FileNotFoundError(f"weight shard is not a regular file: {path}")
+    size = st.st_size
+    hasher.update(f"\0{size}\0".encode())
+    if size == 0:
+        return
+    sample = _WEIGHT_SHARD_SAMPLE_BYTES
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        if size <= 4 * sample:
+            offsets = ((0, size),)
+        else:
+            span = size - sample
+            offsets = (
+                (0, sample),
+                (span // 3, sample),
+                ((span * 2) // 3, sample),
+                (span, sample),
+            )
+        for offset, length in offsets:
+            remaining = length
+            cursor = offset
+            while remaining > 0:
+                chunk = os.pread(fd, remaining, cursor)
+                if not chunk:
+                    raise OSError(
+                        f"unexpected EOF reading weight shard {path} at offset {cursor}"
+                    )
+                hasher.update(chunk)
+                cursor += len(chunk)
+                remaining -= len(chunk)
+    finally:
+        os.close(fd)
+
+
+def _verify_index_weight_map_shards(
+    model_dir: str, *, load_format: str, extra_weight_files: Sequence[tuple[str, str]]
+) -> None:
+    """Ensure every shard named in an active HF weight index exists on disk."""
+    if load_format in ("dummy", "sharded_state", "pt"):
+        return
+    if load_format == "npcache" and extra_weight_files:
+        return
+    if load_format == "mistral":
+        candidates = ("consolidated.safetensors.index.json",)
+    elif load_format == "npcache":
+        candidates = ("pytorch_model.bin.index.json",)
+    elif load_format in ("safetensors", "instanttensor"):
+        candidates = ("model.safetensors.index.json",)
+    else:
+        candidates = (
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+        )
+    for index_name in candidates:
+        index_path = os.path.join(model_dir, index_name)
+        if not os.path.lexists(index_path):
+            continue
+        if not os.path.isfile(index_path):
+            raise FileNotFoundError(index_path)
+        try:
+            with open(index_path, encoding="utf-8") as handle:
+                index_data = json.load(handle)
+        except json.JSONDecodeError:
+            break
+        weight_map = index_data.get("weight_map") if isinstance(index_data, dict) else None
+        if isinstance(weight_map, dict):
+            for shard_rel in sorted(set(weight_map.values())):
+                if not isinstance(shard_rel, str) or not shard_rel:
+                    continue
+                shard_path = os.path.join(model_dir, shard_rel)
+                if not os.path.isfile(shard_path):
+                    raise FileNotFoundError(shard_path)
+        break
 
 
 @functools.cache
 def _local_checkpoint_fingerprint(
     model_dir: str, load_format: str, extra_config_json: str
 ) -> str:
-    """Hash config/index/quant-config/code bytes and selected weight shard sizes.
+    """Hash config/index/quant-config/code bytes and sampled weight shard digests.
 
     Cached by directory path, load format, and loader extra-config so a
     process that resolves the same local checkpoint more than once (target
-    plus draft, or a repeated prefix rebuild) does not re-stat every shard.
+    plus draft, or a repeated prefix rebuild) does not re-read every shard.
     Lightweight metadata/code files (``config.json``, ``hf_quant_config.json``,
-    ``*.index.json``, ``np/weight_names.json``, local ``*.py``) are still
-    hashed byte-for-byte; large weight shard files hash ``(relative_name,
-    file_size)`` so 1,000-rank startups on shared storage never stall scanning
-    multi-hundred-GB checkpoints while preserving identical fingerprints across
-    nodes regardless of file mtime.
+    ``*.index.json``, ``np/weight_names.json``, local ``*.py``) are hashed
+    byte-for-byte; large weight shard files hash ``(relative_name, file_size,
+    64 KiB header + 3 strided 64 KiB samples)`` (``<= 256 KiB`` per shard,
+    never ``mtime``) so 1,000-rank startups finish in milliseconds while
+    preventing collisions across same-shape checkpoints. Missing or broken
+    weight files raise ``FileNotFoundError`` instead of hashing empty.
     """
     hasher = hashlib.sha256()
-    try:
-        names = tuple(sorted(os.listdir(model_dir)))
-    except OSError:
-        return hasher.hexdigest()
+    names = tuple(sorted(os.listdir(model_dir)))
     extra_config = json.loads(extra_config_json)
     if not isinstance(extra_config, dict):
         raise TypeError("model_loader_extra_config must be a dict")
     selected_weights, extra_weight_files = _selected_weight_targets(
         model_dir, names=names, load_format=load_format, extra_config=extra_config
     )
+    _verify_index_weight_map_shards(
+        model_dir, load_format=load_format, extra_weight_files=extra_weight_files
+    )
     for rel, path in _local_checkpoint_code_files(model_dir):
         hasher.update(rel.encode())
         _update_file_digest(hasher, path)
     for name in names:
         path = os.path.join(model_dir, name)
-        if not os.path.isfile(path):
-            continue
         if name in _CHECKPOINT_METADATA_FILES:
-            hasher.update(name.encode())
-            _update_file_digest(hasher, path)
+            if os.path.islink(path) and not os.path.exists(path):
+                raise FileNotFoundError(path)
+            if os.path.isfile(path):
+                hasher.update(name.encode())
+                _update_file_digest(hasher, path)
             continue
         if name in selected_weights:
+            if os.path.isdir(path) and not os.path.islink(path):
+                continue
             hasher.update(name.encode())
-            _update_file_size_digest(hasher, path)
+            _update_weight_shard_digest(hasher, path)
     for rel, path in extra_weight_files:
         hasher.update(rel.encode())
         if rel == "np/weight_names.json":
             _update_file_digest(hasher, path)
         else:
-            _update_file_size_digest(hasher, path)
+            _update_weight_shard_digest(hasher, path)
     return hasher.hexdigest()
 
 
@@ -833,8 +915,10 @@ def _sharded_state_weight_files(
     matched = glob.glob(os.path.join(model_dir, match_glob))
     found: list[tuple[str, str]] = []
     for path in sorted(matched):
-        if not os.path.isfile(path):
+        if os.path.isdir(path) and not os.path.islink(path):
             continue
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
         rel = os.path.relpath(path, model_dir).replace(os.sep, "/")
         found.append((rel, path))
     return tuple(found)
@@ -842,6 +926,8 @@ def _sharded_state_weight_files(
 
 def _npcache_weight_files(model_dir: str) -> tuple[tuple[str, str], ...] | None:
     names_file = os.path.join(model_dir, "np", "weight_names.json")
+    if os.path.islink(names_file) and not os.path.exists(names_file):
+        raise FileNotFoundError(names_file)
     if not os.path.isfile(names_file):
         return None
     with open(names_file) as handle:
@@ -852,8 +938,9 @@ def _npcache_weight_files(model_dir: str) -> tuple[tuple[str, str], ...] | None:
     for name in weight_names:
         rel = "np/" + str(name)
         path = os.path.join(model_dir, "np", str(name))
-        if os.path.isfile(path):
-            found.append((rel, path))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        found.append((rel, path))
     return tuple(found)
 
 

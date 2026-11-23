@@ -106,6 +106,14 @@ impl Holder {
         self.stamp.identity = identity;
     }
 
+    /// Answer a `Layout` query without touching the scheduler.
+    pub fn layout_reply(&self) -> Reply {
+        Reply::Layout {
+            stamp: self.stamp.clone(),
+            ranks: self.ranks.clone(),
+        }
+    }
+
     /// The answer to `request`, and the endpoint it goes to.
     pub fn handle(
         &mut self,
@@ -115,13 +123,7 @@ impl Holder {
     ) -> (String, Reply) {
         self.records.retain(|_, record| now < record.expires);
         match request {
-            Request::Layout { reply_to } => (
-                reply_to,
-                Reply::Layout {
-                    stamp: self.stamp.clone(),
-                    ranks: self.ranks.clone(),
-                },
-            ),
+            Request::Layout { reply_to } => (reply_to, self.layout_reply()),
             Request::Lookup { lease, prompt } => {
                 let lookup = prompt.lookup_event(&lease);
                 let answer = cache.answer_lookup(&lookup);

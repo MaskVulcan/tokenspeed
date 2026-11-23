@@ -481,23 +481,43 @@ fn sibling_receives_requests_while_public_scheduler_is_locked() {
     let sibling = replica(31, private, HOLDER_BASE);
     let (incoming, replies) = mpsc::channel();
     let client = PeerNet::start("127.0.0.1", 0, incoming).unwrap();
+    let client_addr = format!("127.0.0.1:{}", client.port());
     let layout = Request::Layout {
-        reply_to: format!("127.0.0.1:{}", client.port()),
+        reply_to: client_addr.clone(),
     };
-    let receive_holder = || {
+    let receive_layout = || {
         let frames = replies.recv_timeout(Duration::from_secs(5)).unwrap();
         let Inbound::Reply(Reply::Layout { stamp, .. }) = Inbound::decode(&frames).unwrap() else {
             panic!("expected a layout reply");
         };
         stamp.name
     };
-    // Both messages enter the same public socket in FIFO order.
+    let receive_pin = || {
+        let frames = replies.recv_timeout(Duration::from_secs(5)).unwrap();
+        let Inbound::Reply(Reply::Answer { stamp, .. }) = Inbound::decode(&frames).unwrap() else {
+            panic!("expected a pin answer reply");
+        };
+        stamp.name
+    };
+    // 1. `Request::Layout` on `owner` answers immediately WITHOUT locking `owner.scheduler`!
     let lock = owner.scheduler.lock();
     client.request(&owner.name, &layout).unwrap();
-    client.request(&sibling.name, &layout).unwrap();
-    assert_eq!(receive_holder(), sibling.name);
+    assert_eq!(receive_layout(), owner.name);
+
+    // 2. Both `Request::Pin` messages enter the same public socket in FIFO order;
+    //    `owner`'s servicer waits on `owner.scheduler.lock()`, while `ts-peer-router`
+    //    forwards `sibling`'s request without head-of-line blocking!
+    let pin = Request::Pin {
+        lease: ts_scheduler::PeerLeaseView {
+            reader: client_addr,
+            id: 77,
+        },
+    };
+    client.request(&owner.name, &pin).unwrap();
+    client.request(&sibling.name, &pin).unwrap();
+    assert_eq!(receive_pin(), sibling.name);
     drop(lock);
-    assert_eq!(receive_holder(), owner.name);
+    assert_eq!(receive_pin(), owner.name);
 }
 
 fn read_through_node_port(public_reads: bool) {
@@ -974,18 +994,263 @@ fn holder_read_failure_circuit_breaker_enters_cooldown_suppresses_lookups_and_re
     ]);
     reader.round();
 
-    // Wait for cooldown (150 ms) to expire, heal physical reader, and send probe request.
+    // Wait for cooldown (150 ms) to expire, heal physical reader, and send a
+    // 4-request concurrent burst to prove half-open single-probe guard:
+    // ONLY the first lookup (`f5-probe`) passes while `f6..f8` are suppressed
+    // with `holder_cooldown` (zero stampede!), and once `f5-probe` lands and
+    // completes `Release`, `holder_health` resets to `(0, None)`.
     fail.store(false, Ordering::Release);
     std::thread::sleep(Duration::from_millis(200));
-    let hit5 = run_reader_req(&mut reader, &mut holder, "f5-probe", &prefixes[4]);
+    reader.decisions.clear();
+    let burst_specs: Vec<RequestSpec> = (0..4)
+        .map(|k| {
+            let mut p = prefixes[4].clone();
+            p.extend((91_000 + k * 100)..(91_000 + k * 100 + PAGE));
+            spec(&format!("f5-burst-{k}"), p, &holder.name)
+        })
+        .collect();
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&burst_specs)
+        .unwrap();
+    // First round dispatches all 4 lookups (`f5-burst-0` is the single probe;
+    // `f5-burst-1..3` are immediately suppressed by the re-armed probe guard,
+    // and their `holder_cooldown` decisions are drained on the next `agree()`).
+    let (probe_hit, _) = rounds_until_prefill(&mut reader, Some(&mut holder), "f5-burst-0");
+    let suppressed_in_half_open = reader
+        .decisions
+        .iter()
+        .filter(|(_, d)| *d == "holder_cooldown")
+        .count();
     assert_eq!(
-        hit5,
+        suppressed_in_half_open, 3,
+        "half-open guard must allow exactly 1 probe and suppress the 3 sibling burst lookups, got {:?}",
+        reader.decisions
+    );
+    assert_eq!(
+        probe_hit,
         6 * PAGE,
-        "post-cooldown probe must succeed and land the holder's prefix"
+        "post-cooldown single probe must succeed and land the holder's prefix"
     );
     assert_eq!(
         reader.peer.holder_cooldown_state(&holder.name),
         (0, None),
         "successful probe must reset failure counter and clear cooldown"
     );
+}
+
+#[test]
+fn dead_holder_lookup_timeouts_trip_cooldown_even_without_metrics() {
+    let arena = Arena::new(200_000);
+    // Silent bound socket: never answers `Lookup`, `Layout`, or `Pin`.
+    let silent = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let silent_name = format!("127.0.0.1:{}", silent.port());
+
+    let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let reader_name = format!("127.0.0.1:{}", listener.port());
+    // Fast lookup timeout (40 ms) so 2 timeouts run in ~100 ms; metrics intentionally OFF!
+    interpreter();
+    let reader_sched = Python::attach(|py| {
+        let code = format!(
+            r#"
+import tokenspeed_scheduler as ts
+cfg = ts.SchedulerConfig()
+cfg.role = ts.SchedulerConfig.Role.Fused
+cfg.prefix_granularity = {PAGE}
+cfg.max_scheduled_tokens = 512
+cfg.max_batch_size = 8
+cfg.max_resident_requests = 8
+cfg.num_device_pages = {PAGES}
+cfg.num_snapshot_pages = 1
+cfg.disable_l2_cache = True
+cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity={PAGE},
+                                        total_pages={PAGES}, attn_kind=ts.AttnKind.Full,
+                                        transfer_policy=ts.CacheTransferPolicy.FullSuffix)]
+cfg.peer_config = ts.PeerConfig(name="{reader_name}", incarnation=1, max_leases=8,
+                                soft_pin_us=500_000, hard_pin_us=500_000,
+                                lookup_timeout_us=40_000, min_fetch_tokens={PAGE},
+                                landing_tier=ts.PeerLandingTier.Device,
+                                max_host_landing_blocks=0, host_ready_timeout_us=0)
+result = ts.Scheduler(cfg)
+"#
+        );
+        let globals = PyDict::new(py);
+        py.run(&CString::new(code).unwrap(), Some(&globals), None)
+            .unwrap();
+        Arc::new(Mutex::new(
+            Scheduler::from_python(&globals.get_item("result").unwrap().unwrap()).unwrap(),
+        ))
+    });
+    let mut peer_settings = settings(&reader_name, "v1");
+    peer_settings.timeouts.answer_us = 40_000;
+    let mut reader_peer = Peer::start(
+        peer_settings,
+        0,
+        vec![geometry(READER_BASE)],
+        Some(listener),
+        reader_sched.clone(),
+        Arc::new(arena),
+        Arc::new(NoPushes),
+    )
+    .unwrap();
+    reader_peer.set_holder_circuit_breaker(2, Duration::from_secs(30));
+    let mut reader = Replica {
+        name: reader_name,
+        scheduler: reader_sched,
+        peer: reader_peer,
+        decisions: Vec::new(),
+        landed: Vec::new(),
+    };
+
+    for idx in 0..2 {
+        let tokens: Vec<i32> = ((idx + 1) * 1000..(idx + 1) * 1000 + 4 * PAGE).collect();
+        let rid = format!("dead-{idx}");
+        reader
+            .scheduler
+            .lock()
+            .submit_requests(&[spec(&rid, tokens, &silent_name)])
+            .unwrap();
+        let (hit, landings) = rounds_until_prefill(&mut reader, None, &rid);
+        assert_eq!((hit, landings.len()), (0, 0));
+        reader.advance(&[
+            event(ForwardEventKind::ExtendResult, &rid, vec![7]),
+            event(ForwardEventKind::Finish, &rid, Vec::new()),
+        ]);
+        reader.round();
+    }
+
+    let (failures, cooldown_until) = reader.peer.holder_cooldown_state(&silent_name);
+    assert_eq!(failures, 2, "lookup timeouts must increment holder_health even without metrics");
+    assert!(cooldown_until.is_some(), "dead holder must enter cooldown via lookup timeouts");
+
+    // 3rd request must prefill immediately (< 20 ms, without waiting 40 ms lookup_timeout)!
+    let t0 = Instant::now();
+    let tokens3: Vec<i32> = (5000..5000 + 4 * PAGE).collect();
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("dead-fast-skip", tokens3, &silent_name)])
+        .unwrap();
+    let (hit3, _) = rounds_until_prefill(&mut reader, None, "dead-fast-skip");
+    assert_eq!(hit3, 0);
+    assert!(
+        t0.elapsed() < Duration::from_millis(25),
+        "cooldown must short-circuit dead holder lookup immediately, took {:?}",
+        t0.elapsed()
+    );
+    assert!(reader
+        .decisions
+        .contains(&("dead-fast-skip".into(), "holder_cooldown")));
+}
+
+#[test]
+fn unvouched_release_does_not_clear_holder_failures_and_trips_cooldown() {
+    let arena = Arena::new(200_000);
+    let (incoming, received) = mpsc::channel();
+    let proxy = PeerNet::start("127.0.0.1", 0, incoming).unwrap();
+    let holder_name = format!("127.0.0.1:{}", proxy.port());
+    let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let holder_endpoint = format!("127.0.0.1:{}", listener.port());
+    let mut holder = Replica::with_listener(
+        settings(&holder_name, "v1"),
+        listener,
+        HOLDER_BASE,
+        &arena,
+        "Fused",
+    );
+
+    let reader_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let reader_name = format!("127.0.0.1:{}", reader_listener.port());
+    let mut reader_settings = settings(&reader_name, "v1");
+    reader_settings.timeouts.answer_us = 60_000; // 60 ms release timeout
+    let mut reader = Replica::with_listener(
+        reader_settings,
+        reader_listener,
+        READER_BASE,
+        &arena,
+        "Fused",
+    );
+    reader
+        .peer
+        .set_holder_circuit_breaker(2, Duration::from_secs(30));
+
+    let prefixes: Vec<Vec<i32>> = (0..2)
+        .map(|k| ((k + 1) * 2000..(k + 1) * 2000 + 6 * PAGE).collect())
+        .collect();
+    for p in &prefixes {
+        holder_computes(&mut holder, p, &arena);
+    }
+
+    // Forward `Lookup`, `Layout`, and `Pin` so local `Arena::read` succeeds
+    // (`Action::SendRelease { demote: true }`), then DROP `Request::Release`!
+    // Under the old bug, `Phase::Read` prematurely called `record_holder_read_success`,
+    // resetting `consecutive_failures = 0` even though `Release` timed out (`num_tokens == 0`)!
+    for (idx, p) in prefixes.iter().enumerate() {
+        let rid = format!("rel-fail-{idx}");
+        let mut prompt = p.clone();
+        prompt.extend(80_000..80_000 + PAGE);
+        reader
+            .scheduler
+            .lock()
+            .submit_requests(&[spec(&rid, prompt, &holder_name)])
+            .unwrap();
+        let start = Instant::now();
+        let hit = loop {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            for frames in received.try_iter() {
+                let Inbound::Request(message) = Inbound::decode(&frames).unwrap() else {
+                    panic!("proxy only receives requests");
+                };
+                if !matches!(message, Request::Release { .. }) {
+                    proxy.request(&holder_endpoint, &message).unwrap();
+                }
+            }
+            holder.round();
+            let (rows, _) = reader.round();
+            if let Some((_, prefix)) = rows.into_iter().find(|(id, _)| id == &rid) {
+                break prefix;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(hit, 0, "unanswered Release must discard the read");
+        assert_eq!(
+            reader.peer.holder_cooldown_state(&holder_name).0,
+            (idx + 1) as u32,
+            "failed Release after local read Ok(()) must increment failures, NOT reset them"
+        );
+        reader.advance(&[
+            event(ForwardEventKind::ExtendResult, &rid, vec![7]),
+            event(ForwardEventKind::Finish, &rid, Vec::new()),
+        ]);
+        reader.round();
+    }
+    assert!(
+        reader.peer.holder_cooldown_state(&holder_name).1.is_some(),
+        "2 consecutive Release failures must trip holder cooldown"
+    );
+}
+
+#[test]
+fn disable_same_node_guard_short_circuits_same_host_lookups_cleanly() {
+    let arena = Arena::new(200_000);
+    let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
+    let mut reader = Replica::start("v1", READER_BASE, &arena);
+    reader.peer.set_disable_same_node(true);
+    reader.enable_logical_metrics();
+
+    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+    let mut longer = tokens;
+    longer.extend(1000..1000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("r-same-host", longer, &holder.name)])
+        .unwrap();
+    // Do NOT step `holder` at all: `same_node_disabled` short-circuits locally!
+    let (prefix, landings) = rounds_until_prefill(&mut reader, None, "r-same-host");
+    assert_eq!((prefix, landings.len()), (0, 0));
+    assert_eq!(reader.decisions, vec![("r-same-host".into(), "same_node_disabled")]);
+    assert_eq!(reader.peer.holder_cooldown_state(&holder.name), (0, None));
 }

@@ -97,28 +97,34 @@ fn a_batch_encodes_as_the_python_publisher_s() {
     assert_eq!(encoded, expected.trim());
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+fn start_test_publisher(topic: &str) -> (KvEventPublisher, u16, u16) {
+    static BIND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = BIND_LOCK.lock().unwrap();
+    for _ in 0..16 {
+        let l1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let l2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l1.local_addr().unwrap().port();
+        let replay_port = l2.local_addr().unwrap().port();
+        drop((l1, l2));
+        if let Ok(publisher) = KvEventPublisher::start(
+            &KvEventsConfig {
+                endpoint: format!("tcp://*:{port}"),
+                replay_endpoint: Some(format!("tcp://*:{replay_port}")),
+                buffer_steps: 8,
+                max_queue_size: 64,
+                topic: topic.to_owned(),
+            },
+            0,
+        ) {
+            return (publisher, port, replay_port);
+        }
+    }
+    panic!("failed to bind test KvEventPublisher after 16 attempts");
 }
 
 #[test]
 fn subscribers_receive_batches_and_replay_them() {
-    let (port, replay_port) = (free_port(), free_port());
-    let publisher = KvEventPublisher::start(
-        &KvEventsConfig {
-            endpoint: format!("tcp://*:{port}"),
-            replay_endpoint: Some(format!("tcp://*:{replay_port}")),
-            buffer_steps: 8,
-            max_queue_size: 64,
-            topic: "kv".to_owned(),
-        },
-        0,
-    )
-    .unwrap();
+    let (publisher, port, replay_port) = start_test_publisher("kv");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -207,18 +213,7 @@ fn batching_rejects_tokens_that_a_removal_would_discard() {
 fn clear_medium_disk_publishes_and_replays_over_zmq() {
     use ts_scheduler::KvEventMedium;
 
-    let (port, replay_port) = (free_port(), free_port());
-    let publisher = KvEventPublisher::start(
-        &KvEventsConfig {
-            endpoint: format!("tcp://*:{port}"),
-            replay_endpoint: Some(format!("tcp://*:{replay_port}")),
-            buffer_steps: 8,
-            max_queue_size: 64,
-            topic: "kv".to_owned(),
-        },
-        0,
-    )
-    .unwrap();
+    let (publisher, port, replay_port) = start_test_publisher("kv");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

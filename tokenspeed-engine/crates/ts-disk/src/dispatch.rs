@@ -49,9 +49,9 @@ pub const AIMD_WINDOW: Duration = Duration::from_millis(100);
 pub const AIMD_MIN_SAMPLES: usize = 8;
 const AIMD_MAX_SAMPLES: usize = 64;
 /// Read p99 threshold (microseconds) above which AIMD halves write concurrency.
-pub const AIMD_HIGH_US: u32 = 2_000;
+pub const AIMD_HIGH_US: u32 = 8_000;
 /// Read p99 threshold (microseconds) below which AIMD increments write concurrency.
-pub const AIMD_LOW_US: u32 = 1_000;
+pub const AIMD_LOW_US: u32 = 4_000;
 
 /// What a job runs once it ended: its report.
 pub(crate) type Done = Box<dyn FnOnce(JobReport) + Send>;
@@ -190,17 +190,15 @@ impl ReadLatencyAimd {
 
     /// Effective background write concurrency for `max_write_depth`.
     /// When foreground reads are completely idle (`reads_pending == false`),
-    /// keeps at least 1 write slot open so background cleaning never deadlocks.
+    /// returns the full `max_write_depth` (background writes remain rate-paced
+    /// by `TokenBucket` and `IOPRIO_WRITE` idle priority).
     pub fn effective_write_depth_for(&self, max_write_depth: usize, reads_pending: bool) -> usize {
-        let current = self
-            .effective_write_depth
-            .unwrap_or(max_write_depth)
-            .min(max_write_depth);
-        if reads_pending {
-            current
-        } else {
-            current.max(1).min(max_write_depth)
+        if !reads_pending {
+            return max_write_depth;
         }
+        self.effective_write_depth
+            .unwrap_or(max_write_depth)
+            .min(max_write_depth)
     }
 
     pub(crate) fn effective_write_depth(&self, limits: Limits, reads_pending: bool) -> usize {
@@ -871,38 +869,48 @@ mod tests {
         let mut aimd = ReadLatencyAimd::default();
         let start = Instant::now();
         assert_eq!(aimd.effective_write_depth(limits, true), 4);
+        assert_eq!(aimd.effective_write_depth(limits, false), 4);
 
-        // Feed 8 slow reads (5 ms) spanning the 100 ms window -> halve 4 -> 2.
+        // Feed 8 slow reads (12 ms > AIMD_HIGH_US=8_000) spanning 100 ms -> halve 4 -> 2.
         for i in 0..AIMD_MIN_SAMPLES {
             let t = start + Duration::from_millis((i as u64 + 1) * 15);
-            aimd.record_read(Duration::from_micros(5_000), t, limits.write_depth);
+            aimd.record_read(Duration::from_micros(12_000), t, limits.write_depth);
         }
         assert_eq!(aimd.effective_write_depth(limits, true), 2);
+        assert_eq!(aimd.effective_write_depth(limits, false), 4);
 
-        // Another slow window -> halve 2 -> 1.
+        // Another slow window (10 ms > 8_000) -> halve 2 -> 1.
         let t2 = start + Duration::from_millis(200);
         for i in 0..AIMD_MIN_SAMPLES {
             let t = t2 + Duration::from_millis((i as u64 + 1) * 15);
-            aimd.record_read(Duration::from_micros(4_000), t, limits.write_depth);
+            aimd.record_read(Duration::from_micros(10_000), t, limits.write_depth);
         }
         assert_eq!(aimd.effective_write_depth(limits, true), 1);
 
-        // Another slow window -> halve 1 -> 0 while reads are pending, but keep
-        // 1 slot when reads are completely idle so background cleaning never
-        // deadlocks.
+        // Another slow window -> halve 1 -> 0 while reads are pending, while
+        // returning full `max_write_depth` (4) when reads are completely idle!
         let t3 = start + Duration::from_millis(400);
         for i in 0..AIMD_MIN_SAMPLES {
             let t = t3 + Duration::from_millis((i as u64 + 1) * 15);
-            aimd.record_read(Duration::from_micros(4_000), t, limits.write_depth);
+            aimd.record_read(Duration::from_micros(10_000), t, limits.write_depth);
         }
         assert_eq!(aimd.effective_write_depth(limits, true), 0);
-        assert_eq!(aimd.effective_write_depth(limits, false), 1);
+        assert_eq!(aimd.effective_write_depth(limits, false), 4);
 
-        // Fast read window (200 us) -> additive recovery 0 -> 1.
+        // Hysteresis window (6 ms within [4_000, 8_000] us) holds steady.
         let t4 = start + Duration::from_millis(600);
         for i in 0..AIMD_MIN_SAMPLES {
             let t = t4 + Duration::from_millis((i as u64 + 1) * 15);
-            aimd.record_read(Duration::from_micros(200), t, limits.write_depth);
+            aimd.record_read(Duration::from_micros(6_000), t, limits.write_depth);
+        }
+        assert_eq!(aimd.effective_write_depth(limits, true), 0);
+        assert_eq!(aimd.effective_write_depth(limits, false), 4);
+
+        // Healthy 4 MiB read window (1.5 ms < AIMD_LOW_US=4_000) -> additive recovery 0 -> 1.
+        let t5 = start + Duration::from_millis(800);
+        for i in 0..AIMD_MIN_SAMPLES {
+            let t = t5 + Duration::from_millis((i as u64 + 1) * 15);
+            aimd.record_read(Duration::from_micros(1_500), t, limits.write_depth);
         }
         assert_eq!(aimd.effective_write_depth(limits, true), 1);
     }

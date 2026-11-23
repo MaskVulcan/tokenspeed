@@ -951,7 +951,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let mut forwarded = false;
             if let Some(dp) = self.dp_round(None, &mut stop)? {
                 if dp.idle_forward && memory_resident {
-                    self.data_plane.idle_forward(&dp)?;
+                    let data_plane = &mut self.data_plane;
+                    ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.idle_forward(&dp))?;
                     forwarded = true;
                 }
             }
@@ -1170,7 +1171,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut forwarded = idle_forward;
         let device_work = plan.needs_device() || idle_forward;
         if device_work {
-            if let Some(pending) = self.data_plane.execute(plan, &dispatch)? {
+            let executed = if idle_forward {
+                let data_plane = &mut self.data_plane;
+                ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                    data_plane.execute(plan, &dispatch)
+                })?
+            } else {
+                self.data_plane.execute(plan, &dispatch)?
+            };
+            if let Some(pending) = executed {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
                 let input_logprobs = logprobs.and_then(|plan| plan.input);
@@ -1919,7 +1928,34 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 -key,
                 if reload_ready { -1 } else { 0 },
             ];
-            let reduced = self.ranks.mesh.all_reduce(world, &row, Reduce::Max)?;
+            let mesh = &mut self.ranks.mesh;
+            let reduced = ArcMutexGuard::unlocked(&mut self.scheduler, || {
+                mesh.all_reduce(world, &row, Reduce::Max)
+            })?;
+            // Any peer Lookup/Pin/Release answered while waiting on sibling DP
+            // ranks in `all_reduce` must be applied to `self.scheduler` before
+            // `clear_cache` or `next_execution_plan` runs in this round.
+            if let Some(peer) = &self.peer {
+                let changes = if self.ranks.replica.size() == 1 {
+                    peer.take_holder_changes()
+                } else {
+                    let payload = if self.owns_frontend() {
+                        Peer::encode_changes(&peer.take_holder_changes())
+                    } else {
+                        Vec::new()
+                    };
+                    let shared =
+                        self.ranks
+                            .mesh
+                            .broadcast(&self.ranks.replica, 0, payload)?;
+                    Peer::decode_changes(&shared)?
+                };
+                if !changes.is_empty() {
+                    self.scheduler
+                        .advance_peer(self.peer_now_us, &changes)
+                        .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+                }
+            }
             // A resume reaches DP engines independently. None may forward
             // until every peer can join its device collectives again.
             memory_resident = reduced[7] == 0;
@@ -2917,7 +2953,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             i64::from(wants_prefill),
             i64::from(has_decode_work),
         ];
-        let rows = self.ranks.mesh.all_gather_i64(world, &row)?;
+        let mesh = &mut self.ranks.mesh;
+        let rows =
+            ArcMutexGuard::unlocked(&mut self.scheduler, || mesh.all_gather_i64(world, &row))?;
         *stop = rows.iter().any(|row| row[3] != 0);
         let any_work = rows.iter().any(|row| row[0] > 0);
         self.dp_idle = !any_work;

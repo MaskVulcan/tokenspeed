@@ -27,9 +27,9 @@
 //! - **TS-A2 (`D4-03`)**: 100% single-bit silent on-disk corruption catch rate
 //!   across single-chunk MLA, multi-chunk GF(2) `crc32c_combine` KDA, and
 //!   straddling 1 GiB boundary offsets for all three modes.
-//! - **TS-A4 (`D4-01`)**: `ReadLatencyAimd` step-down (`8->4->2->1->0`, `1`
-//!   when idle) + additive recovery (`+1/100ms -> 8`) + live 16-rank NVMe
-//!   contention stress.
+//! - **TS-A4 (`D4-01`)**: `ReadLatencyAimd` step-down (`8->4->2->1->0`, full
+//!   `max_write_depth=8` when idle) + additive recovery (`+1/100ms -> 8`) +
+//!   live 16-rank NVMe contention stress.
 //! - **TS-A5 (`D5-01`)**: `O_DIRECT` fixed-buffer direct vs fixed-buffer bounce
 //!   pool vs `psync` throughput & CPU overhead micro-benchmark (`848 KiB`,
 //!   `4 MiB`, `24.84 MiB`).
@@ -1176,21 +1176,21 @@ fn ts_a4_aimd_16_rank_contention_and_recovery() {
 
     // (window_label, sample_latencies_us, expected_wd_pending, expected_wd_idle)
     let schedule: &[(&str, u64, usize, usize)] = &[
-        ("W00_baseline_fast", 350, 8, 8),
-        ("W01_spike_3.5ms", 3_500, 4, 4),
-        ("W02_spike_8.0ms", 8_000, 2, 2),
-        ("W03_spike_14.0ms", 14_000, 1, 1),
-        ("W04_spike_20.0ms", 20_000, 0, 1), // starvation-free: 0 pending, 1 when idle!
-        ("W05_hysteresis_1.5ms", 1_500, 0, 1), // neutral band [1000, 2000] us holds steady
-        ("W06_recover_400us", 400, 1, 1),
-        ("W07_recover_400us", 400, 2, 2),
-        ("W08_recover_400us", 400, 3, 3),
-        ("W09_recover_400us", 400, 4, 4),
-        ("W10_recover_400us", 400, 5, 5),
-        ("W11_recover_400us", 400, 6, 6),
-        ("W12_recover_400us", 400, 7, 7),
-        ("W13_recover_400us", 400, 8, 8),
-        ("W14_recover_cap_400us", 400, 8, 8),
+        ("W00_baseline_fast_1.5ms", 1_500, 8, 8),
+        ("W01_spike_10.0ms", 10_000, 4, 8),
+        ("W02_spike_12.0ms", 12_000, 2, 8),
+        ("W03_spike_16.0ms", 16_000, 1, 8),
+        ("W04_spike_20.0ms", 20_000, 0, 8), // 0 while reads pending, full max_wd=8 when idle!
+        ("W05_hysteresis_6.0ms", 6_000, 0, 8), // neutral band [4000, 8000] us holds steady
+        ("W06_recover_2.0ms", 2_000, 1, 8),
+        ("W07_recover_2.0ms", 2_000, 2, 8),
+        ("W08_recover_2.0ms", 2_000, 3, 8),
+        ("W09_recover_2.0ms", 2_000, 4, 8),
+        ("W10_recover_2.0ms", 2_000, 5, 8),
+        ("W11_recover_2.0ms", 2_000, 6, 8),
+        ("W12_recover_2.0ms", 2_000, 7, 8),
+        ("W13_recover_2.0ms", 2_000, 8, 8),
+        ("W14_recover_cap_2.0ms", 2_000, 8, 8),
     ];
 
     let mut cursor_ms = 0u64;
@@ -1369,13 +1369,13 @@ fn ts_a4_aimd_16_rank_contention_and_recovery() {
     let max = *all_lats.last().unwrap();
     let errs = total_errors.load(Ordering::Relaxed);
     assert_eq!(errs, 0);
-    assert!(global_min_wd_idle >= 1);
+    assert_eq!(global_min_wd_idle, 8);
     println!(
         "TS-A4-LIVE-16RANK: ranks={RANKS} reads={} writes={} min_writes_per_rank={min_rank_writes} errors={errs} read_p50_us={p50} read_p99_us={p99} read_max_us={max} min_eff_wd_pending={global_min_wd_pending} min_eff_wd_idle={global_min_wd_idle}",
         total_reads.load(Ordering::Relaxed),
         total_writes.load(Ordering::Relaxed),
     );
-    println!("TS-A4 PASS: deterministic AIMD 8->4->2->1->0 (idle=1) -> +1/100ms -> 8 verified; 16-rank live NVMe contention 0 errors, 0 cleaning starvation");
+    println!("TS-A4 PASS: deterministic AIMD 8->4->2->1->0 (idle=8) -> +1/100ms -> 8 verified; 16-rank live NVMe contention 0 errors, 0 cleaning starvation");
 }
 
 // ---------------------------------------------------------------------------

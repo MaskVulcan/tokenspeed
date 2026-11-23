@@ -62,6 +62,10 @@ const DONE: &[u8] = b"d";
 const CANCELLED: &[u8] = b"x";
 
 /// How long a reader waits for a cancelled push's acknowledgment.
+/// Together with `QUARANTINE_S = 30.0s` (`peer.py`), `CANCEL_WAIT + QUARANTINE_S`
+/// (`35s`) exceeds the maximum in-flight transfer engine WRITE retry window
+/// (`2 * MC_TRANSFER_TIMEOUT = 20s` at `MC_TRANSFER_TIMEOUT=10`), guaranteeing
+/// destination blocks are never reallocated before unacknowledged writes retire.
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
 
 /// One field copy of a pushed block: `length` bytes at `offset` within the
@@ -1024,6 +1028,13 @@ impl PagePusher for PushEndpoint {
                 Err(_) => break,
             }
         }
+        tracing::warn!(
+            endpoint,
+            session,
+            job,
+            cancel_wait_s = CANCEL_WAIT.as_secs(),
+            "peer push timed out and cancellation went unacknowledged; reader quarantine must outlive in-flight writes"
+        );
         Err(
             "the push did not finish in its budget, and its cancellation went unacknowledged"
                 .to_owned(),
