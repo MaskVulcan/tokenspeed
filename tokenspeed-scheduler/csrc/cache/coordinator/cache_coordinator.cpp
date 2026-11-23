@@ -189,6 +189,14 @@ void CacheCoordinator::ClearCacheRetainingStorage() {
     store_.Checkpoints().Clear();
 }
 
+std::size_t CacheCoordinator::InvalidateDiskCache() {
+    const std::size_t invalidated = evictor_.InvalidateDiskEntries();
+    if (invalidated > 0) {
+        CollectDeadEntries();
+    }
+    return invalidated;
+}
+
 bool CacheCoordinator::ClearDeviceCache() {
     // Every plan drains what its admissions, restores and compactions recorded; a clear
     // runs between plans and drops what it evicts.

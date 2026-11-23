@@ -890,5 +890,188 @@ TEST(DiskTierTest, CleaningSkipsSingleHitEntriesWhenReuseIsRequired) {
     EXPECT_EQ(cache.disks.DroppedCleanings(), 2u);
 }
 
+TEST(DiskTierTest, DegradedClearDropsDiskIndexKeepsInFlightAndPeerPinsSafeAndIgnoresLateWrites) {
+    DiskTierCache cache(FullOnly(), /*disk_parents=*/16);
+    const Prompt p1(2, 1);
+    const Prompt p2(2, 2);
+    const Prompt p3(2, 3);
+    const Prompt p4(2, 4);
+    const std::vector<CacheKey> k1 = cache.OnHostOnly(p1);
+    const std::vector<CacheKey> k2 = cache.OnHostOnly(p2);
+    const std::vector<CacheKey> k3 = cache.OnHostOnly(p3);
+    const std::vector<CacheKey> k4 = cache.OnHostOnly(p4);
+
+    // Clean p1 and p2 to Disk; evict p1 from Host so p1 is Disk-only while p2 stays on Host+Disk.
+    const DiskOperation w1 = cache.Clean(k1);
+    cache.disks.Complete(cache::DiskDone{.op_id = w1.op_id, .success = true});
+    const DiskOperation w2 = cache.Clean(k2);
+    cache.disks.Complete(cache::DiskDone{.op_id = w2.op_id, .success = true});
+    cache.EvictFromHost(k1);
+
+    // Start an issued read of p1 (holds Disk + Host blocks), an issued write of p3,
+    // and queue p4 for cleaning. Also hard-pin p2 on Disk via PeerExports.
+    StorageLease read_p1 = cache.disks.StartRead(p1.Prefix());
+    ASSERT_TRUE(read_p1);
+    const std::uint64_t read_id = read_p1.OperationId();
+    ASSERT_EQ(cache.disks.TakeCommands().size(), 1u);
+
+    const DiskOperation write_p3 = cache.Clean(k3);
+    ASSERT_EQ(write_p3.kind, DiskOpKind::kWrite);
+    cache.disks.QueueCleaning(k4);
+    ASSERT_EQ(cache.disks.NumQueuedCleanings(), k4.size());
+
+    // Pin p1's Disk blocks as a peer holder too (since p1 is Disk-only).
+    const cache::PeerLookup lookup{.lease = {.reader = "reader", .id = 1},
+                                   .prefix_hashes = p1.hashes,
+                                   .tokens = p1.tokens,
+                                   .max_tokens = static_cast<std::int32_t>(p1.tokens.size())};
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup);
+    ASSERT_EQ(answer.num_tokens, 8);
+    ASSERT_EQ(answer.pages.size(), 2u);
+    EXPECT_EQ(answer.pages[0].tier, CacheTier::kDisk);
+    PeerExports exports{PeerConfig{.name = "holder",
+                                   .incarnation = 1,
+                                   .max_leases = 4,
+                                   .soft_pin_us = 100,
+                                   .hard_pin_us = 1000,
+                                   .lookup_timeout_us = 100,
+                                   .min_fetch_tokens = 1,
+                                   .landing_tier = PeerLandingTier::kDevice,
+                                   .max_host_landing_blocks = 0,
+                                   .host_ready_timeout_us = 0}};
+    exports.Lookup(cache.coordinator, lookup, /*now_us=*/0);
+    exports.Pin(cache.coordinator,
+                cache::PeerPin{.lease = lookup.lease, .num_tokens = answer.num_tokens, .pages = answer.pages},
+                /*now_us=*/1);
+    ASSERT_TRUE(exports.Held(lookup.lease));
+
+    // Degrade the Disk tier: detach waiting read, mark degraded, invalidate Disk index.
+    read_p1.reset();
+    cache.disks.MarkDegraded();
+    const std::size_t invalidated = cache.coordinator.InvalidateDiskCache();
+    EXPECT_EQ(invalidated, 4u);
+    EXPECT_TRUE(cache.disks.Degraded());
+    EXPECT_EQ(cache.coordinator.Disk().NumDiskCachedBlocks(), 0);
+    EXPECT_EQ(cache.coordinator.Evictor().DiskEvictions().degraded.blocks, 4u);
+    EXPECT_EQ(cache.disks.NumQueuedCleanings(), 0u);
+    // Host entries for p2, p3, p4 remain intact!
+    EXPECT_EQ(cache.HostHitTokens(p2), 8);
+    EXPECT_EQ(cache.HostHitTokens(p3), 8);
+    EXPECT_EQ(cache.HostHitTokens(p4), 8);
+    // Peer lookup no longer sees Disk pages for p1.
+    EXPECT_EQ(PeerExports::AnswerLookup(cache.coordinator, lookup).num_tokens, 0);
+    // New cleanings and prefetches are refused.
+    EXPECT_FALSE(cache.disks.HasReadCredits());
+    const auto blocked_read = cache.disks.TryStartRead(p1.Prefix());
+    EXPECT_FALSE(blocked_read.lease);
+    EXPECT_FALSE(blocked_read.retryable);
+    cache.disks.QueueCleaning(k4);
+    cache.disks.StartCleaning();
+    EXPECT_EQ(cache.disks.NumQueuedCleanings(), 0u);
+    EXPECT_TRUE(cache.disks.TakeCommands().empty());
+
+    // In-flight read, in-flight write, and peer hard pin still keep their Disk slots occupied.
+    EXPECT_GT(cache.disk.NumOccupiedSlots(), 0);
+    EXPECT_TRUE(cache.disks.HasPending());
+
+    // Late-retiring write with success=true MUST NOT re-populate Disk.
+    cache.disks.Complete(cache::DiskDone{.op_id = write_p3.op_id, .success = true});
+    EXPECT_EQ(cache.coordinator.Disk().NumDiskCachedBlocks(), 0);
+
+    // Retiring the detached read and releasing the peer pin returns every Disk slot.
+    cache.disks.Complete(cache::DiskDone{.op_id = read_id, .success = false});
+    EXPECT_FALSE(cache.disks.HasPending());
+    exports.Release(cache.coordinator, cache::PeerRelease{.lease = lookup.lease, .demote = false}, /*now_us=*/2);
+    EXPECT_EQ(cache.disk.NumOccupiedSlots(), 0);
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
+TEST_F(DiskTierKvEventsTest, DiskDegradedClearsDiskUnblocksWaitingPrefetchesAndEmitsClearMedium) {
+    Tick(1);
+    SeedOnHost();
+    scheduler_->DrainKvEvents();
+    const std::vector<DiskOperation> writes = DiskOps(PlanOnce());
+    ASSERT_EQ(writes.size(), 1u);
+    AckDisk(writes[0], /*success=*/true);
+    ASSERT_FALSE(scheduler_->DrainKvEvents().empty());
+    DropSeedFromHost();
+
+    // Submit a prompt that enters Prefetching for the Disk-only second page.
+    Submit(RequestSpec{.request_id = "hit", .tokens = MakeTokens(9), .max_new_tokens = 1});
+    const ExecutionPlan prefetch = PlanOnce();
+    ASSERT_TRUE(Idle(prefetch));
+    const std::vector<DiskOperation> reads = DiskOps(prefetch);
+    ASSERT_EQ(reads.size(), 1u);
+    ASSERT_EQ(scheduler_->GetDiskStats().waiting_requests, 1u);
+    scheduler_->DrainKvEvents();
+
+    // Deliver DiskDegraded while the read is still in flight.
+    {
+        ExecutionEvent event;
+        event.With(cache::DiskDegraded{});
+        scheduler_->Advance(std::move(event));
+    }
+
+    EXPECT_EQ(scheduler_->GetDiskStats().disk_blocks, 0u);
+    EXPECT_EQ(scheduler_->GetDiskStats().waiting_requests, 0u);
+    EXPECT_TRUE(scheduler_->StoragePending()) << "the in-flight read retains its blocks until DiskDone";
+
+    // KV events emit one ClearMedium(kDisk) and zero per-block kDisk removals;
+    // Device/Host blocks stay intact.
+    const std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_FALSE(events.empty());
+    ASSERT_TRUE(std::holds_alternative<KvClearMediumEvent>(events.front()));
+    EXPECT_EQ(std::get<KvClearMediumEvent>(events.front()).medium, KvEventMedium::kDisk);
+    for (const KvCacheEvent& event : events) {
+        if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+            EXPECT_NE(removed->medium, KvEventMedium::kDisk);
+        }
+    }
+
+    // The waiting request admits immediately from its local Device hit (4 tokens)
+    // without waiting for wait_timeout_us.
+    const ExecutionPlan admitted = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(admitted);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"hit"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{4});
+    EXPECT_TRUE(DiskOps(admitted).empty());
+
+    // Duplicate DiskDegraded is a no-op and emits no second ClearMedium.
+    scheduler_->DrainKvEvents();
+    {
+        ExecutionEvent event;
+        event.With(cache::DiskDegraded{});
+        scheduler_->Advance(std::move(event));
+    }
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+
+    // Retiring the detached read clears pending storage cleanly.
+    AckDisk(reads[0], /*success=*/false);
+    EXPECT_FALSE(scheduler_->StoragePending());
+    EXPECT_EQ(scheduler_->GetDiskStats().disk_blocks, 0u);
+}
+
+TEST_F(DiskTierKvEventsTest, DiskDegradedAfterDiskDoneInSameBatchWipesCompletedWrite) {
+    Tick(1);
+    SeedOnHost();
+    scheduler_->DrainKvEvents();
+    const std::vector<DiskOperation> writes = DiskOps(PlanOnce());
+    ASSERT_EQ(writes.size(), 1u);
+
+    // Same ordering as ts-scheduler `advance_head`: DiskDone precedes DiskDegraded.
+    ExecutionEvent event;
+    event.With(cache::DiskDone{.op_id = writes[0].op_id, .success = true});
+    event.With(cache::DiskDegraded{});
+    scheduler_->Advance(std::move(event));
+
+    EXPECT_EQ(scheduler_->GetDiskStats().disk_blocks, 0u);
+    EXPECT_FALSE(scheduler_->StoragePending());
+    const std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<KvClearMediumEvent>(events[0]));
+    EXPECT_EQ(std::get<KvClearMediumEvent>(events[0]).medium, KvEventMedium::kDisk);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

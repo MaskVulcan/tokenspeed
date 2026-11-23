@@ -43,9 +43,13 @@ std::vector<std::uint64_t> Hashes(const std::vector<KvCacheEvent>& events, bool 
     std::vector<std::uint64_t> hashes;
     for (const auto& event : events) {
         EXPECT_EQ(std::holds_alternative<KvBlockStoredEvent>(event), stored);
-        std::visit(
-            [&](const auto& data) { hashes.insert(hashes.end(), data.block_hashes.begin(), data.block_hashes.end()); },
-            event);
+        if (const auto* s = std::get_if<KvBlockStoredEvent>(&event)) {
+            hashes.insert(hashes.end(), s->block_hashes.begin(), s->block_hashes.end());
+        } else if (const auto* r = std::get_if<KvBlockRemovedEvent>(&event)) {
+            hashes.insert(hashes.end(), r->block_hashes.begin(), r->block_hashes.end());
+        } else {
+            ADD_FAILURE() << "unexpected KvClearMediumEvent in Hashes()";
+        }
     }
     return hashes;
 }
@@ -73,9 +77,10 @@ std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>> Feed(const KvEventBa
     for (const auto& event : batch.ToEvents()) {
         if (const auto* stored = std::get_if<KvBlockStoredEvent>(&event)) {
             feed.emplace_back(true, stored->medium, stored->block_hashes.front());
+        } else if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+            feed.emplace_back(false, removed->medium, removed->block_hashes.front());
         } else {
-            const auto& removed = std::get<KvBlockRemovedEvent>(event);
-            feed.emplace_back(false, removed.medium, removed.block_hashes.front());
+            ADD_FAILURE() << "unexpected KvClearMediumEvent in Feed()";
         }
     }
     return feed;
@@ -320,6 +325,55 @@ TEST_F(KvEventSnapshotTestSuite, ADrainedBatchOwnsNoCacheOrRequestResources) {
     const auto before = snapshot.ToEvents();
     EXPECT_EQ(std::get<KvBlockStoredEvent>(before[0]).token_ids, (std::vector<std::int32_t>{1, 2}));
     EXPECT_EQ(std::get<KvBlockStoredEvent>(before[1]).token_ids, (std::vector<std::int32_t>{3, 4}));
+}
+
+TEST(KvEventPrefixView, ClearMediumEmitsSingleClearSuppressesTargetRemovalsAndCascadesOtherMedia) {
+    KvEventPrefixView view;
+    // Branch A: Device(1) -> Host(2) -> Disk(3)
+    // Branch B: Disk-only root(10) -> Host child(11)
+    const std::array initial{
+        Resident(1, std::nullopt, kOnDevice),
+        Resident(2, 1, std::array<bool, kNumKvEventMedia>{false, true, true}),
+        Resident(3, 2, kOnDisk),
+        Resident(10, std::nullopt, kOnDisk),
+        Resident(11, 10, kOnHost),
+    };
+    ASSERT_EQ(Feed(view.ApplyMutations(initial)).size(), 6u);
+
+    // Clear Disk: block 2 stays on Host, blocks 3 & 10 leave Disk completely,
+    // which strands Host child 11 beneath Disk-only root 10.
+    const std::array degraded{
+        Resident(2, 1, kOnHost),
+        Gone(3),
+        Gone(10),
+    };
+    const KvEventBatch batch = view.ApplyMutations(degraded, KvEventMedium::kDisk);
+    EXPECT_EQ(batch.Size(), 2u);
+    EXPECT_FALSE(batch.Empty());
+    ASSERT_EQ(batch.ClearedMedia().size(), 1u);
+    EXPECT_EQ(static_cast<KvEventMedium>(batch.ClearedMedia()[0]), kK);
+
+    const auto events = batch.ToEvents();
+    ASSERT_EQ(events.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<KvClearMediumEvent>(events[0]));
+    EXPECT_EQ(std::get<KvClearMediumEvent>(events[0]).medium, kK);
+    ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(events[1]));
+    const auto& cascaded = std::get<KvBlockRemovedEvent>(events[1]);
+    EXPECT_EQ(cascaded.medium, kH);
+    EXPECT_EQ(cascaded.block_hashes, (std::vector<std::uint64_t>{11}));
+
+    // Round-trip KvClearMediumEvent through FromEvents / ToEvents.
+    const KvEventBatch rebuilt = KvEventBatch::FromEvents(events);
+    EXPECT_EQ(rebuilt.Size(), 2u);
+    EXPECT_EQ(rebuilt.ClearedMedia().size(), 1u);
+    EXPECT_EQ(static_cast<KvEventMedium>(rebuilt.ClearedMedia()[0]), kK);
+    EXPECT_EQ(rebuilt.ToEvents().size(), 2u);
+
+    // ClearMedium with zero mutations still emits one ClearMedium event.
+    const KvEventBatch empty_clear = view.ApplyMutations({}, KvEventMedium::kDisk);
+    ASSERT_EQ(empty_clear.Size(), 1u);
+    ASSERT_FALSE(empty_clear.Empty());
+    EXPECT_TRUE(std::holds_alternative<KvClearMediumEvent>(empty_clear.ToEvents().front()));
 }
 
 }  // namespace tokenspeed::test

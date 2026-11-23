@@ -239,6 +239,8 @@ public:
         DiskEvictionCounts tail_cap;
         // A read of it failed: the drive no longer returns it.
         DiskEvictionCounts read_failure;
+        // Disk tier circuit breaker degraded: whole Disk index invalidated.
+        DiskEvictionCounts degraded;
         // ClearCache.
         DiskEvictionCounts flush;
     };
@@ -345,6 +347,10 @@ public:
     // ClearCache's eviction of one Disk entry, once the whole Disk tier was
     // found clearable: no cascade, counted under flush.
     void FlushDiskEntry(std::uint32_t group_id, CacheBlockLocation location);
+    // Degraded Disk clear: drop every Disk index entry while preserving
+    // external I/O and peer hard-pin references, counting invalidated entries
+    // under degraded.
+    std::size_t InvalidateDiskEntries();
 
     // Cumulative, never reset (accounting only).
     const DeviceEvictionStats& DeviceEvictions() const { return device_evictions_; }

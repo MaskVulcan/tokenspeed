@@ -52,7 +52,13 @@ struct KvBlockRemovedEvent {
     KvEventMedium medium{KvEventMedium::kDevice};
 };
 
-using KvCacheEvent = std::variant<KvBlockStoredEvent, KvBlockRemovedEvent>;
+// Whole-medium invalidation (e.g. Disk tier degraded): consumers drop all
+// entries on `medium` while preserving every other medium.
+struct KvClearMediumEvent {
+    KvEventMedium medium{KvEventMedium::kDevice};
+};
+
+using KvCacheEvent = std::variant<KvBlockStoredEvent, KvBlockRemovedEvent, KvClearMediumEvent>;
 
 // One immutable scheduler boundary. The scheduler and routing view share its
 // descriptor; neither owns a second token/hash vector for the same boundary.
@@ -78,19 +84,22 @@ struct KvEventMutation {
 // no descriptor, cache block, request, or scheduler reference.
 class KvEventBatch {
 public:
-    std::size_t Size() const noexcept { return stored_.size(); }
-    bool Empty() const noexcept { return stored_.empty(); }
+    std::size_t Size() const noexcept { return cleared_media_.size() + stored_.size(); }
+    bool Empty() const noexcept { return cleared_media_.empty() && stored_.empty(); }
     std::size_t ByteSize() const noexcept;
     void Reserve(std::size_t events, std::size_t hashes, std::size_t tokens);
     void Store(std::span<const std::uint64_t> hashes, std::optional<std::uint64_t> parent,
                std::span<const std::int32_t> tokens, std::int32_t block_size, KvEventMedium medium);
     void Remove(std::span<const std::uint64_t> hashes, KvEventMedium medium);
+    void ClearMedium(KvEventMedium medium);
     // Compatibility at the Python/diagnostic boundary; the engine consumes
     // the columns directly. All event forms, including multi-hash events,
     // retain the existing wire representation.
     static KvEventBatch FromEvents(std::span<const KvCacheEvent> events);
     std::vector<KvCacheEvent> ToEvents() const;
 
+    // Media cleared whole before block-level events, as KvEventMedium values.
+    std::span<const std::uint8_t> ClearedMedia() const noexcept { return cleared_media_; }
     std::span<const std::uint8_t> Stored() const noexcept { return stored_; }
     std::span<const std::uint8_t> HasParent() const noexcept { return has_parent_; }
     std::span<const std::uint64_t> Parents() const noexcept { return parents_; }
@@ -105,6 +114,7 @@ public:
 private:
     void Append(bool stored, std::span<const std::uint64_t> hashes, std::optional<std::uint64_t> parent,
                 std::span<const std::int32_t> tokens, std::int32_t block_size, KvEventMedium medium);
+    std::vector<std::uint8_t> cleared_media_;
     std::vector<std::uint8_t> stored_;
     std::vector<std::uint8_t> media_;
     std::vector<std::uint8_t> has_parent_;
@@ -127,7 +137,11 @@ class KvEventPrefixView {
 public:
     // One ordering point: removals leaf-first, stores parent-first. Mutations
     // may arrive in any order, including children before missing parents.
-    KvEventBatch ApplyMutations(std::span<const KvEventMutation> mutations);
+    // When `clear_medium` is set, emits one ClearMedium event for that medium
+    // and suppresses redundant per-block removals on that medium while keeping
+    // all events for other media intact.
+    KvEventBatch ApplyMutations(std::span<const KvEventMutation> mutations,
+                                std::optional<KvEventMedium> clear_medium = std::nullopt);
     std::vector<KvCacheEvent> Apply(std::vector<KvCacheEvent> events);
 
 private:

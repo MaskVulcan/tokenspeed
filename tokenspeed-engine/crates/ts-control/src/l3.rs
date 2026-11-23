@@ -240,6 +240,7 @@ impl L3 {
             cancellations: std::mem::take(&mut self.cancellations),
             done,
             disk_done: Vec::new(),
+            disk_degraded: false,
         })
     }
 

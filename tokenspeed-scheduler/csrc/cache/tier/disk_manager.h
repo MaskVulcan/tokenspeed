@@ -84,6 +84,11 @@ public:
     void StartCleaning();
     // Forgets the queued keys (a flush, a frozen round).
     void DropCleaning();
+    // Monotonic degraded transition: stops future cleaning and prefetches and
+    // drops unissued commands while leaving already-issued operations in
+    // `operations_` until `Complete` retires their blocks.
+    void MarkDegraded();
+    bool Degraded() const { return degraded_; }
 
     // Publishes what a finished operation moved: a read's Host entries, a
     // write's Disk entries. A failed read drops the Disk entries it read.
@@ -139,6 +144,7 @@ private:
     std::uint64_t failed_reads_{0};
     std::uint64_t failed_writes_{0};
     std::uint64_t dropped_cleanings_{0};
+    bool degraded_{false};
 };
 
 }  // namespace tokenspeed

@@ -63,6 +63,29 @@ void Scheduler::handleEvent(const cache::DiskDone& event) {
     disk_transfers_->Complete(event);
 }
 
+void Scheduler::handleEvent(const cache::DiskDegraded&) {
+    if (!disk_transfers_) throw std::invalid_argument("a Disk degradation without a configured Disk tier");
+    if (disk_transfers_->Degraded()) return;
+    // Unblock requests waiting on uncompleted Disk prefetches before marking
+    // degraded: unissued reads are withdrawn immediately while already-issued
+    // reads keep their Host/Disk block references until DiskDone retires them.
+    // Completed prefetches (from DiskDone earlier in this batch) stay Ready.
+    for (const auto& request : requests_) {
+        const auto* prefetch = request->GetIf<fsm::Prefetching>();
+        if (prefetch != nullptr && prefetch->lease.IssuedBy(*disk_transfers_) &&
+            !disk_transfers_->Completed(prefetch->lease.OperationId())) {
+            releaseStorage(*request);
+        }
+    }
+    disk_transfers_->MarkDegraded();
+    const std::size_t invalidated = coordinator_.InvalidateDiskCache();
+    if (config_.enable_kv_cache_events) {
+        pending_disk_kv_clear_ = true;
+    }
+    spdlog::error("[Disk] Disk tier degraded; invalidated {} Disk entries and disabled future Disk transfers",
+                  invalidated);
+}
+
 void Scheduler::prepareDisk(Request& request) {
     const DiskConfig& limits = disk_transfers_->Config();
     if (auto* state = request.GetIf<fsm::Prefetching>()) {
@@ -85,7 +108,7 @@ void Scheduler::prepareDisk(Request& request) {
     auto* admission = request.AdmissionResourcesPtr();
     if (admission == nullptr || admission->storage_prepared || !storage_allowed_) return;
     // Decode receives its prompt from its PD peer.
-    if (config_.role == Role::kD) {
+    if (config_.role == Role::kD || disk_transfers_->Degraded()) {
         admission->storage_prepared = true;
         return;
     }

@@ -467,6 +467,19 @@ void CacheEvictor::InvalidateHostEntries() {
     }
 }
 
+std::size_t CacheEvictor::InvalidateDiskEntries() {
+    const BlockPool* pool = store_.DiskPool();
+    if (pool == nullptr) return 0;
+    std::size_t invalidated = 0;
+    for (auto& group : store_.Groups()) {
+        const std::size_t count = static_cast<std::size_t>(group.Index().NumEntries(*pool));
+        invalidated += count;
+        disk_evictions_.degraded.blocks += count;
+        group.Index().Invalidate(*pool);
+    }
+    return invalidated;
+}
+
 void CacheEvictor::RecordTail(const ContentHash& prior, const TailPublication& tail) {
     const std::optional<TailTable::Tail> dropped = store_.Boundaries().RecordTail(prior, tail.tail_tokens, tail.hash);
     if (!dropped) {

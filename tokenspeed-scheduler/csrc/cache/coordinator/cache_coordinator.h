@@ -420,6 +420,11 @@ public:
     // Requires a successful retaining-storage preflight on the control thread.
     // Removes cache indexes; external refs keep their physical slots occupied.
     void ClearCacheRetainingStorage();
+    // Drops every Disk index entry while leaving Device/Host intact and keeping
+    // external Disk block holds (in-flight Disk transfers, peer hard pins)
+    // alive until retired or released; collects any Host entries stranded
+    // beneath Disk-only ancestors.
+    std::size_t InvalidateDiskCache();
     // Evicts, on every tier, the prefix entries no probe can resume from any
     // more (write_back_evictions only; nothing is queued otherwise). A node no
     // eviction write-back is bringing to the Host is dead when no checkpoint

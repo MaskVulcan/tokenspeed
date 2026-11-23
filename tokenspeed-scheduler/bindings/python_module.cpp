@@ -120,6 +120,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_prop_ro("medium",
                      [medium_name](const tokenspeed::KvBlockRemovedEvent& event) { return medium_name(event.medium); });
 
+    nb::class_<tokenspeed::KvClearMediumEvent>(kv_event, "ClearMedium")
+        .def_prop_ro("kind", [](const tokenspeed::KvClearMediumEvent&) { return "ClearMedium"; })
+        .def_prop_ro("medium",
+                     [medium_name](const tokenspeed::KvClearMediumEvent& event) { return medium_name(event.medium); });
+
     auto scheduler_config = nb::class_<tokenspeed::SchedulerConfig>(m, "SchedulerConfig");
 
     nb::enum_<tokenspeed::Role>(scheduler_config, "Role")
@@ -522,6 +527,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<std::uint64_t, bool>(), nb::arg("op_id"), nb::arg("success"))
         .def_ro("op_id", &tokenspeed::cache::DiskDone::op_id)
         .def_ro("success", &tokenspeed::cache::DiskDone::success);
+
+    nb::class_<tokenspeed::cache::DiskDegraded>(cache, "DiskDegraded").def(nb::init<>());
 
     nb::class_<tokenspeed::cache::WriteBackDone>(cache, "WriteBackDoneEvent")
         .def(nb::init<>())

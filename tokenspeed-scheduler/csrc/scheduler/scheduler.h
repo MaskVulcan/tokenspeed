@@ -599,6 +599,7 @@ private:
     void handleEvent(const cache::StorageTick& event);
     void handleEvent(const cache::StorageDone& event);
     void handleEvent(const cache::DiskDone& event);
+    void handleEvent(const cache::DiskDegraded& event);
     void handleEvent(const cache::StorageDetach& event);
     void prepareStorage(Request& request);
     // The Disk tier's counterpart of prepareStorage: a waiting prompt whose
@@ -981,6 +982,9 @@ private:
     // this order carries no meaning; DrainKvEvents sorts the batch.
     std::vector<CacheKey> kv_event_boundaries_to_reconcile_;
     KvEventPrefixView kv_event_prefix_view_;
+    // Set when DiskDegraded invalidates the Disk index so the next KV event
+    // drain emits one ClearMedium(kDisk) instead of per-block Disk removals.
+    bool pending_disk_kv_clear_{false};
 
     // SchedulerConfig::demote_superseded_state_checkpoints where it takes
     // effect (a model with State groups, outside the D role): what finishes

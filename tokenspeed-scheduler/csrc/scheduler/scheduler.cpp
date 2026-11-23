@@ -213,7 +213,9 @@ KvEventBatch Scheduler::DrainKvEventBatch() {
     }
     // Cache keys own no payload; retain the allocation for the next round.
     kv_event_boundaries_to_reconcile_.clear();
-    return kv_event_prefix_view_.ApplyMutations(mutations);
+    const bool clear_disk = std::exchange(pending_disk_kv_clear_, false);
+    return kv_event_prefix_view_.ApplyMutations(
+        mutations, clear_disk ? std::optional{KvEventMedium::kDisk} : std::nullopt);
 }
 
 bool Scheduler::ClearL1Cache() {

@@ -403,10 +403,10 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
                   rust::Slice<const StorageDoneView> done, rust::Slice<const DiskDoneView> disk_done,
-                  rust::Slice<const CacheEvent> cache_events) {
+                  bool disk_degraded, rust::Slice<const CacheEvent> cache_events) {
     // One batch, in the order the Python hooks built it: the storage clock,
-    // the cancellations, the storage and Disk completions, then the Host
-    // copies' ACKs.
+    // the cancellations, the storage and Disk completions, any Disk
+    // degradation transition, then the Host copies' ACKs.
     tokenspeed::ExecutionEvent execution_event;
     for (const StorageTickView& tick : ticks) {
         execution_event.With(tokenspeed::cache::StorageTick{
@@ -440,6 +440,9 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
     }
     for (const DiskDoneView& completion : disk_done) {
         execution_event.With(tokenspeed::cache::DiskDone{.op_id = completion.op_id, .success = completion.success});
+    }
+    if (disk_degraded) {
+        execution_event.With(tokenspeed::cache::DiskDegraded{});
     }
     for (const CacheEvent& event : cache_events) {
         switch (event.kind) {
@@ -548,9 +551,14 @@ std::unique_ptr<tokenspeed::KvEventBatch> drain_kv_events(tokenspeed::Scheduler&
     return std::make_unique<tokenspeed::KvEventBatch>(std::move(batch));
 }
 
-std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const KvEventView> events) {
-    if (events.empty()) return nullptr;
+std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch_with_clears(
+    rust::Slice<const std::uint8_t> cleared_media, rust::Slice<const KvEventView> events) {
+    if (cleared_media.empty() && events.empty()) return nullptr;
     auto batch = std::make_unique<tokenspeed::KvEventBatch>();
+    for (const std::uint8_t raw_medium : cleared_media) {
+        if (raw_medium >= tokenspeed::kNumKvEventMedia) throw std::invalid_argument("an unknown KV event medium");
+        batch->ClearMedium(static_cast<tokenspeed::KvEventMedium>(raw_medium));
+    }
     for (const auto& event : events) {
         const std::span<const std::uint64_t> hashes{event.block_hashes.data(), event.block_hashes.size()};
         if (event.medium >= tokenspeed::kNumKvEventMedia) throw std::invalid_argument("an unknown KV event medium");
@@ -570,6 +578,10 @@ std::size_t kv_event_batch_size(const tokenspeed::KvEventBatch& batch) {
 }
 std::size_t kv_event_batch_bytes(const tokenspeed::KvEventBatch& batch) {
     return batch.ByteSize();
+}
+rust::Slice<const std::uint8_t> kv_event_cleared_media(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.ClearedMedia();
+    return {values.data(), values.size()};
 }
 rust::Slice<const std::uint8_t> kv_event_stored(const tokenspeed::KvEventBatch& batch) {
     const auto values = batch.Stored();

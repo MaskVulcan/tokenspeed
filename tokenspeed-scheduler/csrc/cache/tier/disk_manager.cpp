@@ -74,7 +74,7 @@ std::size_t DiskTransferManager::numOperations(DiskOpKind kind) const {
 }
 
 bool DiskTransferManager::HasReadCredits() const {
-    return operations_.size() < static_cast<std::size_t>(config_.max_operations) &&
+    return !degraded_ && operations_.size() < static_cast<std::size_t>(config_.max_operations) &&
            NumHeldHostBlocks() < static_cast<std::size_t>(config_.max_host_blocks);
 }
 
@@ -113,6 +113,7 @@ DiskOperation DiskTransferManager::command(std::uint64_t id, const Ticket& ticke
 }
 
 DiskTransferManager::ReadStartResult DiskTransferManager::TryStartRead(const PromptPrefix& prompt) {
+    if (degraded_) return {.retryable = false};
     if (!HasReadCredits()) return {.retryable = true};
     const std::size_t held = NumHeldHostBlocks();
     const auto limit = static_cast<std::size_t>(config_.max_host_blocks);
@@ -152,6 +153,7 @@ StorageLease DiskTransferManager::StartRead(const PromptPrefix& prompt) {
 }
 
 void DiskTransferManager::QueueCleaning(std::span<const CacheKey> keys) {
+    if (degraded_) return;
     for (const CacheKey& key : keys) {
         if (cleaning_.size() == static_cast<std::size_t>(config_.max_queued_cleanings)) {
             cleaning_.pop_front();
@@ -166,7 +168,28 @@ void DiskTransferManager::DropCleaning() {
     cleaning_.clear();
 }
 
+void DiskTransferManager::MarkDegraded() {
+    if (degraded_) return;
+    degraded_ = true;
+    DropCleaning();
+    // Unissued commands still sitting in the scheduler-owned outbox have never
+    // been handed to an executor. Drop them cleanly; already-issued operations
+    // stay in `operations_` until `Complete` retires their blocks.
+    for (const DiskOperation& op : std::exchange(commands_, {})) {
+        const auto it = operations_.find(op.op_id);
+        if (it == operations_.end()) continue;
+        if (it->second.kind == DiskOpKind::kWrite || it->second.detached) {
+            operations_.erase(it);
+        } else {
+            it->second.completed = true;
+            it->second.disk_blocks.clear();
+            it->second.host_blocks.clear();
+        }
+    }
+}
+
 void DiskTransferManager::StartCleaning() {
+    if (degraded_) return;
     const auto max_ops = static_cast<std::size_t>(config_.max_operations);
     const std::size_t max_write_ops = std::max<std::size_t>(1, max_ops / 4);
     const std::size_t read_reserve = max_ops > 1 ? 1 : 0;
@@ -216,19 +239,21 @@ void DiskTransferManager::StartCleaning() {
     // Admission filter applied to the branch tip (`cleaning_.front()`): skips
     // short branches and single-hit cold tails without breaking ancestor chains
     // of qualifying long/reused branches.
-    const auto rejected_by_admission = [&](const CacheKey& key) {
+    const auto rejected_by_admission = [&](const CacheKey& key, const BoundaryTree::Node& node) {
         if (config_.min_clean_tokens == 0 && !config_.require_reuse_for_cleaning) return false;
         const auto loc = store.LocationOf(host_pool, key.group_id, key);
         if (!loc) return true;
         const auto meta = store.Groups()[key.group_id].Index().MetadataFor(host_pool, *loc);
         if (!meta) return true;
         if (config_.require_reuse_for_cleaning && !meta->eviction.was_acquired) return true;
-        if (config_.min_clean_tokens > 0 && meta->eviction.logical_block_index >= 0) {
-            const std::int32_t group_granularity = store.Groups()[key.group_id].Spec().block_granularity;
-            const std::int64_t span = group_granularity > 0 ? group_granularity : store.PrefixGranularity();
-            const std::int64_t branch_tokens =
-                (static_cast<std::int64_t>(meta->eviction.logical_block_index) + 1) * span;
-            if (branch_tokens < config_.min_clean_tokens) return true;
+        if (config_.min_clean_tokens > 0) {
+            std::int64_t branch_tokens = node.boundary_tokens;
+            if (branch_tokens <= 0 && meta->eviction.logical_block_index >= 0) {
+                const std::int32_t group_granularity = store.Groups()[key.group_id].Spec().block_granularity;
+                const std::int64_t span = group_granularity > 0 ? group_granularity : store.PrefixGranularity();
+                branch_tokens = (static_cast<std::int64_t>(meta->eviction.logical_block_index) + 1) * span;
+            }
+            if (branch_tokens > 0 && branch_tokens < config_.min_clean_tokens) return true;
         }
         return false;
     };
@@ -242,7 +267,7 @@ void DiskTransferManager::StartCleaning() {
             cleaning_.pop_front();
             continue;
         }
-        if (rejected_by_admission(front)) {
+        if (rejected_by_admission(front, *node)) {
             cleaning_.pop_front();
             ++dropped_cleanings_;
             continue;
@@ -347,11 +372,13 @@ void DiskTransferManager::Complete(const cache::DiskDone& event) {
         return;
     }
     if (event.success) {
-        written_blocks_ += ticket.keys.size();
-        for (std::size_t i = 0; i < ticket.keys.size(); ++i) {
-            // A Host entry still there still describes these bytes.
-            if (coordinator_.Host().ContainsHostCachedBlock(ticket.keys[i])) {
-                coordinator_.Disk().CacheDiskBlock(ticket.disk_blocks[i], ticket.keys[i], ticket.metadata[i]);
+        if (!degraded_) {
+            written_blocks_ += ticket.keys.size();
+            for (std::size_t i = 0; i < ticket.keys.size(); ++i) {
+                // A Host entry still there still describes these bytes.
+                if (coordinator_.Host().ContainsHostCachedBlock(ticket.keys[i])) {
+                    coordinator_.Disk().CacheDiskBlock(ticket.disk_blocks[i], ticket.keys[i], ticket.metadata[i]);
+                }
             }
         }
     } else {

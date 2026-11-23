@@ -386,3 +386,156 @@ fn evicted_pages_come_back_from_disk_through_io_uring() {
 fn evicted_pages_come_back_from_disk_through_psync() {
     evicted_pages_come_back_from_disk(Backend::Psync);
 }
+
+#[test]
+fn disk_degraded_clears_scheduler_disk_index_and_encodes_clear_medium_disk() {
+    use ts_control::kv_events::encode_batch;
+    use ts_scheduler::{KvEventMedium, StorageRound, StorageTickView};
+
+    interpreter();
+    let mut sched = Python::attach(|py| {
+        let code = format!(
+            r#"
+import tokenspeed_scheduler as ts
+cfg = ts.SchedulerConfig()
+cfg.role = ts.SchedulerConfig.Role.Fused
+cfg.prefix_granularity = {PAGE}
+cfg.max_scheduled_tokens = 64
+cfg.max_batch_size = 8
+cfg.max_resident_requests = 8
+cfg.num_device_pages = 9
+cfg.num_snapshot_pages = 9
+cfg.max_retracted_requests = 8
+cfg.disable_l2_cache = False
+cfg.enable_kv_cache_events = True
+cfg.num_host_pages = {host_pages}
+cfg.host_group_packing = [1]
+cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteBack
+cfg.num_disk_pages = {disk_pages}
+cfg.disk_config = ts.DiskConfig(max_operations=4, max_blocks_per_operation=64,
+                                max_host_blocks=4, max_write_host_blocks=2,
+                                max_queued_cleanings=64, min_prefetch_tokens=1,
+                                wait_timeout_us=10_000_000, ready_timeout_us=10_000_000)
+cfg.cache_groups = [ts.CacheGroupConfig(group_id="full", block_granularity={PAGE},
+                                        total_pages=9, attn_kind=ts.AttnKind.Full)]
+result = ts.Scheduler(cfg)
+"#,
+            host_pages = HOST_BLOCKS + 1,
+            disk_pages = DISK_BLOCKS + 1,
+        );
+        let globals = PyDict::new(py);
+        py.run(&CString::new(code).unwrap(), Some(&globals), None)
+            .unwrap();
+        Scheduler::from_python(&globals.get_item("result").unwrap().unwrap()).unwrap()
+    });
+
+    let tick = |now_us: i64, disk_degraded: bool| StorageRound {
+        tick: Some(StorageTickView {
+            now_us,
+            allow_forward: true,
+            allow_storage: true,
+            queued_operations: 0,
+            queued_bytes: 0,
+            oldest_operation_us: 0,
+        }),
+        disk_degraded,
+        ..StorageRound::default()
+    };
+    sched.advance_head(&tick(1, false), &[]).unwrap();
+
+    // Seed + pressure so one page moves to Host and gets cleaned to Disk.
+    let submit_and_finish = |sched: &mut Scheduler, rid: &str, tokens: Vec<i32>| -> Vec<CacheEvent> {
+        sched
+            .submit_requests(&[RequestSpec {
+                admission_id: 0,
+                request_id: rid.to_owned(),
+                session_id: String::new(),
+                cache_group_id: String::new(),
+                shared_prefix_tokens: Vec::new(),
+                peer_holder: String::new(),
+                tokens,
+                max_new_tokens: 1,
+                max_cached_prefix_tokens: i32::MAX,
+            }])
+            .unwrap();
+        let plan = sched.next_execution_plan(true, false);
+        let acks: Vec<CacheEvent> = plan
+            .cache_ops()
+            .into_iter()
+            .map(|op| CacheEvent {
+                kind: match op.kind {
+                    CacheOpKind::WriteBack => CacheEventKind::WriteBackDone,
+                    CacheOpKind::LoadBack => CacheEventKind::LoadBackDone,
+                    CacheOpKind::SnapshotStore => CacheEventKind::SnapshotDone,
+                    CacheOpKind::SnapshotRestore => CacheEventKind::RestoreDone,
+                    _ => unreachable!(),
+                },
+                op_id: op.op_id,
+            })
+            .collect();
+        sched
+            .advance(&[
+                ForwardEvent {
+                    kind: ForwardEventKind::ExtendResult,
+                    request_id: rid.to_owned(),
+                    tokens: vec![900],
+                    spec_candidate_ids: Vec::new(),
+                    reserve_num_tokens: 0,
+                    bootstrap_token: -1,
+                },
+                ForwardEvent {
+                    kind: ForwardEventKind::Finish,
+                    request_id: rid.to_owned(),
+                    tokens: Vec::new(),
+                    spec_candidate_ids: Vec::new(),
+                    reserve_num_tokens: 0,
+                    bootstrap_token: -1,
+                },
+            ])
+            .unwrap();
+        acks
+    };
+
+    let acks1 = submit_and_finish(&mut sched, "seed", (1..=8).collect());
+    sched.advance_head(&tick(2, false), &acks1).unwrap();
+    let acks2 = submit_and_finish(&mut sched, "pressure", (101..=123).collect());
+    sched.advance_head(&tick(3, false), &acks2).unwrap();
+    let write_plan = sched.next_execution_plan(true, false);
+    let writes = write_plan.disk_ops();
+    assert_eq!(writes.len(), 1);
+    sched
+        .advance_head(
+            &StorageRound {
+                disk_done: vec![ts_scheduler::DiskDoneView {
+                    op_id: writes[0].op_id,
+                    success: true,
+                }],
+                ..tick(4, false)
+            },
+            &[],
+        )
+        .unwrap();
+    assert_eq!(sched.disk_stats().disk_blocks, 1);
+    let stored_events = sched.drain_kv_events();
+    assert!(stored_events
+        .iter()
+        .any(|e| e.stored && e.medium == KvEventMedium::Disk));
+
+    // Feed mirrored-rank DiskDegraded transition through FFI advance_head.
+    sched.advance_head(&tick(5, true), &[]).unwrap();
+    assert_eq!(sched.disk_stats().disk_blocks, 0);
+    let drained = sched.drain_kv_events();
+    assert_eq!(
+        drained.cleared_media().collect::<Vec<_>>(),
+        vec![KvEventMedium::Disk]
+    );
+    assert!(
+        drained
+            .iter()
+            .all(|e| e.stored || e.medium != KvEventMedium::Disk),
+        "per-block DISK removals must be suppressed by ClearMedium(DISK)"
+    );
+    let wire = encode_batch(1.0, &drained, 0);
+    assert!(wire.windows(b"ClearMedium".len()).any(|w| w == b"ClearMedium"));
+    assert!(wire.windows(b"DISK".len()).any(|w| w == b"DISK"));
+}

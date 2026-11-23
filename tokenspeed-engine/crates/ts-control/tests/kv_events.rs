@@ -202,3 +202,78 @@ fn batching_rejects_tokens_that_a_removal_would_discard() {
     events[0].parent_block_hash = 0;
     KvEventBatch::from_events(&events);
 }
+
+#[test]
+fn clear_medium_disk_publishes_and_replays_over_zmq() {
+    use ts_scheduler::KvEventMedium;
+
+    let (port, replay_port) = (free_port(), free_port());
+    let publisher = KvEventPublisher::start(
+        &KvEventsConfig {
+            endpoint: format!("tcp://*:{port}"),
+            replay_endpoint: Some(format!("tcp://*:{replay_port}")),
+            buffer_steps: 8,
+            max_queue_size: 64,
+            topic: "kv".to_owned(),
+        },
+        0,
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut subscriber = SubSocket::new();
+    runtime.block_on(async {
+        subscriber
+            .connect(&format!("tcp://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        subscriber.subscribe("").await.unwrap();
+    });
+    let received = loop {
+        publisher.publish(KvEventBatch::with_cleared_media(
+            &[KvEventMedium::Disk],
+            &[],
+        ));
+        let received = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(200), subscriber.recv()).await
+        });
+        if let Ok(Ok(message)) = received {
+            break message.into_vec();
+        }
+    };
+    assert_eq!(received.len(), 3);
+    assert_eq!(received[0], Bytes::from_static(b"kv"));
+    let seq = u64::from_be_bytes(received[1].as_ref().try_into().unwrap());
+    let payload = received[2].as_ref();
+    let contains = |needle: &[u8]| payload.windows(needle.len()).any(|w| w == needle);
+    assert!(contains(b"ClearMedium"));
+    assert!(contains(b"DISK"));
+    assert_eq!(payload.last().copied(), Some(0), "dp_rank = 0");
+
+    // Replay from `seq` must also carry the ClearMedium("DISK") payload.
+    let replayed_payload = runtime.block_on(async {
+        let mut client = DealerSocket::new();
+        client
+            .connect(&format!("tcp://127.0.0.1:{replay_port}"))
+            .await
+            .unwrap();
+        let mut request = ZmqMessage::from(Bytes::new());
+        request.push_back(Bytes::copy_from_slice(&seq.to_be_bytes()));
+        client.send(request).await.unwrap();
+        let mut first_payload = None;
+        loop {
+            let frames = client.recv().await.unwrap().into_vec();
+            assert_eq!(frames.len(), 3, "[delimiter, seq, payload]");
+            let replayed_seq = i64::from_be_bytes(frames[1].as_ref().try_into().unwrap());
+            if replayed_seq == -1 {
+                return first_payload.unwrap();
+            }
+            if first_payload.is_none() {
+                first_payload = Some(frames[2].to_vec());
+            }
+        }
+    });
+    assert_eq!(replayed_payload.as_slice(), payload);
+}

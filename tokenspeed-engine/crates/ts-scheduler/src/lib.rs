@@ -778,6 +778,7 @@ mod ffi {
             cancellations: &[StorageCancellationView],
             done: &[StorageDoneView],
             disk_done: &[DiskDoneView],
+            disk_degraded: bool,
             cache_events: &[CacheEvent],
         ) -> Result<()>;
         fn advance_peer(
@@ -822,9 +823,13 @@ mod ffi {
         #[namespace = "tokenspeed"]
         type KvEventBatch;
         fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> UniquePtr<KvEventBatch>;
-        fn make_kv_event_batch(events: &[KvEventView]) -> UniquePtr<KvEventBatch>;
+        fn make_kv_event_batch_with_clears(
+            cleared_media: &[u8],
+            events: &[KvEventView],
+        ) -> UniquePtr<KvEventBatch>;
         fn kv_event_batch_size(batch: &KvEventBatch) -> usize;
         fn kv_event_batch_bytes(batch: &KvEventBatch) -> usize;
+        fn kv_event_cleared_media(batch: &KvEventBatch) -> &[u8];
         fn kv_event_stored(batch: &KvEventBatch) -> &[u8];
         fn kv_event_has_parent(batch: &KvEventBatch) -> &[u8];
         fn kv_event_parents(batch: &KvEventBatch) -> &[u64];
@@ -923,6 +928,10 @@ pub struct StorageRound {
     pub done: Vec<StorageDoneView>,
     /// Disk operations every owner finished, by op id.
     pub disk_done: Vec<DiskDoneView>,
+    /// One-shot transition: at least one cache owner's Disk executor tripped
+    /// its circuit breaker this round; mirrored schedulers clear their Disk
+    /// index and emit `ClearMedium("DISK")`.
+    pub disk_degraded: bool,
 }
 
 extern "C" {
@@ -1082,6 +1091,7 @@ impl Scheduler {
             &storage.cancellations,
             &storage.done,
             &storage.disk_done,
+            storage.disk_degraded,
             cache_events,
         )
     }
@@ -1363,6 +1373,24 @@ pub enum KvEventMedium {
     /// The Disk tier (`docs/rfcs/0006-disk-tier.md`).
     Disk,
 }
+impl KvEventMedium {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Device,
+            1 => Self::Host,
+            _ => Self::Disk,
+        }
+    }
+
+    fn as_raw(self) -> u8 {
+        match self {
+            Self::Device => 0,
+            Self::Host => 1,
+            Self::Disk => 2,
+        }
+    }
+}
+
 impl KvEventBatch {
     /// Copy independent event rows into an owned batch, preserving wire fields.
     /// Serving receives the already-flat native snapshot from `drain_kv_events`.
@@ -1370,6 +1398,11 @@ impl KvEventBatch {
     /// Panics if an absent parent carries a hash, or a removal carries store
     /// fields that the wire cannot represent.
     pub fn from_events(events: &[KvEventView]) -> Self {
+        Self::with_cleared_media(&[], events)
+    }
+
+    /// Copy cleared media and independent block event rows into an owned batch.
+    pub fn with_cleared_media(cleared_media: &[KvEventMedium], events: &[KvEventView]) -> Self {
         for event in events {
             assert!(
                 event.has_parent || event.parent_block_hash == 0,
@@ -1381,9 +1414,11 @@ impl KvEventBatch {
                 "a removal must not carry a store payload"
             );
         }
-        Self(ffi::make_kv_event_batch(events))
+        let raw_media: Vec<u8> = cleared_media.iter().map(|m| m.as_raw()).collect();
+        Self(ffi::make_kv_event_batch_with_clears(&raw_media, events))
     }
-    /// Number of events in this snapshot.
+
+    /// Number of events in this snapshot (whole-medium clears plus block events).
     pub fn len(&self) -> usize {
         self.0.as_ref().map_or(0, ffi::kv_event_batch_size)
     }
@@ -1395,7 +1430,12 @@ impl KvEventBatch {
     pub fn byte_size(&self) -> usize {
         self.0.as_ref().map_or(0, ffi::kv_event_batch_bytes)
     }
-    /// Iterate without allocating per-row vectors or copying token/hash data.
+    /// Media cleared whole before block-level events.
+    pub fn cleared_media(&self) -> impl ExactSizeIterator<Item = KvEventMedium> + '_ {
+        let raw = self.0.as_ref().map_or(&[][..], ffi::kv_event_cleared_media);
+        raw.iter().copied().map(KvEventMedium::from_raw)
+    }
+    /// Iterate block-level events without allocating per-row vectors or copying token/hash data.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = KvEvent<'_>> {
         let columns = self.0.as_ref();
         let stored = columns.map_or(&[][..], ffi::kv_event_stored);
@@ -1414,17 +1454,16 @@ impl KvEventBatch {
             parent_block_hash: parents[i],
             token_ids: &tokens[token_offsets[i]..token_offsets[i + 1]],
             block_size: block_sizes[i],
-            medium: match media[i] {
-                0 => KvEventMedium::Device,
-                1 => KvEventMedium::Host,
-                _ => KvEventMedium::Disk,
-            },
+            medium: KvEventMedium::from_raw(media[i]),
         })
     }
 }
 impl std::fmt::Debug for KvEventBatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.iter()).finish()
+        f.debug_struct("KvEventBatch")
+            .field("cleared_media", &self.cleared_media().collect::<Vec<_>>())
+            .field("events", &self.iter().collect::<Vec<_>>())
+            .finish()
     }
 }
 

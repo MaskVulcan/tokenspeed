@@ -73,7 +73,7 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
                   rust::Slice<const StorageDoneView> done, rust::Slice<const DiskDoneView> disk_done,
-                  rust::Slice<const CacheEvent> cache_events);
+                  bool disk_degraded, rust::Slice<const CacheEvent> cache_events);
 void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events);
 rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler);
 PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup);
@@ -96,9 +96,11 @@ std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler);
 PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler);
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id);
 std::unique_ptr<tokenspeed::KvEventBatch> drain_kv_events(tokenspeed::Scheduler& scheduler);
-std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const KvEventView> events);
+std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch_with_clears(
+    rust::Slice<const std::uint8_t> cleared_media, rust::Slice<const KvEventView> events);
 std::size_t kv_event_batch_size(const tokenspeed::KvEventBatch& batch);
 std::size_t kv_event_batch_bytes(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::uint8_t> kv_event_cleared_media(const tokenspeed::KvEventBatch& batch);
 rust::Slice<const std::uint8_t> kv_event_stored(const tokenspeed::KvEventBatch& batch);
 rust::Slice<const std::uint8_t> kv_event_has_parent(const tokenspeed::KvEventBatch& batch);
 rust::Slice<const std::uint64_t> kv_event_parents(const tokenspeed::KvEventBatch& batch);

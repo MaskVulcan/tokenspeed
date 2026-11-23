@@ -907,7 +907,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             Vec::new()
         };
-        if storage.tick.is_some() || !ready.is_empty() {
+        if storage.tick.is_some() || storage.disk_degraded || !ready.is_empty() {
             if !ready.is_empty() {
                 tracing::debug!(
                     ?ready,
@@ -998,6 +998,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         busy |= !ready.is_empty()
             || !storage.done.is_empty()
             || !storage.disk_done.is_empty()
+            || storage.disk_degraded
             || !events.is_empty()
             || !outputs.is_empty()
             || !released.is_empty();

@@ -112,6 +112,12 @@ struct DiskDone {
     std::uint64_t op_id;
     bool success;
 };
+
+// The replica agreed that at least one cache owner's Disk executor tripped its
+// circuit breaker into degraded mode: drop the Disk index safely while letting
+// already-issued operations and peer hard pins retire, disable future Disk
+// cleaning and prefetches, and tell routing consumers to clear DISK entries.
+struct DiskDegraded {};
 }  // namespace cache
 
 }  // namespace tokenspeed

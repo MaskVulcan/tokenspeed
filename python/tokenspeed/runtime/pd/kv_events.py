@@ -83,8 +83,12 @@ class AllBlocksCleared(KVCacheEvent):
     pass
 
 
+class ClearMedium(KVCacheEvent):
+    medium: str | None = None
+
+
 class KVEventBatch(EventBatch):
-    events: list[BlockStored | BlockRemoved | AllBlocksCleared]
+    events: list[BlockStored | BlockRemoved | AllBlocksCleared | ClearMedium]
 
 
 class KVEventsConfig(BaseModel):

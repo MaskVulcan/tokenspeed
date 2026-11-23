@@ -100,11 +100,13 @@ pub enum DiskError {
     Protocol(&'static str),
 }
 
-/// What one rank shares each round: its clock and the operations it
-/// finished since its last report, with whether every row of each moved.
+/// What one rank shares each round: its clock, whether its Disk executor
+/// tripped into degraded/broken state, and the operations it finished since
+/// its last report, with whether every row of each moved.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Report {
     now_us: i64,
+    degraded: bool,
     finished: Vec<(u64, bool)>,
 }
 
@@ -112,6 +114,7 @@ impl Report {
     fn encode(&self) -> Vec<u8> {
         let mut out = Writer::new();
         out.i64(self.now_us);
+        out.flag(self.degraded);
         out.count(self.finished.len());
         for &(op_id, success) in &self.finished {
             out.u64(op_id);
@@ -123,12 +126,17 @@ impl Report {
     fn decode(bytes: &[u8]) -> Option<Self> {
         let mut input = Reader::new(bytes);
         let now_us = input.i64()?;
+        let degraded = input.flag()?;
         let count = input.count()?;
         let mut finished = Vec::with_capacity(count.min(4096));
         for _ in 0..count {
             finished.push((input.u64()?, input.flag()?));
         }
-        input.finish(Self { now_us, finished })
+        input.finish(Self {
+            now_us,
+            degraded,
+            finished,
+        })
     }
 }
 
@@ -139,6 +147,8 @@ struct Agreement {
     max_operations: usize,
     /// Per operation, each owner's outcome until every owner reported.
     reports: BTreeMap<u64, BTreeMap<usize, bool>>,
+    /// Latched true on the round any replica member first reports degraded.
+    degraded: bool,
 }
 
 impl Agreement {
@@ -183,6 +193,20 @@ impl Agreement {
                 }
             })
             .collect();
+        let any_degraded = reports.iter().any(|report| report.degraded);
+        let disk_degraded = any_degraded && !self.degraded;
+        if disk_degraded {
+            self.degraded = true;
+            let degraded_ranks: Vec<usize> = reports
+                .iter()
+                .enumerate()
+                .filter_map(|(rank, report)| report.degraded.then_some(rank))
+                .collect();
+            tracing::error!(
+                ?degraded_ranks,
+                "Disk tier circuit breaker tripped on replica rank(s); clearing Disk index across mirrored ranks"
+            );
+        }
         Ok(StorageRound {
             tick: Some(StorageTickView {
                 now_us: first.now_us,
@@ -195,6 +219,7 @@ impl Agreement {
             cancellations: Vec::new(),
             done: Vec::new(),
             disk_done,
+            disk_degraded,
         })
     }
 }
@@ -290,6 +315,7 @@ impl DiskTier {
             agreement: Agreement {
                 max_operations: settings.max_operations,
                 reports: BTreeMap::new(),
+                degraded: false,
             },
             clock: Instant::now(),
             metrics_sampled: None,
@@ -346,7 +372,8 @@ impl DiskTier {
             let bytes: usize = ios.iter().map(|io| io.len).sum();
             let finished = self.finished.clone();
             let job_metrics = self.job_metrics.clone();
-            self.executor
+            match self
+                .executor
                 .submit(Job { direction, ios }, move |report: JobReport| {
                     let succeeded = report.outcome.is_ok();
                     if let Err(error) = &report.outcome {
@@ -379,15 +406,42 @@ impl DiskTier {
                         );
                     }
                     finished.lock().push((op_id, succeeded));
-                })?;
+                }) {
+                Ok(_) => {}
+                Err(ts_disk::SubmitError::Closed) if self.degraded() => {
+                    // The breaker tripped between this round's report() and submit():
+                    // report the op failed on the next round so mirrored ranks stay
+                    // in lockstep and release every held block without crashing.
+                    tracing::warn!(
+                        op_id,
+                        "Disk executor degraded before submission; reporting operation failed"
+                    );
+                    if let Some(metrics) = &self.job_metrics {
+                        metrics.observe(name, false, None, Duration::ZERO);
+                    }
+                    self.finished.lock().push((op_id, false));
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(!ops.is_empty())
     }
 
-    /// This round's report: the clock and what finished since the last.
+    /// Whether this rank's local Disk executor tripped into degraded or broken state.
+    pub fn degraded(&self) -> bool {
+        self.executor.degraded() || self.executor.broken()
+    }
+
+    /// Whether the replica has agreed that the Disk tier is degraded.
+    pub fn agreed_degraded(&self) -> bool {
+        self.agreement.degraded
+    }
+
+    /// This round's report: the clock, degraded state, and what finished since the last.
     pub fn report(&self) -> Vec<u8> {
         Report {
             now_us: i64::try_from(self.clock.elapsed().as_micros()).unwrap_or(i64::MAX),
+            degraded: self.degraded(),
             finished: std::mem::take(&mut *self.finished.lock()),
         }
         .encode()
@@ -491,8 +545,13 @@ mod tests {
     use super::*;
 
     fn report(now_us: i64, finished: &[(u64, bool)]) -> Vec<u8> {
+        report_degraded(now_us, false, finished)
+    }
+
+    fn report_degraded(now_us: i64, degraded: bool, finished: &[(u64, bool)]) -> Vec<u8> {
         Report {
             now_us,
+            degraded,
             finished: finished.to_vec(),
         }
         .encode()
@@ -503,12 +562,14 @@ mod tests {
         let mut agreement = Agreement {
             max_operations: 8,
             reports: BTreeMap::new(),
+            degraded: false,
         };
         let first = agreement
             .agree(&[report(5, &[(1, true)]), report(9, &[])], true, true)
             .unwrap();
         assert_eq!(first.tick.unwrap().now_us, 5, "the first member's clock");
         assert!(first.disk_done.is_empty());
+        assert!(!first.disk_degraded);
         let second = agreement
             .agree(
                 &[
@@ -532,6 +593,7 @@ mod tests {
                 }
             ]
         );
+        assert!(!second.disk_degraded);
     }
 
     #[test]
@@ -539,6 +601,7 @@ mod tests {
         let mut agreement = Agreement {
             max_operations: 8,
             reports: BTreeMap::new(),
+            degraded: false,
         };
         agreement
             .agree(&[report(1, &[(3, true)]), report(1, &[])], true, true)
@@ -550,12 +613,73 @@ mod tests {
     }
 
     #[test]
+    fn degraded_from_any_rank_agrees_once_latches_and_retires_in_flight_ops() {
+        let mut rank0 = Agreement {
+            max_operations: 8,
+            reports: BTreeMap::new(),
+            degraded: false,
+        };
+        let mut rank1 = Agreement {
+            max_operations: 8,
+            reports: BTreeMap::new(),
+            degraded: false,
+        };
+        let mut rank2 = Agreement {
+            max_operations: 8,
+            reports: BTreeMap::new(),
+            degraded: false,
+        };
+
+        // Round 1: op 10 completes on all 3 ranks; only rank 2 reports degraded.
+        let r1 = [
+            report_degraded(10, false, &[(10, true)]),
+            report_degraded(11, false, &[(10, true)]),
+            report_degraded(12, true, &[(10, false)]),
+        ];
+        let a0 = rank0.agree(&r1, true, true).unwrap();
+        let a1 = rank1.agree(&r1, true, true).unwrap();
+        let a2 = rank2.agree(&r1, true, true).unwrap();
+        assert_eq!(a0, a1);
+        assert_eq!(a1, a2);
+        assert!(a0.disk_degraded);
+        assert_eq!(
+            a0.disk_done,
+            vec![DiskDoneView {
+                op_id: 10,
+                success: false
+            }]
+        );
+
+        // Round 2: rank 1 and rank 2 still report degraded; disk_degraded stays
+        // latched (false) while an in-flight op 11 retires cleanly.
+        let r2 = [
+            report_degraded(20, false, &[(11, true)]),
+            report_degraded(21, true, &[(11, true)]),
+            report_degraded(22, true, &[(11, false)]),
+        ];
+        let b0 = rank0.agree(&r2, true, true).unwrap();
+        let b1 = rank1.agree(&r2, true, true).unwrap();
+        let b2 = rank2.agree(&r2, true, true).unwrap();
+        assert_eq!(b0, b1);
+        assert_eq!(b1, b2);
+        assert!(!b0.disk_degraded);
+        assert_eq!(
+            b0.disk_done,
+            vec![DiskDoneView {
+                op_id: 11,
+                success: false
+            }]
+        );
+    }
+
+    #[test]
     fn reports_round_trip() {
-        let bytes = report(-1, &[(7, true), (u64::MAX, false)]);
+        let bytes = report_degraded(-1, true, &[(7, true), (u64::MAX, false)]);
         assert_eq!(
             Report::decode(&bytes),
             Some(Report {
                 now_us: -1,
+                degraded: true,
                 finished: vec![(7, true), (u64::MAX, false)]
             })
         );

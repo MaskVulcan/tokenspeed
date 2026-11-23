@@ -132,16 +132,19 @@ std::vector<KvCacheEvent> KvEventPrefixView::Apply(std::vector<KvCacheEvent> eve
                                                        .token_ids = std::move(stored->token_ids),
                                                        .block_size = stored->block_size}),
                                  .resident = {true, false}});
-        } else {
-            for (const auto hash : std::get<KvBlockRemovedEvent>(event).block_hashes) {
+        } else if (auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+            for (const auto hash : removed->block_hashes) {
                 mutations.push_back({.block_hash = hash, .stored = {}, .resident = {}});
             }
+        } else {
+            throw std::invalid_argument("routing residency events do not accept ClearMedium");
         }
     }
     return ApplyMutations(mutations).ToEvents();
 }
 
-KvEventBatch KvEventPrefixView::ApplyMutations(std::span<const KvEventMutation> mutations) {
+KvEventBatch KvEventPrefixView::ApplyMutations(std::span<const KvEventMutation> mutations,
+                                               std::optional<KvEventMedium> clear_medium) {
     // A wrapped generation must not alias one retained by a live node.
     if (round_ == std::numeric_limits<std::uint64_t>::max()) {
         for (auto& [hash, node] : nodes_) node.changed_round = 0;
@@ -185,6 +188,9 @@ KvEventBatch KvEventPrefixView::ApplyMutations(std::span<const KvEventMutation> 
         const auto& node = nodes_.at(hash);
         for (std::size_t medium = 0; medium < kNumKvEventMedia; ++medium) {
             if (node.was_visible[medium] == node.visible[medium]) continue;
+            if (!node.visible[medium] && clear_medium && static_cast<KvEventMedium>(medium) == *clear_medium) {
+                continue;
+            }
             (node.visible[medium] ? stored : removed).emplace_back(node.depth, static_cast<std::uint8_t>(medium), hash);
             if (node.visible[medium]) {
                 const auto count = node.descriptor->token_ids.size();
@@ -198,6 +204,9 @@ KvEventBatch KvEventPrefixView::ApplyMutations(std::span<const KvEventMutation> 
     std::sort(removed.begin(), removed.end(), std::greater<>());
     std::sort(stored.begin(), stored.end());
     KvEventBatch result;
+    if (clear_medium) {
+        result.ClearMedium(*clear_medium);
+    }
     const auto count = removed.size() + stored.size();
     result.Reserve(count, count, token_count);
     for (const auto& [depth, medium, hash] : removed) {
@@ -250,13 +259,16 @@ void KvEventBatch::Store(std::span<const std::uint64_t> hashes, std::optional<st
 void KvEventBatch::Remove(std::span<const std::uint64_t> hashes, KvEventMedium medium) {
     Append(false, hashes, std::nullopt, {}, 0, medium);
 }
+void KvEventBatch::ClearMedium(KvEventMedium medium) {
+    cleared_media_.push_back(static_cast<std::uint8_t>(medium));
+}
 
 std::size_t KvEventBatch::ByteSize() const noexcept {
-    return stored_.size() * sizeof(std::uint8_t) + media_.size() * sizeof(std::uint8_t) +
-           has_parent_.size() * sizeof(std::uint8_t) + parents_.size() * sizeof(std::uint64_t) +
-           block_sizes_.size() * sizeof(std::int32_t) + hash_offsets_.size() * sizeof(std::size_t) +
-           token_offsets_.size() * sizeof(std::size_t) + hashes_.size() * sizeof(std::uint64_t) +
-           tokens_.size() * sizeof(std::int32_t);
+    return cleared_media_.size() * sizeof(std::uint8_t) + stored_.size() * sizeof(std::uint8_t) +
+           media_.size() * sizeof(std::uint8_t) + has_parent_.size() * sizeof(std::uint8_t) +
+           parents_.size() * sizeof(std::uint64_t) + block_sizes_.size() * sizeof(std::int32_t) +
+           hash_offsets_.size() * sizeof(std::size_t) + token_offsets_.size() * sizeof(std::size_t) +
+           hashes_.size() * sizeof(std::uint64_t) + tokens_.size() * sizeof(std::int32_t);
 }
 
 KvEventBatch KvEventBatch::FromEvents(std::span<const KvCacheEvent> events) {
@@ -265,9 +277,11 @@ KvEventBatch KvEventBatch::FromEvents(std::span<const KvCacheEvent> events) {
         if (const auto* stored = std::get_if<KvBlockStoredEvent>(&event)) {
             result.Store(stored->block_hashes, stored->parent_block_hash, stored->token_ids, stored->block_size,
                          stored->medium);
+        } else if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+            result.Remove(removed->block_hashes, removed->medium);
         } else {
-            const auto& removed = std::get<KvBlockRemovedEvent>(event);
-            result.Remove(removed.block_hashes, removed.medium);
+            const auto& cleared = std::get<KvClearMediumEvent>(event);
+            result.ClearMedium(cleared.medium);
         }
     }
     return result;
@@ -276,7 +290,10 @@ KvEventBatch KvEventBatch::FromEvents(std::span<const KvCacheEvent> events) {
 std::vector<KvCacheEvent> KvEventBatch::ToEvents() const {
     std::vector<KvCacheEvent> result;
     result.reserve(Size());
-    for (std::size_t i = 0; i < Size(); ++i) {
+    for (const std::uint8_t medium : cleared_media_) {
+        result.emplace_back(KvClearMediumEvent{.medium = static_cast<KvEventMedium>(medium)});
+    }
+    for (std::size_t i = 0; i < stored_.size(); ++i) {
         std::vector<std::uint64_t> hashes(hashes_.begin() + hash_offsets_[i], hashes_.begin() + hash_offsets_[i + 1]);
         if (stored_[i]) {
             result.emplace_back(KvBlockStoredEvent{

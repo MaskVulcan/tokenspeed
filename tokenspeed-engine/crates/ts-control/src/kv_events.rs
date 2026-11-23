@@ -106,6 +106,14 @@ const MEDIUM_HOST: &str = "CPU_PINNED";
 /// The medium of a Disk tier event, as routers name local disk.
 const MEDIUM_DISK: &str = "DISK";
 
+fn encode_medium(encoder: &mut ts_wire::msgpack::Encoder, medium: KvEventMedium) {
+    match medium {
+        KvEventMedium::Device => encoder.nil(),
+        KvEventMedium::Host => encoder.str(MEDIUM_HOST),
+        KvEventMedium::Disk => encoder.str(MEDIUM_DISK),
+    }
+}
+
 /// One round's events as the publisher's payload (`KVEventBatch`): the
 /// time, the events and this rank's attention-DP rank.
 pub fn encode_batch(timestamp: f64, events: &KvEventBatch, dp_rank: i64) -> Vec<u8> {
@@ -113,14 +121,16 @@ pub fn encode_batch(timestamp: f64, events: &KvEventBatch, dp_rank: i64) -> Vec<
     encoder.array_len(3);
     encoder.float(timestamp);
     encoder.array_len(events.len());
+    for medium in events.cleared_media() {
+        // Matches Dynamo's `RawKvEvent::ClearMedium { medium }` tagged seq layout:
+        // `["ClearMedium", <medium_or_nil>]`.
+        encoder.array_len(2);
+        encoder.str("ClearMedium");
+        encode_medium(&mut encoder, medium);
+    }
     for event in events.iter() {
         // vLLM's layout: a store's `lora_id` (always nil) and `medium`, a
         // removal's `medium`; nil is the GPU cache.
-        let medium = |encoder: &mut ts_wire::msgpack::Encoder| match event.medium {
-            KvEventMedium::Device => encoder.nil(),
-            KvEventMedium::Host => encoder.str(MEDIUM_HOST),
-            KvEventMedium::Disk => encoder.str(MEDIUM_DISK),
-        };
         if event.stored {
             encoder.array_len(7);
             encoder.str("BlockStored");
@@ -136,12 +146,12 @@ pub fn encode_batch(timestamp: f64, events: &KvEventBatch, dp_rank: i64) -> Vec<
             }
             encoder.int(i64::from(event.block_size));
             encoder.nil();
-            medium(&mut encoder);
+            encode_medium(&mut encoder, event.medium);
         } else {
             encoder.array_len(3);
             encoder.str("BlockRemoved");
             hashes(&mut encoder, event.block_hashes);
-            medium(&mut encoder);
+            encode_medium(&mut encoder, event.medium);
         }
     }
     encoder.int(dp_rank);
@@ -408,6 +418,64 @@ mod tests {
         assert!(!contains(&removal(0), b"CPU_PINNED") && !contains(&removal(0), b"DISK"));
         assert!(contains(&removal(1), MEDIUM_HOST.as_bytes()));
         assert!(contains(&removal(2), MEDIUM_DISK.as_bytes()));
+    }
+
+    #[test]
+    fn clear_medium_disk_encodes_exact_dynamo_zmq_wire_bytes() {
+        use ts_scheduler::KvEventView;
+
+        // Exact msgpack for [1.0, [["ClearMedium", "DISK"]], 2]:
+        //   0x93                 fixarray(3)
+        //   0xcb 3f f0 00..00    float64(1.0)
+        //   0x91                 fixarray(1)
+        //   0x92                 fixarray(2)
+        //   0xab "ClearMedium"   fixstr(11)
+        //   0xa4 "DISK"          fixstr(4)
+        //   0x02                 positive fixint(2)
+        let batch = KvEventBatch::with_cleared_media(&[KvEventMedium::Disk], &[]);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch.cleared_media().collect::<Vec<_>>(),
+            vec![KvEventMedium::Disk]
+        );
+        let encoded = encode_batch(1.0, &batch, 2);
+        let mut expected = vec![0x93, 0xcb];
+        expected.extend_from_slice(&1.0_f64.to_be_bytes());
+        expected.extend_from_slice(&[0x91, 0x92, 0xab]);
+        expected.extend_from_slice(b"ClearMedium");
+        expected.push(0xa4);
+        expected.extend_from_slice(b"DISK");
+        expected.push(0x02);
+        assert_eq!(encoded, expected);
+
+        // Mixed batch: ClearMedium("DISK") precedes cascading BlockRemoved("CPU_PINNED").
+        let mixed = KvEventBatch::with_cleared_media(
+            &[KvEventMedium::Disk],
+            &[KvEventView {
+                stored: false,
+                block_hashes: vec![42],
+                has_parent: false,
+                parent_block_hash: 0,
+                token_ids: Vec::new(),
+                block_size: 0,
+                medium: 1,
+            }],
+        );
+        assert_eq!(mixed.len(), 2);
+        let encoded_mixed = encode_batch(1.0, &mixed, 0);
+        let mut expected_mixed = vec![0x93, 0xcb];
+        expected_mixed.extend_from_slice(&1.0_f64.to_be_bytes());
+        expected_mixed.extend_from_slice(&[0x92, 0x92, 0xab]);
+        expected_mixed.extend_from_slice(b"ClearMedium");
+        expected_mixed.push(0xa4);
+        expected_mixed.extend_from_slice(b"DISK");
+        // Second event: ["BlockRemoved", [42], "CPU_PINNED"]
+        expected_mixed.extend_from_slice(&[0x93, 0xac]);
+        expected_mixed.extend_from_slice(b"BlockRemoved");
+        expected_mixed.extend_from_slice(&[0x91, 42, 0xaa]);
+        expected_mixed.extend_from_slice(b"CPU_PINNED");
+        expected_mixed.push(0x00);
+        assert_eq!(encoded_mixed, expected_mixed);
     }
 
     #[test]
