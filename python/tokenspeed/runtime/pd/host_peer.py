@@ -157,11 +157,13 @@ class DecodeSettings:
 def ensure_mooncake_transfer_timeouts() -> None:
     """Install bounded transfer timeouts before Mooncake / CANN ADXL initializes.
 
-    Respects any explicit operator/launcher setting via ``os.environ.setdefault``
-    while preventing Mooncake's ``60s`` unbound default when unset.
+    Respects any explicit non-empty operator/launcher setting while preventing
+    Mooncake's ``60s`` unbound default when unset or empty.
     """
-    os.environ.setdefault("MC_TRANSFER_TIMEOUT", "10")
-    os.environ.setdefault("ASCEND_TRANSFER_TIMEOUT", "10000")
+    if not (os.environ.get("MC_TRANSFER_TIMEOUT") or "").strip():
+        os.environ["MC_TRANSFER_TIMEOUT"] = "10"
+    if not (os.environ.get("ASCEND_TRANSFER_TIMEOUT") or "").strip():
+        os.environ["ASCEND_TRANSFER_TIMEOUT"] = "10000"
 
 
 def enable_mooncake_ipv6_for_host(hostname: str) -> None:

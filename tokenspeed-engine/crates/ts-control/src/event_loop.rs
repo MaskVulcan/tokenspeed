@@ -833,6 +833,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         self.round_with(stop_requested, Vec::new())
     }
 
+    /// Whether `self.scheduler` may be temporarily unlocked for `ts-peer-servicer`
+    /// while waiting on I/O, collectives, or an idle frontend. Kept locked while
+    /// relocated `pages_to_copy` or overlap-published (`hold_lock`) batches have
+    /// not yet retired on the execution stream.
+    fn can_unlock_scheduler(&self) -> bool {
+        !self.uncommitted_device_copies
+            && !self.in_flight.iter().any(|(_, _, _, hold_lock)| *hold_lock)
+    }
+
     /// A round whose replica-first member also receives `submitted`, the
     /// engine's own requests, ahead of the frontend's.
     fn round_with(
@@ -847,7 +856,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // through empty rounds, so it hands the scheduler to a waiting
         // servicer once per round; with none waiting this costs one atomic
         // read.
-        if !self.uncommitted_device_copies {
+        if self.can_unlock_scheduler() {
             ArcMutexGuard::bump(&mut self.scheduler);
         }
         // A profile keeps the spans of a round that did something: a loop
@@ -861,10 +870,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let wait = (submitted.is_empty() && self.idle() && self.dp_idle).then_some(IDLE_WAIT);
             let _span = profile::span("Frontend::receive");
             let mut received = submitted;
+            let can_unlock = self.can_unlock_scheduler();
             let frontend = &mut self.frontend;
             received.extend(match wait {
-                Some(_) => ArcMutexGuard::unlocked(&mut self.scheduler, || frontend.receive(wait)),
-                None => frontend.receive(wait),
+                Some(_) if can_unlock => {
+                    ArcMutexGuard::unlocked(&mut self.scheduler, || frontend.receive(wait))
+                }
+                _ => frontend.receive(wait),
             });
             received
         } else {
@@ -965,8 +977,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let mut forwarded = false;
             if let Some(dp) = self.dp_round(None, &mut stop, !frozen_has_copies)? {
                 if dp.idle_forward && memory_resident {
-                    if self.uncommitted_device_copies {
+                    if !self.can_unlock_scheduler() {
                         self.data_plane.idle_forward(&dp)?;
+                        self.uncommitted_device_copies = false;
                     } else {
                         let data_plane = &mut self.data_plane;
                         ArcMutexGuard::unlocked(&mut self.scheduler, || {
@@ -978,7 +991,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             busy |= forwarded;
             self.note_forward(forwarded);
-            if self.uncommitted_device_copies {
+            if !self.can_unlock_scheduler() {
                 std::thread::sleep(PAUSED_IDLE_SLEEP);
             } else {
                 ArcMutexGuard::unlocked(&mut self.scheduler, || {
@@ -1209,7 +1222,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let device_work = plan.needs_device() || idle_forward;
         if device_work {
             let executed =
-                if idle_forward && !has_device_copies && !self.uncommitted_device_copies {
+                if idle_forward && !has_device_copies && self.can_unlock_scheduler() {
                     let data_plane = &mut self.data_plane;
                     ArcMutexGuard::unlocked(&mut self.scheduler, || {
                         data_plane.execute(plan, &dispatch)
@@ -1232,6 +1245,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 forwarded = true;
             } else if has_device_copies {
                 self.uncommitted_device_copies = true;
+            } else if idle_forward {
+                // Synchronous idle_forward drained ts-forward (and waited on
+                // default_stream via execution_stream), settling prior copies.
+                self.uncommitted_device_copies = false;
             }
         }
         self.note_forward(forwarded);
@@ -1975,7 +1992,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 -key,
                 if reload_ready { -1 } else { 0 },
             ];
-            let reduced = if self.uncommitted_device_copies {
+            let reduced = if !self.can_unlock_scheduler() {
                 self.ranks.mesh.all_reduce(world, &row, Reduce::Max)?
             } else {
                 let mesh = &mut self.ranks.mesh;
@@ -3020,7 +3037,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             i64::from(wants_prefill),
             i64::from(has_decode_work),
         ];
-        let rows = if allow_unlock && !self.uncommitted_device_copies && self.in_flight.is_empty() {
+        let rows = if allow_unlock && self.can_unlock_scheduler() && self.in_flight.is_empty() {
             let mesh = &mut self.ranks.mesh;
             ArcMutexGuard::unlocked(&mut self.scheduler, || mesh.all_gather_i64(world, &row))?
         } else {

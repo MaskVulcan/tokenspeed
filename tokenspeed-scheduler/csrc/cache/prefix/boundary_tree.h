@@ -122,6 +122,14 @@ public:
         bool HasCheckpointBoundaryInSubtree() const noexcept {
             return std::ranges::any_of(checkpoint_boundaries_in_subtree, [](std::int32_t count) { return count > 0; });
         }
+        // Whether every State checkpoint in this node's subtree lives only on
+        // Disk (none left on Device or Host). Any resume at or under this node
+        // therefore requires Disk I/O even if History blocks remain on RAM.
+        bool IsStateDiskOnly() const noexcept {
+            return checkpoint_boundaries_in_subtree[kDevice] == 0 &&
+                   checkpoint_boundaries_in_subtree[kHost] == 0 &&
+                   checkpoint_boundaries_in_subtree[kDisk] > 0;
+        }
         // Whether some prefix-closed group indexes a block of this hash on any
         // tier.
         bool HasClosedEntries() const noexcept {
@@ -480,7 +488,8 @@ private:
                 node.state_entries_[hold.tier_] += hold.state_ ? delta : 0;
                 node.closed_entries_[hold.tier_] += hold.closed_ ? delta : 0;
                 node.closed_pairs_ += hold.paired_ ? delta : 0;
-                if (hold.tier_ != kDevice && hold.closed_ && lower_tier_entries_observer_) {
+                if (((hold.tier_ != kDevice && hold.closed_) || (hold.state_ && config_.has_disk_tier)) &&
+                    lower_tier_entries_observer_) {
                     lower_tier_entries_observer_(node.hash);
                 }
                 break;
@@ -597,9 +606,15 @@ private:
             // boundaries count in every new ancestor, and its Host presence in
             // the parent.
             if (!inserted) {
+                const bool notify = config_.num_state_groups > 0 && config_.has_disk_tier &&
+                                    static_cast<bool>(lower_tier_entries_observer_);
                 for (Node* ancestor = parent; ancestor != nullptr; ancestor = ancestor->parent) {
+                    const bool was_state_disk_only = notify && ancestor->IsStateDiskOnly();
                     for (const std::size_t tier : kTiers) {
                         ancestor->checkpoint_boundaries_in_subtree[tier] += node.checkpoint_boundaries_in_subtree[tier];
+                    }
+                    if (notify && ancestor->IsStateDiskOnly() != was_state_disk_only) {
+                        lower_tier_entries_observer_(ancestor->hash);
                     }
                 }
                 if (node.OnHost()) {
@@ -618,10 +633,16 @@ private:
 
     // A checkpoint boundary appeared (+1) or went (-1) at `node` on `tier`.
     void countCheckpointBoundary(Node& node, std::size_t tier, std::int32_t delta) noexcept {
+        const bool notify = config_.num_state_groups > 0 && config_.has_disk_tier &&
+                            static_cast<bool>(lower_tier_entries_observer_);
         for (Node* ancestor = &node; ancestor != nullptr; ancestor = ancestor->parent) {
+            const bool was_state_disk_only = notify && ancestor->IsStateDiskOnly();
             ancestor->checkpoint_boundaries_in_subtree[tier] += delta;
             FatalCheck(ancestor->checkpoint_boundaries_in_subtree[tier] >= 0,
                        "a subtree holds a negative number of checkpoint boundaries");
+            if (notify && ancestor->IsStateDiskOnly() != was_state_disk_only) {
+                lower_tier_entries_observer_(ancestor->hash);
+            }
         }
     }
 

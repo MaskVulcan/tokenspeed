@@ -1073,5 +1073,68 @@ TEST_F(DiskTierKvEventsTest, DiskDegradedAfterDiskDoneInSameBatchWipesCompletedW
     EXPECT_EQ(std::get<KvClearMediumEvent>(events[0]).medium, KvEventMedium::kDisk);
 }
 
+TEST(DiskTierTest, HybridStateDiskOnlyReclassifiesHostHistoryAndNotifiesAncestors) {
+    DiskTierCache cache(FullAndState(), /*disk_parents=*/16);
+    std::vector<ContentHash> observed;
+    cache.coordinator.SetCacheMutationSink([&](const CacheKey& key, CacheMutation mutation) {
+        if (mutation == CacheMutation::kLowerTierResidency) {
+            observed.push_back(key.content_hash);
+        }
+    });
+
+    const Prompt prompt(4, 9);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    // Clean all pages (History + leaf State) to Disk while keeping them on Host.
+    const DiskOperation write = cache.Clean(keys);
+    cache.disks.Complete(cache::DiskDone{.op_id = write.op_id, .success = true});
+
+    // While the leaf State checkpoint is still on Host, every page is Host-publishable.
+    for (const std::string& hash : prompt.hashes) {
+        const auto status = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{hash}}, 0);
+        EXPECT_TRUE(status.host_publishable) << hash;
+        EXPECT_TRUE(status.disk_publishable) << hash;
+    }
+
+    // Evict ONLY the State checkpoint (group 1) from Host while History (group 0) remains on Host!
+    // This mirrors LongCat Lite 17B where 182 MB KDA evicts to Disk before 44 MB MLA.
+    std::vector<CacheKey> state_keys;
+    for (const CacheKey& key : keys) {
+        if (key.group_id == 1) state_keys.push_back(key);
+    }
+    ASSERT_FALSE(state_keys.empty());
+    observed.clear();
+    cache.EvictFromHost(state_keys);
+
+    // Every page whose only remaining State checkpoint is on Disk must:
+    // (1) trigger kLowerTierResidency so Scheduler::DrainKvEventBatch reconciles it, and
+    // (2) flip host_publishable -> false and disk_publishable -> true so Dynamo enforces
+    //     Disk cost pricing, peer_max_concurrent_disk_pushes, and peer_disk_prefix_routing=false.
+    for (const std::string& hash : prompt.hashes) {
+        const ContentHash h{hash};
+        EXPECT_NE(std::ranges::find(observed, h), observed.end()) << "ancestor not notified: " << hash;
+        const auto status = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = h}, 0);
+        EXPECT_FALSE(status.device_publishable) << hash;
+        EXPECT_FALSE(status.host_publishable) << hash;
+        EXPECT_TRUE(status.disk_publishable) << hash;
+    }
+
+    // Prefetching the missing State checkpoint back from Disk -> Host restores host_publishable.
+    observed.clear();
+    StorageLease read = cache.disks.StartRead(prompt.Prefix());
+    ASSERT_TRUE(read);
+    const std::vector<DiskOperation> reads = cache.disks.TakeCommands();
+    ASSERT_EQ(reads.size(), 1u);
+    cache.disks.Complete(cache::DiskDone{.op_id = read.OperationId(), .success = true});
+
+    for (const std::string& hash : prompt.hashes) {
+        const ContentHash h{hash};
+        EXPECT_NE(std::ranges::find(observed, h), observed.end()) << "ancestor not notified on restore: " << hash;
+        const auto status = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = h}, 0);
+        EXPECT_TRUE(status.host_publishable) << hash;
+        EXPECT_TRUE(status.disk_publishable) << hash;
+    }
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
 }  // namespace
 }  // namespace tokenspeed::test
