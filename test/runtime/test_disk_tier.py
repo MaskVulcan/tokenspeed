@@ -406,6 +406,25 @@ def test_raw_block_device_paths_are_opened_directly_and_reject_local_sharing(tmp
     with pytest.raises(ValueError, match="cannot be shared by multiple local ranks"):
         disk_file_path(non_dividing_alias, global_rank=2)
 
+    # Uninitialized Mapping (rank=None, as constructed during ServerArgs.__post_init__
+    # before worker spawn) must validate cleanly using node_rank without asserting on
+    # Mapping.rank.
+    uninitialized = _disk_args(
+        disk_tier_paths=["/dev/nvme0n1", str(tmp_path), "/dev/nvme0n1"],
+        nnodes=2,
+        node_rank=0,
+        mapping=Mapping(rank=None, world_size=4, attn_tp_size=2, attn_dp_size=2),
+    )
+    uninitialized.validate_disk_tier_options()
+    uninitialized_node1 = _disk_args(
+        disk_tier_paths=["/dev/nvme0n1", str(tmp_path), "/dev/nvme0n1"],
+        nnodes=2,
+        node_rank=1,
+        mapping=Mapping(rank=None, world_size=4, attn_tp_size=2, attn_dp_size=2),
+    )
+    with pytest.raises(ValueError, match="cannot be shared by multiple local ranks"):
+        uninitialized_node1.validate_disk_tier_options()
+
     # Mixed raw block device + real directory: directory still gets per-port/per-rank filename.
     mixed = _disk_args(disk_tier_paths=["/dev/nvme0n1", str(tmp_path)])
     mixed.validate_disk_tier_options()

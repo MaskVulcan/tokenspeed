@@ -226,6 +226,19 @@ def _local_world_size(server_args) -> int:
     return max(1, (tp_size * dp_size) // nnodes)
 
 
+def _mapping_rank(mapping) -> int | None:
+    """Return ``mapping``'s initialized global rank, or ``None`` before rank
+    assignment (``Mapping.rank`` asserts when ``_rank`` is still ``None``)."""
+    if mapping is None:
+        return None
+    if hasattr(mapping, "_rank"):
+        return mapping._rank
+    try:
+        return getattr(mapping, "rank", None)
+    except AssertionError:
+        return None
+
+
 def _node_global_ranks(
     server_args, *, global_rank: int | None = None
 ) -> range:
@@ -233,9 +246,9 @@ def _node_global_ranks(
     if global_rank is not None:
         base = (int(global_rank) // local_ranks) * local_ranks
     else:
-        mapping = getattr(server_args, "mapping", None)
-        if mapping is not None and getattr(mapping, "rank", None) is not None:
-            base = (max(0, int(mapping.rank)) // local_ranks) * local_ranks
+        mapping_rank = _mapping_rank(getattr(server_args, "mapping", None))
+        if mapping_rank is not None:
+            base = (max(0, int(mapping_rank)) // local_ranks) * local_ranks
         else:
             node_rank = max(0, int(getattr(server_args, "node_rank", 0) or 0))
             base = node_rank * local_ranks
