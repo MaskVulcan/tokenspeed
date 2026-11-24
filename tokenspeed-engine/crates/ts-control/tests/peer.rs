@@ -183,9 +183,11 @@ impl PagePusher for NoPushes {
 }
 
 fn settings(name: &str, weight_version: &str) -> PeerSettings {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_INCARNATION: AtomicU64 = AtomicU64::new(1);
     PeerSettings {
         name: name.to_owned(),
-        incarnation: 1,
+        incarnation: NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed),
         deployment_id: "deployment".into(),
         weight_version: weight_version.to_owned(),
         timeouts: Timeouts {
@@ -258,7 +260,12 @@ impl Replica {
         role: &str,
         landing: Landing,
     ) -> Self {
-        let scheduler = Arc::new(Mutex::new(scheduler(&settings.name, 1, role, landing)));
+        let scheduler = Arc::new(Mutex::new(scheduler(
+            &settings.name,
+            settings.incarnation,
+            role,
+            landing,
+        )));
         let name = settings.name.clone();
         let peer = Peer::start(
             settings,
@@ -1918,4 +1925,308 @@ fn push_busy_backpressure_is_benign_miss() {
         ]);
         reader.round();
     }
+}
+
+#[test]
+fn arrived_layout_reply_advances_to_pin_even_past_answer_timeout_without_fault() {
+    let arena = Arena::new(200_000);
+    let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
+    let prefix: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &prefix, &arena);
+
+    let reader_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let reader_name = format!("127.0.0.1:{}", reader_listener.port());
+    let mut reader_settings = settings(&reader_name, "v1");
+    // Short 40 ms answer timeout + threshold = 1 so even ONE false Layout timeout
+    // fault immediately trips cooldown!
+    reader_settings.timeouts.answer_us = 40_000;
+    reader_settings.holder_fail_threshold = 1;
+    reader_settings.holder_cooldown_us = 30_000_000;
+    let mut reader = Replica::with_listener(
+        reader_settings,
+        reader_listener,
+        READER_BASE,
+        &arena,
+        "Fused",
+    );
+
+    let mut prompt = prefix;
+    prompt.extend(95_000..95_000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("slow-step-layout", prompt, &holder.name)])
+        .unwrap();
+
+    // Drive until `reader` dispatches its `Landing` in `Phase::Layout` (sending `Request::Layout`).
+    let wait_start = Instant::now();
+    loop {
+        assert!(wait_start.elapsed() < Duration::from_secs(5));
+        holder.round();
+        let (_, fetches) = reader.round();
+        if !fetches.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // `holder`'s lock-free `Reply::Layout` arrives in < 1 ms, while `reader` simulates
+    // an eager forward step lasting 90 ms (> 2x `answer_us = 40 ms`) before its next `agree()`.
+    std::thread::sleep(Duration::from_millis(90));
+
+    let (hit, _) = rounds_until_prefill(&mut reader, Some(&mut holder), "slow-step-layout");
+    assert!(
+        hit >= 5 * PAGE,
+        "arrived Reply::Layout must advance Landing to Phase::Pin instead of timing out, got hit={hit}"
+    );
+    assert_eq!(
+        reader.peer.holder_cooldown_state(&holder.name),
+        (0, None),
+        "arrived Reply::Layout after a long forward step must emit ZERO false HealthOutcome::Fault"
+    );
+}
+
+#[test]
+fn servicer_demux_delivers_replies_and_layout_while_scheduler_locked_and_batch_drains_lookups() {
+    use ts_control::peer::wire::Prompt;
+    use ts_scheduler::{PeerAnswerKind, PeerLeaseView};
+
+    let arena = Arena::new(200_000);
+    let mut holder_b = Replica::start("v1", HOLDER_BASE, &arena);
+    let prefix: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder_b, &prefix, &arena);
+
+    let mut rank_a = Replica::start("v1", READER_BASE, &arena);
+    // Seed a prefix on `rank_a` too so external peers can send `Lookup`s to `rank_a`.
+    let seed_a: Vec<i32> = (500..500 + 4 * PAGE).collect();
+    holder_computes(&mut rank_a, &seed_a, &arena);
+
+    // Start a peer read on `rank_a` from `holder_b` so `rank_a` has an active `Landing`
+    // waiting on `Inbound::Reply` frames from `holder_b`.
+    let mut prompt_from_b = prefix;
+    prompt_from_b.extend(96_000..96_000 + PAGE);
+    rank_a
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("hol-check", prompt_from_b, &holder_b.name)])
+        .unwrap();
+
+    // Round 1 on `rank_a`: dispatches `Lookup` to `holder_b` (`holder_b` has NOT answered yet,
+    // or answers while we lock `rank_a.scheduler`!).
+    // Wait until `rank_a` sends `Lookup` and receives `Lookup` answer so `Landing` starts in
+    // `Phase::Layout` on `rank_a`, OR test while `rank_a.scheduler` is locked right before
+    // `Inbound::Reply` arrives!
+    // Even stronger: hold `rank_a.scheduler.lock()` while 4 `Request::Lookup`s are queued on `rank_a`
+    // AHEAD of `Request::Layout` AND an incoming `Inbound::Reply(Lookup)` from `holder_b`!
+    let (ext_tx, ext_rx) = mpsc::channel();
+    let ext_client = PeerNet::start("127.0.0.1", 0, ext_tx).unwrap();
+    let ext_addr = format!("127.0.0.1:{}", ext_client.port());
+
+    // Build a valid `Prompt` for `seed_a` using a scratch scheduler.
+    let lookup_prompt = {
+        let mut scratch = scheduler("scratch", 99, "Fused", Landing::Device);
+        let mut s_tokens = seed_a.clone();
+        s_tokens.extend(88_000..88_000 + PAGE);
+        scratch
+            .submit_requests(&[spec("s", s_tokens, "target")])
+            .unwrap();
+        let _ = scratch.next_execution_plan(true, false);
+        let l = scratch.take_peer_lookups().pop().unwrap();
+        Prompt {
+            prefix_hashes: l.prefix_hashes,
+            tokens: l.tokens,
+            max_tokens: l.max_tokens,
+        }
+    };
+
+    // Step `rank_a` once while `holder_b`'s scheduler is temporarily locked so `rank_a`'s
+    // `Lookup` to `holder_b` is in flight and its `Inbound::Reply` has NOT arrived yet!
+    let b_guard = holder_b.scheduler.lock();
+    let _ = rank_a.round();
+
+    // Now LOCK `rank_a.scheduler` (simulating a long forward or lazy HCCL init) and queue
+    // 4 `Request::Lookup` RPCs on `rank_a`'s endpoint!
+    let a_guard = rank_a.scheduler.lock();
+    for i in 0..4u64 {
+        ext_client
+            .request(
+                &rank_a.name,
+                &Request::Lookup {
+                    lease: PeerLeaseView {
+                        reader: ext_addr.clone(),
+                        id: 500 + i,
+                    },
+                    prompt: lookup_prompt.clone(),
+                },
+            )
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(20));
+
+    // 1. Send `Request::Layout` BEHIND the 4 blocked `Lookup`s while `a_guard` is held:
+    //    `ts-peer-demux` MUST answer `Layout` immediately without HOL blocking!
+    ext_client
+        .request(
+            &rank_a.name,
+            &Request::Layout {
+                reply_to: ext_addr.clone(),
+            },
+        )
+        .unwrap();
+    let layout_frame = ext_rx
+        .recv_timeout(Duration::from_millis(300))
+        .expect("Request::Layout was HOL-blocked behind scheduler.lock()-waiting Lookups!");
+    assert!(matches!(
+        Inbound::decode(&layout_frame).unwrap(),
+        Inbound::Reply(Reply::Layout { .. })
+    ));
+
+    // 2. Unlock `holder_b.scheduler` so `holder_b` sends `Inbound::Reply(Lookup)` back to
+    //    `rank_a` BEHIND the 4 blocked `Lookup`s while `a_guard` is STILL held on `rank_a`!
+    drop(b_guard);
+    let wait_reply = Instant::now();
+    let lookup_events = loop {
+        assert!(
+            wait_reply.elapsed() < Duration::from_millis(500),
+            "Inbound::Reply on rank_a was HOL-blocked behind rank_a.scheduler.lock()!"
+        );
+        let rep = rank_a.peer.report();
+        let agreed = rank_a.peer.agree(&[rep]).unwrap();
+        if !agreed.events.is_empty() {
+            break agreed.events;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(lookup_events.len(), 1);
+    assert!(lookup_events[0].num_tokens >= 5 * PAGE);
+
+    // 3. Drop `a_guard` so `ts-peer-servicer` batch-drains all 4 queued `Lookup`s!
+    drop(a_guard);
+    for _ in 0..4 {
+        let frame = ext_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("queued Lookup was not drained after unlocking scheduler");
+        match Inbound::decode(&frame).unwrap() {
+            Inbound::Reply(Reply::Answer { answer, .. })
+                if answer.kind == PeerAnswerKind::Lookup =>
+            {
+                assert_eq!(answer.num_tokens, 4 * PAGE);
+            }
+            other => panic!("expected Lookup answer, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn trailing_slash_zero_normalized_and_self_incarnation_reply_rejected() {
+    use ts_control::peer::wire::Stamp;
+    use ts_scheduler::{PeerAnswerKind, PeerAnswerView};
+
+    let arena = Arena::new(200_000);
+    let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
+    let prefix: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &prefix, &arena);
+
+    // 1. Self-hint on DP0 with non-canonical `"/0"` suffix (`"<host>:<port>/0"`) is skipped immediately.
+    let mut self_prompt = prefix.clone();
+    self_prompt.extend(97_000..97_000 + PAGE);
+    holder
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("self-slash-zero", self_prompt, &format!("{}/0", holder.name))])
+        .unwrap();
+    let (rows, fetches) = holder.round();
+    assert!(fetches.is_empty(), "self '/0' hint must never start a peer landing");
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].1 >= 5 * PAGE, "self '/0' hint must admit directly from local cache");
+    holder.advance(&[
+        event(ForwardEventKind::ExtendResult, "self-slash-zero", vec![7]),
+        event(ForwardEventKind::Finish, "self-slash-zero", Vec::new()),
+    ]);
+    holder.round();
+
+    // 2. Cross-replica hint with non-canonical `"/0"` suffix normalizes to `holder.name`
+    //    so `Reply::Layout` (`stamp.name == holder.name`) matches `landing.fetch().holder`!
+    let reader_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let reader_name = format!("127.0.0.1:{}", reader_listener.port());
+    let reader_settings = settings(&reader_name, "v1");
+    let reader_incarnation = reader_settings.incarnation;
+    let mut reader = Replica::with_listener(
+        reader_settings,
+        reader_listener,
+        READER_BASE,
+        &arena,
+        "Fused",
+    );
+    reader.enable_logical_metrics();
+
+    let mut cross_prompt = prefix.clone();
+    cross_prompt.extend(98_000..98_000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("cross-slash-zero", cross_prompt, &format!("{}/0", holder.name))])
+        .unwrap();
+    let (cross_hit, cross_landings) =
+        rounds_until_prefill(&mut reader, Some(&mut holder), "cross-slash-zero");
+    assert_eq!(cross_landings.len(), 1);
+    assert!(cross_hit >= 5 * PAGE);
+    assert_eq!(reader.peer.holder_cooldown_state(&holder.name), (0, None));
+    reader.advance(&[
+        event(ForwardEventKind::ExtendResult, "cross-slash-zero", vec![7]),
+        event(ForwardEventKind::Finish, "cross-slash-zero", Vec::new()),
+    ]);
+    reader.round();
+
+    // 3. Uncanonicalized alias returning a reply with `stamp.incarnation == reader.incarnation`
+    //    is rejected as a self-reply (`num_tokens == 0`, `"incompatible"`), never stalling!
+    let (alias_tx, alias_rx) = mpsc::channel();
+    let alias_net = PeerNet::start("127.0.0.1", 0, alias_tx).unwrap();
+    let alias_name = format!("127.0.0.1:{}", alias_net.port());
+    reader.decisions.clear();
+    let self_inc_prompt: Vec<i32> = (55_000..55_000 + 4 * PAGE).collect();
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("self-inc-alias", self_inc_prompt, &alias_name)])
+        .unwrap();
+    let start = Instant::now();
+    let hit = loop {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        for frames in alias_rx.try_iter() {
+            if let Ok(Inbound::Request(Request::Lookup { lease, .. })) = Inbound::decode(&frames) {
+                let to = lease.reader.clone();
+                alias_net
+                    .reply(
+                        &to,
+                        &Reply::Answer {
+                            stamp: Stamp {
+                                name: alias_name.clone(),
+                                incarnation: reader_incarnation,
+                                identity: "deployment/v1".into(),
+                            },
+                            answer: PeerAnswerView {
+                                lease,
+                                kind: PeerAnswerKind::Lookup,
+                                num_tokens: 4 * PAGE,
+                                pages: Vec::new(),
+                                held: true,
+                            },
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+        let (rows, fetches) = reader.round();
+        assert!(fetches.is_empty(), "self-incarnation lookup reply must never start a landing");
+        if let Some((_, p)) = rows.into_iter().find(|(id, _)| id == "self-inc-alias") {
+            break p;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(hit, 0);
+    assert!(reader
+        .decisions
+        .contains(&("self-inc-alias".into(), "incompatible")));
+    assert_eq!(reader.peer.holder_cooldown_state(&alias_name), (0, None));
 }

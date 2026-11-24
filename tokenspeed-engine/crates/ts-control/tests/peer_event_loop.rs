@@ -359,6 +359,7 @@ struct DeviceHooks {
 struct HookedDevice {
     generated: HashMap<String, i32>,
     hooks: Arc<DeviceHooks>,
+    peer_fence: Option<ts_control::peer::PeerFence>,
 }
 
 impl HookedDevice {
@@ -366,6 +367,15 @@ impl HookedDevice {
         Self {
             generated: HashMap::new(),
             hooks,
+            peer_fence: None,
+        }
+    }
+
+    fn with_peer_fence(hooks: Arc<DeviceHooks>, peer_fence: ts_control::peer::PeerFence) -> Self {
+        Self {
+            generated: HashMap::new(),
+            hooks,
+            peer_fence: Some(peer_fence),
         }
     }
 }
@@ -382,10 +392,15 @@ impl DataPlane for HookedDevice {
 
     fn execute(
         &mut self,
-        _plan: ExecutionPlan,
+        plan: ExecutionPlan,
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
         self.hooks.execute_hook.pause_if_armed();
+        if !plan.peer_fetches().is_empty() {
+            if let Some(fence) = &self.peer_fence {
+                fence.ready();
+            }
+        }
         let Some(batch) = dispatch.forward else {
             return Ok(None);
         };
@@ -1108,4 +1123,475 @@ fn sync_peer_holder_changes_preserves_hard_pins_across_finish_drain_on_tp_replic
     for t in threads {
         t.join().unwrap();
     }
+}
+
+#[test]
+fn pause_wait_and_release_memory_wait_for_peer_looking_and_peer_landing_to_drain() {
+    use ts_control::peer::{geometry::Spans, read::PageReader, wire::Stamp};
+    use ts_scheduler::{PeerAnswerView, PeerPageView, PeerTier};
+
+    struct HookedReader {
+        arena: Arena,
+        read_hook: Arc<PauseHook>,
+    }
+
+    impl PageReader for HookedReader {
+        fn read(&self, session: &str, spans: &Spans) -> Result<(), String> {
+            self.read_hook.pause_if_armed();
+            self.arena.read(session, spans)
+        }
+    }
+
+    interpreter();
+    let arena = Arena::new(200_000);
+    for block in 1..16u64 {
+        arena.write(block * PAGE_BYTES, &[block as u8; PAGE_BYTES as usize]);
+    }
+
+    // Controlled remote holder endpoint so we deterministically hold requests in
+    // `PeerLooking` and `PeerLanding`.
+    let (holder_tx, holder_rx) = mpsc::channel();
+    let holder_net = PeerNet::start("127.0.0.1", 0, holder_tx).unwrap();
+    let holder_name = format!("127.0.0.1:{}", holder_net.port());
+    let holder_stamp = Stamp {
+        name: holder_name.clone(),
+        incarnation: 99,
+        identity: "deployment/v1".into(),
+    };
+
+    let mesh_listener = Listener::bind("127.0.0.1").unwrap();
+    let mesh_addr = vec![format!("127.0.0.1:{}", mesh_listener.port().unwrap())];
+
+    let peer_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let reader_name = format!("127.0.0.1:{}", peer_listener.port());
+    let sched = Arc::new(Mutex::new(peer_scheduler(&reader_name)));
+    let read_hook = Arc::new(PauseHook::default());
+    let mut reader_settings = peer_settings(&reader_name);
+    reader_settings.incarnation = 1;
+    let peer = Peer::start(
+        reader_settings,
+        0,
+        vec![rank_geometry(100_000)],
+        Some(peer_listener),
+        sched.clone(),
+        Arc::new(HookedReader {
+            arena: arena.clone(),
+            read_hook: read_hook.clone(),
+        }),
+        Arc::new(NoPushes),
+    )
+    .unwrap();
+
+    let peer_fence = peer.fence();
+    let fe = Arc::new(ChannelFrontendState::default());
+    let hooks = Arc::new(DeviceHooks::default());
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let loop_thread = {
+        let sched = sched.clone();
+        let fe = fe.clone();
+        let hooks = hooks.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mesh = Mesh::connect(0, mesh_listener, &mesh_addr, Duration::from_secs(5)).unwrap();
+            let replica = Group::new(1, vec![0], 0).unwrap();
+            let outputs = OutputProcessor::new(
+                None,
+                1,
+                None,
+                Role::Plain,
+                FinishLog {
+                    enabled: false,
+                    request_stats: false,
+                    ttft_percentage: 0,
+                },
+                false,
+                None,
+            );
+            let mut ev = EventLoop::new(
+                sched,
+                HookedDevice::with_peer_fence(hooks, peer_fence),
+                Some(ChannelFrontend { state: fe }),
+                outputs,
+                loop_config(0),
+                Ranks {
+                    mesh,
+                    replica,
+                    pp: None,
+                    dp: None,
+                    ep: None,
+                },
+                Subsystems {
+                    transfer: None,
+                    embeddings: None,
+                    metrics: None,
+                    kv_events: None,
+                    eplb: None,
+                    grammars: None,
+                    l3_metrics: None,
+                    l3: None,
+                    disk: None,
+                    disk_metrics: None,
+                    peer: Some(peer),
+                },
+            );
+            ev.run(&stop).unwrap();
+        })
+    };
+
+    // -------------------------------------------------------------------------
+    // Phase A: Request in `PeerLooking` keeps `drained() == false` so
+    //          `PauseScheduler(mode="wait")` waits until lookup resolves!
+    // -------------------------------------------------------------------------
+    let mut req1 = TokenizedGenerateReqInput::new(
+        "r-looking",
+        SamplingParams {
+            max_new_tokens: Some(1),
+            ..Default::default()
+        },
+    );
+    req1.input_ids = Some((1..=4 * PAGE).collect());
+    req1.stream = true;
+    req1.peer_holder = Some(holder_name.clone());
+    fe.push(EngineRequest::Add(Box::new(req1)));
+
+    // Wait for `Request::Lookup` to arrive at `holder_rx`: `"r-looking"` is now in `PeerLooking`.
+    let lookup_frame = holder_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let Inbound::Request(Request::Lookup { lease: lease1, .. }) =
+        Inbound::decode(&lookup_frame).unwrap()
+    else {
+        panic!("expected Lookup request for r-looking");
+    };
+    {
+        let s = sched.lock();
+        let sizes = s.sizes();
+        assert_eq!(s.peer_stats().looking_requests, 1);
+        assert_eq!(sizes.waiting, 1, "PeerLooking must count in WaitingSize()");
+        assert_eq!(
+            sizes.pending_prefill_tokens,
+            i64::from(4 * PAGE),
+            "PeerLooking must count in PendingPrefillTokens()"
+        );
+    }
+
+    // Send `PauseScheduler(mode="wait")` while `"r-looking"` is parked in `PeerLooking`.
+    fe.push(EngineRequest::Control(Box::new(
+        ControlRequest::PauseScheduler(PauseSchedulerReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            mode: "wait".to_owned(),
+        }),
+    )));
+    thread::sleep(Duration::from_millis(60));
+    assert!(
+        fe.replies.lock().unwrap().is_empty(),
+        "PauseScheduler(mode=wait) must NOT complete while r-looking is still in PeerLooking!"
+    );
+
+    // Answer `Lookup` with 0 tokens -> `"r-looking"` admits locally, finishes 1 token,
+    // and ONLY THEN does `PauseScheduler(mode="wait")` complete!
+    let to1 = lease1.reader.clone();
+    holder_net
+        .reply(
+            &to1,
+            &Reply::Answer {
+                stamp: holder_stamp.clone(),
+                answer: PeerAnswerView {
+                    lease: lease1,
+                    kind: PeerAnswerKind::Lookup,
+                    num_tokens: 0,
+                    pages: Vec::new(),
+                    held: false,
+                },
+            },
+        )
+        .unwrap();
+    fe.wait_finished("r-looking", Duration::from_secs(5));
+    let replies = fe.wait_reply_count(1, Duration::from_secs(5));
+    assert!(matches!(&replies[0], ControlOutput::PauseScheduler(out) if out.success));
+
+    fe.push(EngineRequest::Control(Box::new(
+        ControlRequest::ResumeScheduler(ResumeSchedulerReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        }),
+    )));
+    fe.wait_reply_count(2, Duration::from_secs(5));
+
+    // -------------------------------------------------------------------------
+    // Phase B: Request in `PeerLanding` keeps `drained() == false` so both
+    //          `PauseScheduler(mode="wait")` and `ReleaseMemoryOccupation(["kv_cache"])`
+    //          wait until `PeerLanding` drains before completing / unmapping KV HBM!
+    // -------------------------------------------------------------------------
+    read_hook.arm();
+    let mut req2 = TokenizedGenerateReqInput::new(
+        "r-landing",
+        SamplingParams {
+            max_new_tokens: Some(1),
+            ..Default::default()
+        },
+    );
+    req2.input_ids = Some((500..500 + 4 * PAGE).collect());
+    req2.stream = true;
+    req2.peer_holder = Some(holder_name.clone());
+    fe.push(EngineRequest::Add(Box::new(req2)));
+
+    // Answer `Lookup` (3 pages = 48 tokens), `Layout`, and `Pin` so `"r-landing"` enters
+    // `PeerLanding` and pauses inside `HookedReader::read()`!
+    let mut landing_lease: Option<PeerLeaseView> = None;
+    let pages: Vec<PeerPageView> = (0..3)
+        .map(|slot| PeerPageView {
+            group_id: 0,
+            slot,
+            tier: PeerTier::Device,
+            block_id: slot + 1,
+        })
+        .collect();
+    let drive_start = Instant::now();
+    while !read_hook.state.lock().unwrap().1 {
+        assert!(drive_start.elapsed() < Duration::from_secs(5));
+        if let Ok(frames) = holder_rx.recv_timeout(Duration::from_millis(10)) {
+            match Inbound::decode(&frames).unwrap() {
+                Inbound::Request(Request::Lookup { lease, .. }) => {
+                    landing_lease = Some(lease.clone());
+                    let to = lease.reader.clone();
+                    holder_net
+                        .reply(
+                            &to,
+                            &Reply::Answer {
+                                stamp: holder_stamp.clone(),
+                                answer: PeerAnswerView {
+                                    lease,
+                                    kind: PeerAnswerKind::Lookup,
+                                    num_tokens: 3 * PAGE,
+                                    pages: pages.clone(),
+                                    held: true,
+                                },
+                            },
+                        )
+                        .unwrap();
+                }
+                Inbound::Request(Request::Layout { reply_to }) => {
+                    holder_net
+                        .reply(
+                            &reply_to,
+                            &Reply::Layout {
+                                stamp: holder_stamp.clone(),
+                                ranks: vec![rank_geometry(0)],
+                            },
+                        )
+                        .unwrap();
+                }
+                Inbound::Request(Request::Pin { lease }) => {
+                    let to = lease.reader.clone();
+                    holder_net
+                        .reply(
+                            &to,
+                            &Reply::Answer {
+                                stamp: holder_stamp.clone(),
+                                answer: PeerAnswerView {
+                                    lease,
+                                    kind: PeerAnswerKind::Pin,
+                                    num_tokens: 3 * PAGE,
+                                    pages: pages.clone(),
+                                    held: true,
+                                },
+                            },
+                        )
+                        .unwrap();
+                }
+                other => panic!("unexpected message before read_hook: {other:?}"),
+            }
+        }
+    }
+
+    {
+        let s = sched.lock();
+        let sizes = s.sizes();
+        assert_eq!(s.peer_stats().landing_requests, 1);
+        assert_eq!(sizes.prefilling, 1, "PeerLanding must count in PrefillSize()");
+        assert_eq!(
+            sizes.pending_prefill_tokens,
+            i64::from(PAGE),
+            "PeerLanding must report remaining unlanded tokens in PendingPrefillTokens()"
+        );
+    }
+
+    // 1. `PauseScheduler(mode="wait")` while `"r-landing"` is in `PeerLanding` MUST wait!
+    fe.push(EngineRequest::Control(Box::new(
+        ControlRequest::PauseScheduler(PauseSchedulerReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            mode: "wait".to_owned(),
+        }),
+    )));
+    thread::sleep(Duration::from_millis(60));
+    assert_eq!(
+        fe.replies.lock().unwrap().len(),
+        2,
+        "PauseScheduler(mode=wait) must NOT complete while r-landing is in PeerLanding!"
+    );
+
+    // Release `read_hook` and answer `Request::Release`: `"r-landing"` completes its forward
+    // and finishes, after which `PauseScheduler(mode="wait")` resolves!
+    read_hook.release();
+    let rel_frame = holder_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let Inbound::Request(Request::Release { lease, .. }) = Inbound::decode(&rel_frame).unwrap()
+    else {
+        panic!("expected Release request");
+    };
+    assert_eq!(Some(lease.clone()), landing_lease);
+    let to = lease.reader.clone();
+    holder_net
+        .reply(
+            &to,
+            &Reply::Answer {
+                stamp: holder_stamp.clone(),
+                answer: PeerAnswerView {
+                    lease,
+                    kind: PeerAnswerKind::Release,
+                    num_tokens: 0,
+                    pages: Vec::new(),
+                    held: true,
+                },
+            },
+        )
+        .unwrap();
+    fe.wait_finished("r-landing", Duration::from_secs(5));
+    let pause2_replies = fe.wait_reply_count(3, Duration::from_secs(5));
+    assert!(matches!(
+        &pause2_replies[2],
+        ControlOutput::PauseScheduler(out) if out.success
+    ));
+    fe.push(EngineRequest::Control(Box::new(
+        ControlRequest::ResumeScheduler(ResumeSchedulerReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        }),
+    )));
+    fe.wait_reply_count(4, Duration::from_secs(5));
+
+    // 2. `ReleaseMemoryOccupation(["kv_cache"])` while `"r-landing-rel"` is in `PeerLanding`
+    //    MUST NOT unmap KV HBM until the landing and request drain!
+    read_hook.arm();
+    let mut req3 = TokenizedGenerateReqInput::new(
+        "r-landing-rel",
+        SamplingParams {
+            max_new_tokens: Some(1),
+            ..Default::default()
+        },
+    );
+    req3.input_ids = Some((700..700 + 4 * PAGE).collect());
+    req3.stream = true;
+    req3.peer_holder = Some(holder_name);
+    fe.push(EngineRequest::Add(Box::new(req3)));
+
+    let drive_start2 = Instant::now();
+    while !read_hook.state.lock().unwrap().1 {
+        assert!(drive_start2.elapsed() < Duration::from_secs(5));
+        if let Ok(frames) = holder_rx.recv_timeout(Duration::from_millis(10)) {
+            match Inbound::decode(&frames).unwrap() {
+                Inbound::Request(Request::Lookup { lease, .. }) => {
+                    let to = lease.reader.clone();
+                    holder_net
+                        .reply(
+                            &to,
+                            &Reply::Answer {
+                                stamp: holder_stamp.clone(),
+                                answer: PeerAnswerView {
+                                    lease,
+                                    kind: PeerAnswerKind::Lookup,
+                                    num_tokens: 3 * PAGE,
+                                    pages: pages.clone(),
+                                    held: true,
+                                },
+                            },
+                        )
+                        .unwrap();
+                }
+                Inbound::Request(Request::Pin { lease }) => {
+                    let to = lease.reader.clone();
+                    holder_net
+                        .reply(
+                            &to,
+                            &Reply::Answer {
+                                stamp: holder_stamp.clone(),
+                                answer: PeerAnswerView {
+                                    lease,
+                                    kind: PeerAnswerKind::Pin,
+                                    num_tokens: 3 * PAGE,
+                                    pages: pages.clone(),
+                                    held: true,
+                                },
+                            },
+                        )
+                        .unwrap();
+                }
+                other => panic!("unexpected message before 2nd read_hook: {other:?}"),
+            }
+        }
+    }
+
+    fe.push(EngineRequest::Control(Box::new(
+        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            tags: Some(vec!["kv_cache".to_owned()]),
+        }),
+    )));
+    thread::sleep(Duration::from_millis(60));
+    assert_eq!(
+        fe.replies.lock().unwrap().len(),
+        4,
+        "ReleaseMemoryOccupation must NOT complete while r-landing-rel is in PeerLanding!"
+    );
+    assert!(
+        hooks.device_ops.lock().unwrap().is_empty(),
+        "KV HBM must NOT be released while r-landing-rel holds Device pages in PeerLanding!"
+    );
+
+    // Abort in-flight work via `PauseScheduler(mode="abort")`, let `read_hook` + `Release`
+    // retire the landing, and verify `ReleaseMemoryOccupation(["kv_cache"])` then succeeds!
+    fe.push(EngineRequest::Control(Box::new(
+        ControlRequest::PauseScheduler(PauseSchedulerReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            mode: "abort".to_owned(),
+        }),
+    )));
+    read_hook.release();
+    let rel_frame2 = holder_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let Inbound::Request(Request::Release { lease: lease2, .. }) =
+        Inbound::decode(&rel_frame2).unwrap()
+    else {
+        panic!("expected Release request for r-landing-rel");
+    };
+    let to2 = lease2.reader.clone();
+    holder_net
+        .reply(
+            &to2,
+            &Reply::Answer {
+                stamp: holder_stamp,
+                answer: PeerAnswerView {
+                    lease: lease2,
+                    kind: PeerAnswerKind::Release,
+                    num_tokens: 0,
+                    pages: Vec::new(),
+                    held: true,
+                },
+            },
+        )
+        .unwrap();
+
+    let final_replies = fe.wait_reply_count(6, Duration::from_secs(5));
+    assert!(final_replies
+        .iter()
+        .any(|r| matches!(r, ControlOutput::ReleaseMemoryOccupation(out) if out.success)));
+    assert_eq!(
+        *hooks.device_ops.lock().unwrap(),
+        vec!["release:kv_cache".to_owned()]
+    );
+
+    stop.store(true, Ordering::Relaxed);
+    loop_thread.join().unwrap();
 }

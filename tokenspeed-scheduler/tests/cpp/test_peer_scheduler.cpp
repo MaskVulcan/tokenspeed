@@ -776,5 +776,269 @@ TEST(PeerSchedulerConfigTest, PeerSharingNeedsPrefixCachingAndNoReplayableGroup)
     EXPECT_NO_THROW(PeerConfigFor("ok").Validate());
 }
 
+TEST(PeerLifecycleAccountingTest, PeerLookingAndPeerLandingCountInSizesAndCanAbort) {
+    Scheduler holder{PeerConfigFor("holder")};
+    Scheduler reader{PeerConfigFor("reader")};
+
+    const std::vector<std::int32_t> prefix = MakeAlignedTokens(6, kP);  // 12 tokens
+    holder.SubmitRequests({RequestSpec{.request_id = "seed", .tokens = prefix, .max_new_tokens = 1}});
+    ASSERT_EQ(PrefillRows(Plan(holder)).size(), 1u);
+    Send(holder, forward::ExtendResult{.request_id = "seed", .tokens = {7}});
+    Send(holder, forward::Finish{.request_id = "seed"});
+    Plan(holder);
+
+    std::vector<std::int32_t> prompt = prefix;
+    prompt.insert(prompt.end(), {901, 902, 903, 904});  // 16 tokens total
+    reader.SubmitRequests({RequestSpec{.request_id = "r1", .peer_holder = "holder", .tokens = prompt},
+                           RequestSpec{.request_id = "r2-abort", .peer_holder = "holder", .tokens = prompt}});
+
+    // Round 1: Both enter `fsm::PeerLooking`.
+    EXPECT_TRUE(PrefillRows(Plan(reader)).empty());
+    EXPECT_EQ(reader.GetPeerStats().looking_requests, 2u);
+    EXPECT_EQ(reader.WaitingSize(), 2u) << "PeerLooking must count in WaitingSize()";
+    EXPECT_EQ(reader.PrefillSize(), 0u);
+    EXPECT_EQ(reader.PendingPrefillTokens(), 2 * static_cast<std::int64_t>(prompt.size()));
+    EXPECT_TRUE(reader.CanAbortBeforeAdmission("r1"));
+    EXPECT_TRUE(reader.CanAbortBeforeAdmission("r2-abort"));
+
+    // Abort `r2-abort` while in `PeerLooking`: drops cleanly to 1 waiting request.
+    Send(reader, forward::Abort{.request_id = "r2-abort"});
+    EXPECT_EQ(reader.WaitingSize(), 1u);
+    EXPECT_FALSE(reader.CanAbortBeforeAdmission("r2-abort"));
+
+    // Answer `r1`'s lookup -> `r1` enters `fsm::PeerLanding` (`[0, 12)` landing, 4 tokens remaining).
+    HolderServicer servicer{holder};
+    for (const PeerLookupRequest& lookup : reader.TakePeerLookups()) {
+        if (lookup.request_id == "r1") {
+            const PeerAnswer ans = servicer.Lookup(lookup);
+            Send(reader, cache::PeerLookupAnswered{.lease = ans.lease, .num_tokens = ans.num_tokens});
+        }
+    }
+    const ExecutionPlan landing_plan = Plan(reader);
+    ASSERT_EQ(landing_plan.peer_fetches.size(), 1u);
+    EXPECT_EQ(reader.WaitingSize(), 0u);
+    EXPECT_EQ(reader.PrefillSize(), 1u) << "PeerLanding must count in PrefillSize()";
+    EXPECT_FALSE(reader.CanAbortBeforeAdmission("r1")) << "PeerLanding already admitted Device pages";
+    EXPECT_EQ(reader.PendingPrefillTokens(),
+              static_cast<std::int64_t>(prompt.size()) - landing_plan.peer_fetches.front().end_tokens);
+}
+
+TEST(PeerEndpointNormalizationTest, TrailingSlashZeroNormalizesSelfAndCrossRankHints) {
+    Scheduler holder{PeerConfigFor("10.0.0.1:8680")};
+    Scheduler reader{PeerConfigFor("10.0.0.1:8680/1")};
+
+    const std::vector<std::int32_t> prefix = MakeAlignedTokens(6, kP);
+    holder.SubmitRequests({RequestSpec{.request_id = "seed", .tokens = prefix, .max_new_tokens = 1}});
+    ASSERT_EQ(PrefillRows(Plan(holder)).size(), 1u);
+    Send(holder, forward::ExtendResult{.request_id = "seed", .tokens = {7}});
+    Send(holder, forward::Finish{.request_id = "seed"});
+    Plan(holder);
+
+    // 1. Self-hint with trailing `"/0"` on DP0 (`"10.0.0.1:8680/0"`) is skipped without PeerLookup.
+    std::vector<std::int32_t> self_prompt = prefix;
+    self_prompt.insert(self_prompt.end(), {801, 802});
+    holder.SubmitRequests(
+        {RequestSpec{.request_id = "self0", .peer_holder = "10.0.0.1:8680/0", .tokens = self_prompt}});
+    EXPECT_EQ(PrefillRows(Plan(holder)).size(), 1u);
+    EXPECT_TRUE(holder.TakePeerLookups().empty()) << "trailing /0 self-hint must not trigger self lookup";
+
+    // 2. Cross-rank hint from DP1 (`"10.0.0.1:8680/1"`) to `"10.0.0.1:8680/0"` normalizes holder to `"10.0.0.1:8680"`.
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "cross0", .peer_holder = "10.0.0.1:8680/0", .tokens = self_prompt}});
+    EXPECT_TRUE(PrefillRows(Plan(reader)).empty());
+    const std::vector<PeerLookupRequest> lookups = reader.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 1u);
+    EXPECT_EQ(lookups[0].holder, "10.0.0.1:8680");
+    HolderServicer servicer{holder};
+    const PeerAnswer ans = servicer.Lookup(lookups[0]);
+    Send(reader, cache::PeerLookupAnswered{.lease = ans.lease, .num_tokens = ans.num_tokens});
+    const ExecutionPlan landing_plan = Plan(reader);
+    ASSERT_EQ(landing_plan.peer_fetches.size(), 1u);
+    EXPECT_EQ(landing_plan.peer_fetches[0].holder, "10.0.0.1:8680");
+}
+
+TEST(PeerDiskInterleavingTest, TransientDiskCreditExhaustionNeverHijacksPeerHitOrLeaksDualLeases) {
+    Scheduler holder{PeerConfigFor("holder")};
+    const std::vector<std::int32_t> full_prefix = MakeAlignedTokens(8, kP);  // 16 tokens (8 pages of 2)
+    holder.SubmitRequests({RequestSpec{.request_id = "h-seed", .tokens = full_prefix, .max_new_tokens = 1}});
+    ASSERT_EQ(PrefillRows(Plan(holder)).size(), 1u);
+    Send(holder, forward::ExtendResult{.request_id = "h-seed", .tokens = {7}});
+    Send(holder, forward::Finish{.request_id = "h-seed"});
+    Plan(holder);
+
+    // Reader with BOTH Disk tier (`max_host_blocks = 4` to force transient read-credit
+    // exhaustion when 4 Host blocks are held by an in-flight Disk prefetch) AND Peer Host
+    // landings (`PeerLandingTier::kHost`).
+    SchedulerConfig reader_cfg = HostLandingConfigFor("reader", /*hybrid=*/false);
+    reader_cfg.device_allocator.total_pages = 17;
+    reader_cfg.cache_groups.front().total_pages = 17;
+    reader_cfg.host_allocator.total_pages = 33;
+    reader_cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+    reader_cfg.disk_allocator.total_pages = 33;
+    reader_cfg.disk_config = DiskConfig{.max_operations = 4,
+                                        .max_blocks_per_operation = 32,
+                                        .max_host_blocks = 4,
+                                        .max_write_host_blocks = 4,
+                                        .max_queued_cleanings = 32,
+                                        .min_prefetch_tokens = kP,
+                                        .wait_timeout_us = 10'000,
+                                        .ready_timeout_us = 10'000};
+    reader_cfg.max_batch_size = 1;
+    reader_cfg.max_resident_requests = 1;
+    SetTestSnapshotPool(reader_cfg);
+    Scheduler reader{reader_cfg};
+
+    const auto tick_disk = [&](std::int64_t now_us, bool allow_storage = true) {
+        Send(reader, cache::StorageTick{.now_us = now_us,
+                                        .allow_forward = true,
+                                        .allow_storage = allow_storage,
+                                        .pressure = StoragePressure{0, 0, 0}});
+    };
+    const auto disk_ops = [](const ExecutionPlan& plan) {
+        std::vector<DiskOperation> ops;
+        for (const Operation& op : plan.Operations()) {
+            if (const auto* cache = std::get_if<CacheOperation>(&op)) {
+                if (const auto* disk_op = std::get_if<DiskOperation>(cache)) {
+                    ops.push_back(*disk_op);
+                }
+            }
+        }
+        return ops;
+    };
+
+    // 1. Seed a short 2-page (4-token) prefix of `full_prefix` onto `reader`'s Disk ONLY,
+    //    plus an unrelated 4-page (8-token) Disk entry `other_disk` to exhaust all 4 `max_host_blocks`.
+    tick_disk(1);
+    const std::vector<std::int32_t> short_prefix(full_prefix.begin(), full_prefix.begin() + 2 * kP);
+    const std::vector<std::int32_t> other_disk = MakeAlignedTokens(4, kP, /*start=*/5000);
+    for (const auto& [id, toks] :
+         std::vector<std::pair<std::string, std::vector<std::int32_t>>>{{"s1", short_prefix}, {"s2", other_disk}}) {
+        reader.SubmitRequests({RequestSpec{.request_id = id, .tokens = toks, .max_new_tokens = 1}});
+        const ExecutionPlan p = Plan(reader);
+        ASSERT_EQ(PrefillRows(p).size(), 1u);
+        Send(reader, forward::ExtendResult{.request_id = id, .tokens = {7}});
+        Send(reader, forward::Finish{.request_id = id});
+        Plan(reader);
+    }
+    // Evict `s1` (2 pages) + `s2` (4 pages) from the 16-usable-page Device pool using three 7-page
+    // pressure prompts (21 pages > 16 Device pages, each <= 28-token single-request cap) so `kWriteBack`
+    // copies both `s1` and `s2` in full to Host and queues them for Disk cleaning.
+    for (int p_idx = 0; p_idx < 3; ++p_idx) {
+        const std::vector<std::int32_t> pressure_toks = MakeAlignedTokens(7, kP, /*start=*/2000 + p_idx * 100);
+        const std::string pid = "pressure-" + std::to_string(p_idx);
+        reader.SubmitRequests({RequestSpec{.request_id = pid, .tokens = pressure_toks, .max_new_tokens = 1}});
+        const ExecutionPlan p_evict = Plan(reader);
+        ASSERT_EQ(PrefillRows(p_evict).size(), 1u);
+        for (const auto& w : disk_ops(p_evict)) Send(reader, cache::DiskDone{.op_id = w.op_id, .success = true});
+        Send(reader, forward::ExtendResult{.request_id = pid, .tokens = {7}});
+        Send(reader, forward::Finish{.request_id = pid});
+        const ExecutionPlan p_fin = Plan(reader);
+        for (const auto wb : CacheOpIds<WriteBackBatch>(p_evict)) Send(reader, cache::WriteBackDone{.op_id = wb});
+        for (const auto wb : CacheOpIds<WriteBackBatch>(p_fin)) Send(reader, cache::WriteBackDone{.op_id = wb});
+        for (const auto& w : disk_ops(p_fin)) Send(reader, cache::DiskDone{.op_id = w.op_id, .success = true});
+    }
+
+    // Clean both `s1` (2 blocks) and `s2` (4 blocks) to Disk (`max_write_host_blocks = 4` cleans in 2 plans).
+    while (reader.GetDiskStats().queued_cleanings > 0) {
+        const auto writes = disk_ops(Plan(reader));
+        ASSERT_FALSE(writes.empty());
+        for (const auto& w : writes) {
+            EXPECT_EQ(w.kind, DiskOpKind::kWrite);
+            Send(reader, cache::DiskDone{.op_id = w.op_id, .success = true});
+        }
+    }
+    ASSERT_GE(reader.GetDiskStats().disk_blocks, 6u);
+    CacheCoordinator& coord = SchedulerTestAccess::Coordinator(reader);
+    ASSERT_TRUE(coord.ClearDeviceCache());
+    for (const auto& toks : {short_prefix, other_disk}) {
+        std::vector<std::span<const std::int32_t>> pages;
+        for (std::size_t off = 0; off < toks.size(); off += kP) {
+            pages.emplace_back(toks.data() + off, kP);
+        }
+        for (const CacheKey& key : coord.Store().KeysForGroup(ComputePrefixHashes(pages, ""), 0)) {
+            if (const auto loc = coord.Store().LocationOf(*coord.Store().HostPool(), 0, key)) {
+                ASSERT_TRUE(coord.Evictor().EvictHostCachedBlock(0, *loc, &CacheEvictor::HostEvictionStats::lru));
+            }
+        }
+    }
+
+    // 2. Keep the 1 resident batch slot busy with `"blocker"`, exhaust all 4 `max_host_blocks`
+    //    Disk read credits with `"disk-hog"` (`other_disk` = 4 blocks), and submit `"r-peer"`
+    //    (`full_prefix + tail`, `peer_holder = "holder"`).
+    std::vector<std::int32_t> blocker_toks = MakeAlignedTokens(2, kP, /*start=*/8000);
+    reader.SubmitRequests({RequestSpec{.request_id = "blocker", .tokens = blocker_toks, .max_new_tokens = 4}});
+    ASSERT_EQ(PrefillRows(Plan(reader)).size(), 1u);  // occupies the 1 resident request slot!
+
+    std::vector<std::int32_t> hog_toks = other_disk;
+    hog_toks.insert(hog_toks.end(), {7001, 7002});
+    std::vector<std::int32_t> peer_toks = full_prefix;
+    peer_toks.insert(peer_toks.end(), {9001, 9002});
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "disk-hog", .tokens = hog_toks, .max_new_tokens = 1},
+         RequestSpec{.request_id = "r-peer", .peer_holder = "holder", .tokens = peer_toks, .max_new_tokens = 1}});
+
+    // Round A: `"disk-hog"` takes all 4 `max_host_blocks` credits (`!HasReadCredits()` for `"r-peer"`).
+    // `preparePeer` MUST wait for `storage_prepared` rather than racing ahead of `prepareDisk`!
+    const ExecutionPlan plan_a = Plan(reader);
+    const auto reads_a = disk_ops(plan_a);
+    ASSERT_EQ(reads_a.size(), 1u);
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 4u);
+    EXPECT_TRUE(reader.TakePeerLookups().empty())
+        << "preparePeer must wait while prepareDisk is transiently credit-exhausted";
+
+    // Round B: Complete `"disk-hog"`'s Disk read and abort `"disk-hog"` to release all 4 Host block credits
+    // -> `"r-peer"` now gets Disk read credits and prefetches its 2 local Disk pages `[0, 4)`!
+    Send(reader, cache::DiskDone{.op_id = reads_a[0].op_id, .success = true});
+    Send(reader, forward::Abort{.request_id = "disk-hog"});
+    const ExecutionPlan plan_b = Plan(reader);
+    const auto reads_b = disk_ops(plan_b);
+    ASSERT_EQ(reads_b.size(), 1u) << "r-peer prefetches its 2 local Disk pages first";
+    EXPECT_TRUE(reader.TakePeerLookups().empty());
+
+    // Complete `"r-peer"`'s 2-block Disk read: `r-peer` now holds `storage_hold` (`held_host_blocks == 2`)
+    // inside `PeerLooking.admission` as `preparePeer` sends `PeerLookup` for `[4, 16)`!
+    Send(reader, cache::DiskDone{.op_id = reads_b[0].op_id, .success = true});
+    const ExecutionPlan plan_c = Plan(reader);
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 2u);
+    const auto lookups = reader.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 1u);
+    EXPECT_EQ(lookups[0].request_id, "r-peer");
+
+    // Round C: `"holder"` answers 16 tokens. `startPeerHostLanding` reserves `[4, 16)` in Host
+    // AND clears `r-peer`'s prior Disk `storage_hold` so no dual StorageLease is held!
+    HolderServicer servicer{holder};
+    const PeerAnswer ans = servicer.Lookup(lookups[0]);
+    ASSERT_EQ(ans.num_tokens, 16);
+    Send(reader, cache::PeerLookupAnswered{.lease = ans.lease, .num_tokens = ans.num_tokens});
+
+    // Drain all 4 scheduled forwards (1 prefill + 3 decodes from plan_a..plan_c) on `"blocker"`
+    // and finish it so the resident request slot is free for `"r-peer"`.
+    for (int step = 0; step < 4; ++step) {
+        Send(reader, forward::ExtendResult{.request_id = "blocker", .tokens = {7}});
+    }
+    Send(reader, forward::Finish{.request_id = "blocker"});
+
+    const ExecutionPlan plan_d = Plan(reader);
+    EXPECT_TRUE(disk_ops(plan_d).empty()) << "prepareDisk must never hijack a request with peer_hit";
+    ASSERT_EQ(plan_d.peer_fetches.size(), 1u);
+    EXPECT_EQ(plan_d.peer_fetches[0].begin_tokens, 4) << "local Disk supplied [0, 4); peer supplies [4, 16)";
+    EXPECT_EQ(plan_d.peer_fetches[0].end_tokens, 16);
+    EXPECT_EQ(reader.GetDiskStats().ready_requests, 0u)
+        << "startPeerHostLanding must clear prior Disk storage_hold before starting PeerHostLandings";
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 0u) << "no leaked Disk-held Host blocks during peer landing";
+
+    // Complete the peer Host landing and verify full 16-token hit admission with zero leaked resources!
+    Send(reader, cache::PeerFetchDone{.request_id = "r-peer", .num_tokens = 16});
+    const ExecutionPlan plan_e = Plan(reader);
+    EXPECT_EQ(PrefillRows(plan_e), (std::vector<std::pair<std::string, std::int32_t>>{{"r-peer", 16}}));
+    Send(reader, forward::ExtendResult{.request_id = "r-peer", .tokens = {8}});
+    Send(reader, forward::Finish{.request_id = "r-peer"});
+    for (const auto lb : CacheOpIds<LoadBackBatch>(plan_e)) Send(reader, cache::LoadBackDone{.op_id = lb});
+    const ExecutionPlan plan_f = Plan(reader);
+    for (const auto wb : CacheOpIds<WriteBackBatch>(plan_f)) Send(reader, cache::WriteBackDone{.op_id = wb});
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 0u);
+    EXPECT_EQ(reader.GetPeerStats().landing_requests, 0u);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

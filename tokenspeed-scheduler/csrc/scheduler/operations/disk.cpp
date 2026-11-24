@@ -107,8 +107,16 @@ void Scheduler::prepareDisk(Request& request) {
 
     auto* admission = request.AdmissionResourcesPtr();
     if (admission == nullptr || admission->storage_prepared || !storage_allowed_) return;
+    if (admission->peer_hit.has_value()) {
+        admission->storage_prepared = true;
+        return;
+    }
     // Decode receives its prompt from its PD peer.
     if (config_.role == Role::kD || disk_transfers_->Degraded()) {
+        admission->storage_prepared = true;
+        return;
+    }
+    if (coordinator_.Disk().NumDiskCachedBlocks() == 0) {
         admission->storage_prepared = true;
         return;
     }
@@ -116,10 +124,6 @@ void Scheduler::prepareDisk(Request& request) {
     // `storage_prepared` unset so a still-queued request can retry on a later
     // tick instead of permanently falling back to recomputation.
     if (!disk_transfers_->HasReadCredits()) return;
-    if (coordinator_.Disk().NumDiskCachedBlocks() == 0) {
-        admission->storage_prepared = true;
-        return;
-    }
     const auto grain = config_.prefix_granularity;
     const auto max_tokens = cacheablePrefixTokens(request);
     const auto cached_hashes = request.PromptPrefixHashes(max_tokens / grain);

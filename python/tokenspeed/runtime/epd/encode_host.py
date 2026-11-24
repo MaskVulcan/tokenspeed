@@ -585,6 +585,7 @@ class EncodeBootstrap:
 
         local_ip = get_local_ip_by_remote()
         enable_mooncake_ipv6_for_host(local_ip)
+        # Enforces default MC_TRANSFER_TIMEOUT=25s / ASCEND_TRANSFER_TIMEOUT=10000ms.
         ensure_mooncake_transfer_timeouts()
         # Rank 0 hosts the node's bootstrap server; every rank registers with
         # it.

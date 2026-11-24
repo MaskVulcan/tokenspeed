@@ -61,6 +61,13 @@ std::int64_t Deadline(std::int64_t now_us, std::int64_t lifetime_us) {
     return now_us + std::min(lifetime_us, std::numeric_limits<std::int64_t>::max() - now_us);
 }
 
+std::string_view CanonicalPeerEndpoint(std::string_view endpoint) {
+    if (endpoint.size() > 2 && endpoint.ends_with("/0")) {
+        endpoint.remove_suffix(2);
+    }
+    return endpoint;
+}
+
 }  // namespace
 
 Scheduler::PeerStats Scheduler::GetPeerStats() const {
@@ -255,6 +262,9 @@ void Scheduler::startPeerHostLanding(Request& request) {
     }
     spdlog::debug("[Peer] rid={} lands [{}, {}) from {} into Host ({} blocks)", request.Id(), local, hit.num_tokens,
                   request.PeerHolder(), started->fetch.destinations.size());
+    // Release any prior Disk/storage Ready hold before entering PeerHostLandings
+    // Prefetching so the request never holds two StorageLeases simultaneously.
+    admission.storage_hold.reset();
     peer_host_fetches_.push_back(std::move(started->fetch));
     // The runtime always reports the landing (PeerFetchDone), after its
     // answers' deadlines or its quarantine: no soft deadline of its own.
@@ -279,12 +289,20 @@ void Scheduler::preparePeer(Request& request) {
     if (submitted->admission.peer_prepared) {
         return;
     }
+    // When local Disk is enabled, healthy, and holds cached blocks, wait for
+    // `prepareDisk` to settle (in case read credits were transiently exhausted)
+    // before issuing a network PeerLookup.
+    if (disk_transfers_ && !disk_transfers_->Degraded() && storage_allowed_ &&
+        coordinator_.Disk().NumDiskCachedBlocks() > 0 && !submitted->admission.storage_prepared) {
+        return;
+    }
     submitted->admission.peer_prepared = true;
     const PeerConfig& limits = *config_.peer_config;
     const std::string& holder = request.PeerHolder();
     // The D role computes no prompt: what it lacks comes from its PD peer,
     // so it never reads from a holder, whatever the request names.
-    if (holder.empty() || holder == limits.name || config_.role == Role::kD) {
+    if (holder.empty() || CanonicalPeerEndpoint(holder) == CanonicalPeerEndpoint(limits.name) ||
+        config_.role == Role::kD) {
         return;
     }
     const std::int32_t grain = config_.prefix_granularity;

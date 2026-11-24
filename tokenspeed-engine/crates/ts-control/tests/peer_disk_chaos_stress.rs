@@ -561,6 +561,7 @@ fn ts_a3_push_ring_saturation_cancel_quarantine_and_degraded_clear_medium() {
             ring: ring.clone(),
             slot_bytes: PARENT_BYTES,
             writer: writer.clone(),
+            quarantine: Duration::from_millis(50),
         })
         .unwrap();
     assert_eq!(holder_push.push_ring_slot_counts(), Some((20, 20)));
@@ -807,6 +808,7 @@ fn ts_a3_push_ring_saturation_cancel_quarantine_and_degraded_clear_medium() {
             ring: p2_ring,
             slot_bytes: p2_slot_bytes,
             writer: p2_writer,
+            quarantine: Duration::from_millis(50),
         })
         .unwrap();
     assert_eq!(

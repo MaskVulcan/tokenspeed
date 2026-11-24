@@ -30,12 +30,23 @@
 
 namespace tokenspeed {
 
+namespace {
+
+std::string NormalizePeerHolderEndpoint(std::string holder) {
+    if (holder.size() > 2 && holder.ends_with("/0")) {
+        holder.resize(holder.size() - 2);
+    }
+    return holder;
+}
+
+}  // namespace
+
 Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, bool awaits_bootstrap)
     : id_{spec.request_id},
       admission_id_{spec.admission_id},
       session_id_{spec.session_id},
       cache_group_id_{spec.cache_group_id},
-      peer_holder_{spec.peer_holder},
+      peer_holder_{NormalizePeerHolderEndpoint(spec.peer_holder)},
       shared_prefix_tokens_{spec.shared_prefix_tokens},
       token_container_{spec.tokens},
       submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},

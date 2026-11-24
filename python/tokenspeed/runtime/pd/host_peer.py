@@ -158,10 +158,12 @@ def ensure_mooncake_transfer_timeouts() -> None:
     """Install bounded transfer timeouts before Mooncake / CANN ADXL initializes.
 
     Respects any explicit non-empty operator/launcher setting while preventing
-    Mooncake's ``60s`` unbound default when unset or empty.
+    Mooncake's ``60s`` unbound default when unset or empty. ``25s`` exceeds two
+    ``10s`` ADXL retry attempts plus reconnect margin so ``ts_mooncake_write``
+    never returns early while an ADXL retry DMA is still reading ``push_ring``.
     """
     if not (os.environ.get("MC_TRANSFER_TIMEOUT") or "").strip():
-        os.environ["MC_TRANSFER_TIMEOUT"] = "10"
+        os.environ["MC_TRANSFER_TIMEOUT"] = "25"
     if not (os.environ.get("ASCEND_TRANSFER_TIMEOUT") or "").strip():
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = "10000"
 

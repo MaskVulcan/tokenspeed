@@ -305,10 +305,11 @@ def test_host_landings_take_a_share_of_the_host_blocks():
 
 
 def test_quarantine_exceeds_unacknowledged_push_cancel_retry_window():
-    # Paired with MC_TRANSFER_TIMEOUT=10s (up to 2 retries = 20s) and CANCEL_WAIT=5s:
-    # PUSH_TIMEOUT_S (10s) + 1s + CANCEL_WAIT (5s) + QUARANTINE_S (30s) = 46s > 20s.
+    # Paired with MC_TRANSFER_TIMEOUT=25s (> 2 * 10s ADXL retries) and CANCEL_WAIT=5s:
+    # PUSH_TIMEOUT_S (10s) + 1s + CANCEL_WAIT (5s) + QUARANTINE_S (30s) = 46s > 25s,
+    # and default resolve_quarantine_s(10.0) with MC=25s yields 54.0s >= 30.0s.
     assert QUARANTINE_S == 30.0
-    assert (PUSH_TIMEOUT_S + 1.0 + 5.0 + QUARANTINE_S) > 2.0 * 10.0
+    assert (PUSH_TIMEOUT_S + 1.0 + 5.0 + QUARANTINE_S) > 25.0
 
 
 def test_peer_scheduler_config_scales_soft_pin_and_host_ready_with_answer_timeout():
@@ -355,13 +356,18 @@ def test_peer_scheduler_config_scales_soft_pin_and_host_ready_with_answer_timeou
 
 
 def test_resolve_quarantine_s_tracks_effective_transfer_timeouts(monkeypatch):
-    # Explicit 10s / 10000ms defaults -> max(30.0, 2 * 10 + 10 - 6 = 24.0) = 30.0s.
+    # Explicit 10s / 10000ms -> max(30.0, 2 * 10 + 10 - 6 = 24.0) = 30.0s.
     monkeypatch.setenv("MC_TRANSFER_TIMEOUT", "10")
     monkeypatch.setenv("ASCEND_TRANSFER_TIMEOUT", "10000")
     assert resolve_quarantine_s(10.0) == 30.0
 
+    # Production 25s / 10000ms defaults -> 2 * 25 + 10 - 6 = 54.0s (>= 30.0s).
+    monkeypatch.setenv("MC_TRANSFER_TIMEOUT", "25")
+    monkeypatch.setenv("ASCEND_TRANSFER_TIMEOUT", "10000")
+    assert resolve_quarantine_s(10.0) == 54.0
+
     # Hulk ASCEND_TRANSFER_TIMEOUT=31000 (31s) -> 2 * 31 + 10 - 6 = 66.0s!
-    monkeypatch.setenv("MC_TRANSFER_TIMEOUT", "10")
+    monkeypatch.setenv("MC_TRANSFER_TIMEOUT", "25")
     monkeypatch.setenv("ASCEND_TRANSFER_TIMEOUT", "31000")
     assert resolve_quarantine_s(10.0) == 66.0
 
@@ -380,11 +386,11 @@ def test_ensure_mooncake_transfer_timeouts_preserves_operator_overrides(monkeypa
     monkeypatch.delenv("MC_TRANSFER_TIMEOUT", raising=False)
     monkeypatch.delenv("ASCEND_TRANSFER_TIMEOUT", raising=False)
     ensure_mooncake_transfer_timeouts()
-    assert os.environ["MC_TRANSFER_TIMEOUT"] == "10"
+    assert os.environ["MC_TRANSFER_TIMEOUT"] == "25"
     assert os.environ["ASCEND_TRANSFER_TIMEOUT"] == "10000"
-    assert resolve_quarantine_s(10.0) == 30.0
+    assert resolve_quarantine_s(10.0) == 54.0
 
-    # Pre-existing Hulk override is preserved by setdefault and scales quarantine_s to 66.0s.
+    # Pre-existing Hulk override is preserved and scales quarantine_s to 66.0s.
     monkeypatch.setenv("ASCEND_TRANSFER_TIMEOUT", "31000")
     ensure_mooncake_transfer_timeouts()
     assert os.environ["ASCEND_TRANSFER_TIMEOUT"] == "31000"

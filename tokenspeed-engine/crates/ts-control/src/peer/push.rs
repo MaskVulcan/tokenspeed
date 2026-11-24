@@ -62,10 +62,10 @@ const DONE: &[u8] = b"d";
 const CANCELLED: &[u8] = b"x";
 
 /// How long a reader waits for a cancelled push's acknowledgment.
-/// Together with `QUARANTINE_S = 30.0s` (`peer.py`), `CANCEL_WAIT + QUARANTINE_S`
-/// (`35s`) exceeds the maximum in-flight transfer engine WRITE retry window
-/// (`2 * MC_TRANSFER_TIMEOUT = 20s` at `MC_TRANSFER_TIMEOUT=10`), guaranteeing
-/// destination blocks are never reallocated before unacknowledged writes retire.
+/// Together with `QUARANTINE_S = 30.0s` (`peer.py`, `resolve_quarantine_s() >= 54s`
+/// at `MC_TRANSFER_TIMEOUT=25`), `CANCEL_WAIT + quarantine` exceeds the maximum
+/// in-flight transfer engine WRITE retry window, guaranteeing destination and
+/// staging blocks are never reallocated before unacknowledged writes retire.
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
 
 /// One field copy of a pushed block: `length` bytes at `offset` within the
@@ -174,6 +174,9 @@ pub struct PushSource {
     pub slot_bytes: usize,
     /// What writes a slot's fields to the reader.
     pub writer: Arc<dyn PageWriter>,
+    /// How long a staging slot stays quarantined after an uncertain
+    /// `writer.write()` failure before another Disk read may overwrite it.
+    pub quarantine: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,42 +310,100 @@ impl Message {
     }
 }
 
-/// The ring's free slots.
+/// Maximum staging slots a single push job may hold simultaneously, preventing
+/// one large push from monopolizing the entire ring and starving sibling workers.
+const MAX_INFLIGHT_SLOTS_PER_JOB: usize = 8;
+
+fn max_inflight_slots_per_job(total_slots: usize) -> usize {
+    (total_slots / 2).clamp(1, MAX_INFLIGHT_SLOTS_PER_JOB)
+}
+
+struct SlotState {
+    free: Vec<usize>,
+    /// Quarantined `(slot_idx, available_at)` pairs from failed `PageWriter::write` calls.
+    quarantined: VecDeque<(usize, Instant)>,
+}
+
+impl SlotState {
+    fn reclaim_expired(&mut self, now: Instant) {
+        self.quarantined.retain(|&(slot, until)| {
+            if now >= until {
+                self.free.push(slot);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn earliest_quarantine(&self) -> Option<Instant> {
+        self.quarantined.iter().map(|&(_, until)| until).min()
+    }
+}
+
+/// The ring's free and quarantined slots.
 struct Slots {
     total: usize,
-    free: Mutex<Vec<usize>>,
+    max_per_job: usize,
+    quarantine: Duration,
+    state: Mutex<SlotState>,
     returned: Condvar,
 }
 
 impl Slots {
     fn take(&self, deadline: Instant, cancelled: &AtomicBool) -> Option<SlotGuard<'_>> {
-        let mut free = self.free.lock();
+        let mut state = self.state.lock();
         loop {
             if cancelled.load(Ordering::Acquire) {
                 return None;
             }
-            if let Some(slot) = free.pop() {
-                return Some(SlotGuard { slots: self, slot });
+            let now = Instant::now();
+            state.reclaim_expired(now);
+            if let Some(slot) = state.free.pop() {
+                return Some(SlotGuard::new(self, slot));
             }
-            if self.returned.wait_until(&mut free, deadline).timed_out() {
+            if now >= deadline {
+                return None;
+            }
+            let next_wake = state
+                .earliest_quarantine()
+                .map_or(deadline, |until| until.min(deadline));
+            let timed_out = self.returned.wait_until(&mut state, next_wake).timed_out();
+            if timed_out && Instant::now() >= deadline {
                 if cancelled.load(Ordering::Acquire) {
                     return None;
                 }
-                return free.pop().map(|slot| SlotGuard { slots: self, slot });
+                state.reclaim_expired(Instant::now());
+                return state.free.pop().map(|slot| SlotGuard::new(self, slot));
             }
         }
     }
 
     fn try_take(&self) -> Option<SlotGuard<'_>> {
-        self.free
-            .lock()
-            .pop()
-            .map(|slot| SlotGuard { slots: self, slot })
+        let mut state = self.state.lock();
+        state.reclaim_expired(Instant::now());
+        state.free.pop().map(|slot| SlotGuard::new(self, slot))
     }
 
     fn give_back(&self, slot: usize) {
-        self.free.lock().push(slot);
+        self.state.lock().free.push(slot);
         self.returned.notify_one();
+    }
+
+    fn quarantine_slot(&self, slot: usize) {
+        if self.quarantine.is_zero() {
+            self.give_back(slot);
+            return;
+        }
+        let until = Instant::now() + self.quarantine;
+        self.state.lock().quarantined.push_back((slot, until));
+        self.returned.notify_all();
+    }
+
+    fn free_count(&self) -> usize {
+        let mut state = self.state.lock();
+        state.reclaim_expired(Instant::now());
+        state.free.len()
     }
 
     fn wake_all(&self) {
@@ -350,21 +411,42 @@ impl Slots {
     }
 }
 
-/// RAII guard returning a staging slot even on early return or panic.
+/// RAII guard returning or quarantining a staging slot on scope exit or panic.
 struct SlotGuard<'a> {
     slots: &'a Slots,
     slot: usize,
+    quarantined: bool,
 }
 
-impl SlotGuard<'_> {
+impl<'a> SlotGuard<'a> {
+    fn new(slots: &'a Slots, slot: usize) -> Self {
+        Self {
+            slots,
+            slot,
+            quarantined: false,
+        }
+    }
+
     fn index(&self) -> usize {
         self.slot
+    }
+
+    fn arm_quarantine(&mut self) {
+        self.quarantined = true;
+    }
+
+    fn disarm_quarantine(&mut self) {
+        self.quarantined = false;
     }
 }
 
 impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
-        self.slots.give_back(self.slot);
+        if self.quarantined {
+            self.slots.quarantine_slot(self.slot);
+        } else {
+            self.slots.give_back(self.slot);
+        }
     }
 }
 
@@ -543,11 +625,17 @@ impl Holder {
         {
             return Err("a Disk block is larger than a staging slot".to_owned());
         }
+        let quarantine = source.quarantine;
         let state = Arc::new(HolderState {
             source,
             slots: Slots {
                 total: slots,
-                free: Mutex::new((0..slots).collect()),
+                max_per_job: max_inflight_slots_per_job(slots),
+                quarantine,
+                state: Mutex::new(SlotState {
+                    free: (0..slots).collect(),
+                    quarantined: VecDeque::new(),
+                }),
                 returned: Condvar::new(),
             },
             running: Mutex::new(HashMap::new()),
@@ -773,8 +861,9 @@ impl HolderState {
             !ok || job.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline
         };
         loop {
-            // Reads go ahead of the writes, as many as the ring has slots for.
-            while next < blocks.len() && !stopped(ok) {
+            // Reads go ahead of the writes, bounded per job so one large push
+            // never monopolizes every staging slot in the shared ring.
+            while next < blocks.len() && inflight.len() < self.slots.max_per_job && !stopped(ok) {
                 let slot = if inflight.is_empty() {
                     self.slots.take(deadline, &job.cancelled)
                 } else {
@@ -839,7 +928,7 @@ impl HolderState {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            let Some((_slot_guard, _job_id)) = inflight.remove(&slot_idx) else {
+            let Some((mut slot_guard, _job_id)) = inflight.remove(&slot_idx) else {
                 continue;
             };
             ok &= read;
@@ -859,10 +948,18 @@ impl HolderState {
                         host_bytes: 0,
                     };
                     let write_ns = profile::now_ns();
+                    slot_guard.arm_quarantine();
                     match self.source.writer.write(session, &spans) {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            slot_guard.disarm_quarantine();
+                        }
                         Err(error) => {
-                            tracing::warn!(%error, "peer push write failed");
+                            tracing::warn!(
+                                %error,
+                                slot = slot_idx,
+                                quarantine_ms = self.slots.quarantine.as_millis() as u64,
+                                "peer push write failed; quarantining staging slot"
+                            );
                             block_ok = false;
                             ok = false;
                         }
@@ -1033,7 +1130,7 @@ impl PushEndpoint {
     /// `(free, total)` staging-ring slot counts on the active holder, if serving.
     pub fn push_ring_slot_counts(&self) -> Option<(usize, usize)> {
         let holder = self.holder.lock().clone()?;
-        let free = holder.state.slots.free.lock().len();
+        let free = holder.state.slots.free_count();
         Some((free, holder.state.slots.total))
     }
 
@@ -1445,6 +1542,7 @@ mod tests {
                 writer: writer.clone(),
                 ring: ring.clone(),
                 slot_bytes: BLOCK,
+                quarantine: Duration::from_millis(50),
             })
             .unwrap();
         let reader_ep = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 2).unwrap();
@@ -1551,6 +1649,406 @@ mod tests {
             for handle in handles {
                 assert_eq!(handle.join().unwrap(), Ok(()));
             }
+        });
+    }
+
+    #[test]
+    fn write_error_quarantines_staging_slot_until_expiry_then_reclaims_cleanly() {
+        use std::{
+            path::PathBuf,
+            sync::atomic::{AtomicBool, Ordering},
+        };
+        use ts_disk::{Backend, DiskFile, ExecutorConfig, Memory};
+        use ts_l3::{GroupLayout, HostLayout};
+
+        const BLOCK: usize = 4096;
+        struct TempDisk(PathBuf);
+        impl Drop for TempDisk {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let dir = std::env::var_os("TS_DISK_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let temp = TempDisk(dir.join(format!(
+            "ts-push-quarantine-{}-{}.bin",
+            std::process::id(),
+            profile::now_ns()
+        )));
+        let disk_file = DiskFile::create(&temp.0, (4 * BLOCK) as u64).unwrap();
+        // Single-slot staging ring so any premature slot reuse immediately overwrites slot 0!
+        let ring = Arc::new(Memory::map(BLOCK).unwrap());
+        let mut seed_mem = Memory::map(2 * BLOCK).unwrap();
+        seed_mem.write_at(0, &[0xAA; BLOCK]);
+        seed_mem.write_at(BLOCK, &[0xBB; BLOCK]);
+
+        let executor = Arc::new(
+            ts_disk::Executor::start(
+                disk_file,
+                &[
+                    (ring.address(), ring.size()),
+                    (seed_mem.address(), seed_mem.size()),
+                ],
+                ExecutorConfig {
+                    backend: Backend::Psync,
+                    queue_depth: 2,
+                    write_queue_depth: 1,
+                    max_io_bytes: 1 << 20,
+                    write_bytes_per_second: 1 << 30,
+                },
+            )
+            .unwrap(),
+        );
+
+        let (tx, rx) = mpsc::channel();
+        executor
+            .submit(
+                Job {
+                    direction: Direction::Write,
+                    ios: vec![Io {
+                        file_offset: 0,
+                        address: seed_mem.address(),
+                        len: 2 * BLOCK,
+                    }],
+                },
+                move |report| {
+                    let _ = tx.send(report.outcome);
+                },
+            )
+            .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+
+        struct FailToggleWriter {
+            ring: Arc<Memory>,
+            fail: AtomicBool,
+            delivered: Mutex<Vec<Vec<u8>>>,
+        }
+
+        impl PageWriter for FailToggleWriter {
+            fn write(&self, _session: &str, spans: &Spans) -> Result<(), String> {
+                if self.fail.load(Ordering::Acquire) {
+                    return Err("simulated MC_TRANSFER_TIMEOUT while ADXL retry #2 is active".into());
+                }
+                for (&src, &len) in spans.sources.iter().zip(&spans.lengths) {
+                    let mut buf = vec![0u8; len as usize];
+                    self.ring.read_at(src as usize - self.ring.address(), &mut buf);
+                    self.delivered.lock().push(buf);
+                }
+                Ok(())
+            }
+        }
+
+        let writer = Arc::new(FailToggleWriter {
+            ring: ring.clone(),
+            fail: AtomicBool::new(true),
+            delivered: Mutex::new(Vec::new()),
+        });
+        let quarantine = Duration::from_millis(200);
+        let holder_ep = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 10).unwrap();
+        holder_ep
+            .serve(PushSource {
+                executor: executor.clone(),
+                disk_layout: HostLayout {
+                    groups: vec![GroupLayout {
+                        packing: 1,
+                        block_bytes: BLOCK,
+                        shard_count: 1,
+                    }],
+                    lcm_block_bytes: BLOCK,
+                    num_lcm_blocks: 4,
+                    owner_rank: 0,
+                    tp_rank: 0,
+                },
+                ring: ring.clone(),
+                slot_bytes: BLOCK,
+                writer: writer.clone(),
+                quarantine,
+            })
+            .unwrap();
+        let reader_ep = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 11).unwrap();
+
+        // 1. Push block 1 (`0xAA`): `writer.write()` returns `Err`, quarantining slot 0 for 200ms.
+        let fail_at = Instant::now();
+        let err1 = reader_ep.push_checked(
+            holder_ep.name(),
+            "sess-fail",
+            Duration::from_secs(2),
+            vec![PushItem {
+                group: 0,
+                block: 1,
+                spans: vec![PushSpan {
+                    offset: 0,
+                    address: 100_000,
+                    length: BLOCK as u64,
+                }],
+            }],
+        );
+        assert!(matches!(err1, Err(PushFailure::Failed(_))));
+        assert_eq!(
+            holder_ep.push_ring_slot_counts(),
+            Some((0, 1)),
+            "failed write must quarantine slot 0 instead of returning it to free"
+        );
+
+        // 2. Heal writer and immediately attempt to push block 2 (`0xBB`) with a 40ms budget
+        //    (< 200ms quarantine): slot 0 MUST NOT be reused or overwritten by NVMe DMA!
+        writer.fail.store(false, Ordering::Release);
+        let early = reader_ep.push_checked(
+            holder_ep.name(),
+            "sess-early",
+            Duration::from_millis(40),
+            vec![PushItem {
+                group: 0,
+                block: 2,
+                spans: vec![PushSpan {
+                    offset: 0,
+                    address: 200_000,
+                    length: BLOCK as u64,
+                }],
+            }],
+        );
+        assert!(
+            early.is_err(),
+            "push before quarantine deadline must not acquire quarantined slot 0"
+        );
+        let mut slot_bytes_during_quarantine = vec![0u8; BLOCK];
+        ring.read_at(0, &mut slot_bytes_during_quarantine);
+        assert!(
+            slot_bytes_during_quarantine.iter().all(|&b| b == 0xAA),
+            "quarantined staging slot was overwritten before quarantine expired!"
+        );
+        assert_eq!(
+            executor.stats().read_jobs,
+            1,
+            "no second NVMe read may be submitted into a quarantined slot before expiry"
+        );
+
+        // 3. Push block 2 (`0xBB`) with a budget outlasting the remaining quarantine window:
+        //    `Slots::take` wakes automatically at quarantine expiry, reclaims slot 0, and lands `0xBB`!
+        let ok_after = reader_ep.push_checked(
+            holder_ep.name(),
+            "sess-after-expiry",
+            Duration::from_secs(2),
+            vec![PushItem {
+                group: 0,
+                block: 2,
+                spans: vec![PushSpan {
+                    offset: 0,
+                    address: 300_000,
+                    length: BLOCK as u64,
+                }],
+            }],
+        );
+        assert_eq!(ok_after, Ok(()));
+        assert!(
+            fail_at.elapsed() >= quarantine,
+            "slot 0 reclaimed earlier than quarantine duration: {:?}",
+            fail_at.elapsed()
+        );
+        let delivered = writer.delivered.lock().clone();
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].iter().all(|&b| b == 0xBB));
+        assert_eq!(holder_ep.push_ring_slot_counts(), Some((1, 1)));
+    }
+
+    #[test]
+    fn per_job_inflight_slot_cap_prevents_large_push_from_starving_concurrent_workers() {
+        use std::path::PathBuf;
+        use ts_disk::{Backend, DiskFile, ExecutorConfig, Memory};
+        use ts_l3::{GroupLayout, HostLayout};
+
+        const BLOCK: usize = 4096;
+        const RING_SLOTS: usize = 20;
+        struct TempDisk(PathBuf);
+        impl Drop for TempDisk {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let dir = std::env::var_os("TS_DISK_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let temp = TempDisk(dir.join(format!(
+            "ts-push-cap-{}-{}.bin",
+            std::process::id(),
+            profile::now_ns()
+        )));
+        let disk_file = DiskFile::create(&temp.0, (24 * BLOCK) as u64).unwrap();
+        let ring = Arc::new(Memory::map(RING_SLOTS * BLOCK).unwrap());
+        let mut seed_mem = Memory::map(20 * BLOCK).unwrap();
+        for b in 0..20 {
+            seed_mem.write_at(b * BLOCK, &[(b as u8) + 1; BLOCK]);
+        }
+
+        let executor = Arc::new(
+            ts_disk::Executor::start(
+                disk_file,
+                &[
+                    (ring.address(), ring.size()),
+                    (seed_mem.address(), seed_mem.size()),
+                ],
+                ExecutorConfig {
+                    backend: Backend::Psync,
+                    queue_depth: 16,
+                    write_queue_depth: 2,
+                    max_io_bytes: 1 << 20,
+                    write_bytes_per_second: 1 << 30,
+                },
+            )
+            .unwrap(),
+        );
+        let (tx, rx) = mpsc::channel();
+        executor
+            .submit(
+                Job {
+                    direction: Direction::Write,
+                    ios: vec![Io {
+                        file_offset: 0,
+                        address: seed_mem.address(),
+                        len: 20 * BLOCK,
+                    }],
+                },
+                move |report| {
+                    let _ = tx.send(report.outcome);
+                },
+            )
+            .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+
+        struct SelectiveGateWriter {
+            gate: (std::sync::Mutex<(bool, bool)>, std::sync::Condvar), // (hold_large, entered)
+        }
+
+        impl PageWriter for SelectiveGateWriter {
+            fn write(&self, session: &str, _spans: &Spans) -> Result<(), String> {
+                if session == "large-job" {
+                    let mut state = self.gate.0.lock().unwrap();
+                    if state.0 {
+                        state.1 = true;
+                        self.gate.1.notify_all();
+                        let _state = self.gate.1.wait_while(state, |s| s.0).unwrap();
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let writer = Arc::new(SelectiveGateWriter {
+            gate: (std::sync::Mutex::new((true, false)), std::sync::Condvar::new()),
+        });
+        let holder_ep = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 20).unwrap();
+        holder_ep
+            .serve(PushSource {
+                executor,
+                disk_layout: HostLayout {
+                    groups: vec![GroupLayout {
+                        packing: 1,
+                        block_bytes: BLOCK,
+                        shard_count: 1,
+                    }],
+                    lcm_block_bytes: BLOCK,
+                    num_lcm_blocks: 24,
+                    owner_rank: 0,
+                    tp_rank: 0,
+                },
+                ring,
+                slot_bytes: BLOCK,
+                writer: writer.clone(),
+                quarantine: Duration::from_millis(50),
+            })
+            .unwrap();
+        let reader_ep = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 21).unwrap();
+
+        std::thread::scope(|scope| {
+            let holder_name = holder_ep.name().to_owned();
+            let reader_ref = &reader_ep;
+            // Launch 1 large 20-block push that blocks inside its first `writer.write()`.
+            let large_items: Vec<PushItem> = (1..=20)
+                .map(|blk| PushItem {
+                    group: 0,
+                    block: blk,
+                    spans: vec![PushSpan {
+                        offset: 0,
+                        address: (blk as u64) * (BLOCK as u64),
+                        length: BLOCK as u64,
+                    }],
+                })
+                .collect();
+            let large_handle = scope.spawn(move || {
+                reader_ref.push_checked(
+                    &holder_name,
+                    "large-job",
+                    Duration::from_secs(5),
+                    large_items,
+                )
+            });
+
+            // Wait for `large-job` to enter `writer.write()` and give read-ahead time to settle.
+            {
+                let state = writer.gate.0.lock().unwrap();
+                let (_s, res) = writer
+                    .gate
+                    .1
+                    .wait_timeout_while(state, Duration::from_secs(5), |s| !s.1)
+                    .unwrap();
+                assert!(!res.timed_out(), "large-job never entered writer.write");
+            }
+            thread::sleep(Duration::from_millis(40));
+
+            // With `MAX_INFLIGHT_SLOTS_PER_JOB = 8` on a 20-slot ring, `large-job` may hold
+            // at most 8 slots (leaving >= 12 free slots for concurrent push workers!).
+            let (free_slots, total_slots) = holder_ep.push_ring_slot_counts().unwrap();
+            assert_eq!(total_slots, RING_SLOTS);
+            assert!(
+                free_slots >= RING_SLOTS - MAX_INFLIGHT_SLOTS_PER_JOB,
+                "large-job monopolized too many slots: free={free_slots}/{total_slots}"
+            );
+
+            // Launch 4 concurrent 2-block pushes while `large-job` is STILL blocked:
+            // all 4 MUST complete fast without starving!
+            let mut short_handles = Vec::new();
+            for i in 0..4 {
+                let target = holder_ep.name().to_owned();
+                short_handles.push(scope.spawn(move || {
+                    reader_ref.push_checked(
+                        &target,
+                        &format!("short-{i}"),
+                        Duration::from_millis(500),
+                        vec![
+                            PushItem {
+                                group: 0,
+                                block: 1,
+                                spans: vec![PushSpan {
+                                    offset: 0,
+                                    address: 500_000,
+                                    length: BLOCK as u64,
+                                }],
+                            },
+                            PushItem {
+                                group: 0,
+                                block: 2,
+                                spans: vec![PushSpan {
+                                    offset: 0,
+                                    address: 510_000,
+                                    length: BLOCK as u64,
+                                }],
+                            },
+                        ],
+                    )
+                }));
+            }
+            for h in short_handles {
+                assert_eq!(h.join().unwrap(), Ok(()));
+            }
+
+            // Release `large-job` and verify all 20 slots return cleanly.
+            writer.gate.0.lock().unwrap().0 = false;
+            writer.gate.1.notify_all();
+            assert_eq!(large_handle.join().unwrap(), Ok(()));
+            assert_eq!(holder_ep.push_ring_slot_counts(), Some((RING_SLOTS, RING_SLOTS)));
         });
     }
 }

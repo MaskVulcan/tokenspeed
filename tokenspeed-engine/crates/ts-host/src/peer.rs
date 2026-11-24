@@ -262,18 +262,11 @@ pub fn start(
         settings.peer.incarnation,
     )
     .map_err(|error| error.to_string())?;
-    if let Some((executor, disk_layout, ring, slot_bytes)) = disk.and_then(DiskTier::push_source) {
+    let push_source = disk.and_then(DiskTier::push_source);
+    if let Some((_, _, ref ring, _)) = push_source {
         engine
             .register(ring.address(), ring.size())
             .map_err(|error| error.to_string())?;
-        push.serve(PushSource {
-            executor,
-            disk_layout,
-            ring,
-            slot_bytes,
-            writer: Arc::new(EngineWriter(engine.clone())),
-        })
-        .map_err(|error| error.to_string())?;
     }
     let local = RankGeometry {
         session: engine.session_id().to_owned(),
@@ -309,6 +302,20 @@ pub fn start(
         settings.peer.timeouts.quarantine_us = agreed.quarantine_us;
         settings.peer.holder_fail_threshold = agreed.holder_fail_threshold;
         settings.peer.holder_cooldown_us = agreed.holder_cooldown_us;
+    }
+    if let Some((executor, disk_layout, ring, slot_bytes)) = push_source {
+        let quarantine = Duration::from_micros(
+            u64::try_from(settings.peer.timeouts.quarantine_us.max(0)).unwrap_or(0),
+        );
+        push.serve(PushSource {
+            executor,
+            disk_layout,
+            ring,
+            slot_bytes,
+            writer: Arc::new(EngineWriter(engine.clone())),
+            quarantine,
+        })
+        .map_err(|error| error.to_string())?;
     }
     tracing::debug!(
         regions = ?settings
