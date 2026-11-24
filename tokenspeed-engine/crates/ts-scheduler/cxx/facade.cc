@@ -256,9 +256,11 @@ rust::Vec<rust::String> ToRustStrings(const std::vector<std::string>& values) {
 }  // namespace
 
 void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events) {
-    // The agreed clock first, then the events in the order they arrived.
+    // Advance peer_now_us_ first (without expiring) so events answered against
+    // the pre-tick state (Pin, Release, LookupAnswered) stamp against now_us
+    // and promote/deliver before PeerExports::Expire sweeps stale leases.
     tokenspeed::ExecutionEvent execution_event;
-    execution_event.With(tokenspeed::cache::PeerTick{.now_us = now_us});
+    execution_event.With(tokenspeed::cache::PeerTick{.now_us = now_us, .expire = false});
     for (const PeerEventView& event : events) {
         switch (event.kind) {
             case PeerEventKind::Lookup:
@@ -283,6 +285,7 @@ void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::S
                 break;
         }
     }
+    execution_event.With(tokenspeed::cache::PeerTick{.now_us = now_us, .expire = true});
     scheduler.Advance(execution_event);
 }
 

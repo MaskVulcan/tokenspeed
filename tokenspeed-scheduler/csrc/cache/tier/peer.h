@@ -170,8 +170,12 @@ struct PeerFetchOperation {
 namespace cache {
 
 // The peer clock, agreed by the replica's members; it times leases and waits.
+// Setting expire=false advances peer_now_us_ without sweeping leases/waits yet
+// so events answered against the pre-tick state (Pin, Release, LookupAnswered)
+// can be applied at now_us before expiration runs.
 struct PeerTick {
     std::int64_t now_us{0};
+    bool expire{true};
 };
 
 // Holder: a reader's lookup, pin and release, as every member applies them

@@ -83,6 +83,9 @@ void Scheduler::handleEvent(const cache::PeerTick& event) {
     if (!peer_exports_) throw std::invalid_argument("a peer tick without configured peer sharing");
     if (event.now_us < peer_now_us_) throw std::invalid_argument("the peer clock moved backwards");
     peer_now_us_ = event.now_us;
+    if (!event.expire) {
+        return;
+    }
     peer_exports_->Expire(peer_now_us_);
     for (const auto& request : requests_) {
         if (const auto* looking = request->GetIf<fsm::PeerLooking>();
