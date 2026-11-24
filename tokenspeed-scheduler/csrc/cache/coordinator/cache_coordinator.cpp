@@ -322,7 +322,8 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
         const bool state_disk_only =
             store_.NumStateGroups() > 0 && store_.DiskPool() != nullptr &&
             (node->IsStateDiskOnly() ||
-             (node->StateEntries(BoundaryTree::kDisk) > 0 && !HoldsStateCheckpoint(boundary.content_hash)));
+             (!node->HasRamCheckpointInProperSubtree() && node->PendingCheckpointStores() == 0 &&
+              node->StateEntries(BoundaryTree::kDisk) > 0 && !HoldsStateCheckpoint(boundary.content_hash)));
         const bool any_history = on_device == expected || on_host == expected || on_disk == expected;
         return {.device_publishable = on_device == expected && !state_disk_only,
                 .host_publishable = on_host == expected && !state_disk_only,

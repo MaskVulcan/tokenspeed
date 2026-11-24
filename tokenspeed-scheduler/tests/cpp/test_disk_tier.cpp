@@ -1136,5 +1136,70 @@ TEST(DiskTierTest, HybridStateDiskOnlyReclassifiesHostHistoryAndNotifiesAncestor
     EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
 }
 
+TEST(DiskTierTest, HybridDiskOnlyAncestorWithHotRamDescendantKeepsRamVisibility) {
+    DiskTierCache cache(FullAndState(), /*disk_parents=*/16);
+    std::vector<ContentHash> observed;
+    cache.coordinator.SetCacheMutationSink([&](const CacheKey& key, CacheMutation mutation) {
+        if (mutation == CacheMutation::kLowerTierResidency) {
+            observed.push_back(key.content_hash);
+        }
+    });
+
+    // Turn 1: [P0, P1] with State checkpoint at P1, cleaned to Disk.
+    const Prompt turn1(2, 41);
+    const std::vector<CacheKey> keys1 = cache.OnHostOnly(turn1);
+    const DiskOperation write1 = cache.Clean(keys1);
+    cache.disks.Complete(cache::DiskDone{.op_id = write1.op_id, .success = true});
+
+    // Turn 2 extends Turn 1: [P0, P1, P2, P3] sharing seed 41's first 2 pages with State checkpoint at P3 on Host.
+    const Prompt turn2(4, 41);
+    ASSERT_EQ(turn2.hashes[0], turn1.hashes[0]);
+    ASSERT_EQ(turn2.hashes[1], turn1.hashes[1]);
+    const std::vector<CacheKey> keys2 = cache.OnHostOnly(turn2);
+    const DiskOperation write2 = cache.Clean(keys2);
+    cache.disks.Complete(cache::DiskDone{.op_id = write2.op_id, .success = true});
+
+    // Evict ONLY Turn 1's superseded State checkpoint at P1 from Host (leaving P1 State
+    // on Disk, while descendant P3 still holds a hot State checkpoint on Host!).
+    const ContentHash p1_hash{turn1.hashes[1]};
+    const ContentHash p3_hash{turn2.hashes[3]};
+    const std::vector<CacheKey> evict_p1{CacheKey{.group_id = 1, .content_hash = p1_hash}};
+    cache.EvictFromHost(evict_p1);
+
+    // TS-R4-P1-1: Because descendant P3 has a RAM checkpoint in P1's proper subtree,
+    // P1 must remain host_publishable so Turn 2's hot suffix [P2, P3] is not severed!
+    for (const std::string& hash : turn2.hashes) {
+        const auto status = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{hash}}, 0);
+        EXPECT_TRUE(status.host_publishable) << hash;
+    }
+
+    // Now evict P3's State checkpoint from Host as well: BOTH P1 and P3 are now Disk-only,
+    // so P1..P3 must all receive kLowerTierResidency and flip to host_publishable=false, disk_publishable=true.
+    observed.clear();
+    const std::vector<CacheKey> evict_p3{CacheKey{.group_id = 1, .content_hash = p3_hash}};
+    cache.EvictFromHost(evict_p3);
+    for (const std::string& hash : turn2.hashes) {
+        const ContentHash h{hash};
+        EXPECT_NE(std::ranges::find(observed, h), observed.end()) << "notified on Disk-only flip: " << hash;
+        const auto status = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = h}, 0);
+        EXPECT_FALSE(status.host_publishable) << hash;
+        EXPECT_TRUE(status.disk_publishable) << hash;
+    }
+
+    // Restoring P3's State checkpoint back to Host must notify P1 (and ancestors) and restore RAM visibility.
+    observed.clear();
+    StorageLease read = cache.disks.StartRead(turn2.Prefix());
+    ASSERT_TRUE(read);
+    const std::vector<DiskOperation> reads = cache.disks.TakeCommands();
+    ASSERT_EQ(reads.size(), 1u);
+    cache.disks.Complete(cache::DiskDone{.op_id = read.OperationId(), .success = true});
+    EXPECT_NE(std::ranges::find(observed, p1_hash), observed.end()) << "P1 not notified when descendant P3 restored to Host";
+    for (const std::string& hash : turn2.hashes) {
+        const auto status = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{hash}}, 0);
+        EXPECT_TRUE(status.host_publishable) << hash;
+    }
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

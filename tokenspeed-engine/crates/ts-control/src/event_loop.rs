@@ -979,7 +979,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 if dp.idle_forward && memory_resident {
                     if !self.can_unlock_scheduler() {
                         self.data_plane.idle_forward(&dp)?;
-                        self.uncommitted_device_copies = false;
                     } else {
                         let data_plane = &mut self.data_plane;
                         ArcMutexGuard::unlocked(&mut self.scheduler, || {
@@ -1234,9 +1233,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
                 let input_logprobs = logprobs.and_then(|plan| plan.input);
-                let hold_lock = has_device_copies
-                    || self.config.in_flight_depth > 0
-                    || self.uncommitted_device_copies;
+                let hold_lock = has_device_copies || self.uncommitted_device_copies;
                 if has_device_copies && self.config.in_flight_depth > 0 {
                     self.uncommitted_device_copies = true;
                 }
@@ -1245,10 +1242,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 forwarded = true;
             } else if has_device_copies {
                 self.uncommitted_device_copies = true;
-            } else if idle_forward {
-                // Synchronous idle_forward drained ts-forward (and waited on
-                // default_stream via execution_stream), settling prior copies.
-                self.uncommitted_device_copies = false;
             }
         }
         self.note_forward(forwarded);

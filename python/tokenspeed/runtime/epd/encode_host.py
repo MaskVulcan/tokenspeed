@@ -66,6 +66,7 @@ from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
 from tokenspeed.runtime.pd.host_peer import (
     enable_mooncake_ipv6_for_host,
+    ensure_mooncake_transfer_timeouts,
     mooncake_library,
     mooncake_protocol,
 )
@@ -538,6 +539,7 @@ class EncodeBootstrap:
 
         local_ip = get_local_ip_by_remote()
         enable_mooncake_ipv6_for_host(local_ip)
+        ensure_mooncake_transfer_timeouts()
         # Rank 0 hosts the node's bootstrap server; every rank registers with
         # it.
         bootstrap_host = (

@@ -714,6 +714,32 @@ fn unlocked_gate_and_idle_forward_answer_peer_while_plan_dispatch_and_overlap_st
     );
     fe1.receive_hook.release();
 
+    // 2b. UNLOCKED `gate()` WITH UN-OVERLAPPED IN-FLIGHT BATCH (`TS-R4-P0-1` regression):
+    //     With `in_flight_depth > 0`, dispatch 1 batch (`B_1`) on Rank 0; `B_1`'s pages are
+    //     NOT yet overlap-published until Round 2's `next_execution_plan`, so `B_1` must be
+    //     pushed with `hold_lock = false` and Rank 0 MUST unlock `self.scheduler` during
+    //     Round 2's `bump()` and `gate()` `all_reduce` instead of starving `ts-peer-servicer`!
+    //     Pin Rank 1 inside Round 1's `execute` (idle_forward) alongside Rank 0's Round 1
+    //     `execute` so `fe1.receive_hook` deterministically catches Round 2 (before Round 2's
+    //     `next_execution_plan` sets `B_1.hold_lock = true` for `in_flight_depth = 2` Round 3).
+    hooks0.execute_hook.arm();
+    hooks1.execute_hook.arm();
+    fe0.push(add_req("r0-inflight-gate", (400..400 + 2 * PAGE).collect(), 2));
+    hooks0.execute_hook.wait_entered(Duration::from_secs(5));
+    hooks1.execute_hook.wait_entered(Duration::from_secs(5));
+    fe1.receive_hook.arm();
+    hooks0.execute_hook.release();
+    hooks1.execute_hook.release();
+    fe1.receive_hook.wait_entered(Duration::from_secs(5));
+    thread::sleep(Duration::from_millis(15));
+    assert_eq!(
+        lookup_and_pin(103, Duration::from_millis(500)),
+        Some((3 * PAGE, true)),
+        "TS-R4-P0-1: ts-peer-servicer must still answer Lookup/Pin in gate() with 1 un-overlapped batch in flight"
+    );
+    fe1.receive_hook.release();
+    fe0.wait_finished("r0-inflight-gate", Duration::from_secs(5));
+
     // 3. UNLOCKED `DataPlane::idle_forward`:
     //    Pause Rank 0 (`!forward_allowed && memory_resident`) while Rank 1 runs `"r1-only"`,
     //    putting Rank 0 into `ArcMutexGuard::unlocked(..., || data_plane.idle_forward(&dp))`!

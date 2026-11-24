@@ -130,6 +130,21 @@ public:
                    checkpoint_boundaries_in_subtree[kHost] == 0 &&
                    checkpoint_boundaries_in_subtree[kDisk] > 0;
         }
+        // Whether a strict descendant holds a Device or Host checkpoint (so a
+        // Disk-only superseded checkpoint at this node does not block RAM
+        // visibility of deeper hot prefixes).
+        bool HasRamCheckpointInProperSubtree() const noexcept {
+            const std::int32_t self_ram =
+                (HasCheckpoint(kDevice) ? 1 : 0) + (HasCheckpoint(kHost) ? 1 : 0);
+            return checkpoint_boundaries_in_subtree[kDevice] + checkpoint_boundaries_in_subtree[kHost] > self_ram;
+        }
+        // Coarse trigger for `GetBoundaryEventStatus`'s `state_disk_only` check
+        // so ancestor notifications fire whenever a descendant RAM checkpoint
+        // appears or leaves above a Disk-only interior checkpoint.
+        bool MaybeStateDiskOnly() const noexcept {
+            return IsStateDiskOnly() ||
+                   (!HasRamCheckpointInProperSubtree() && pending_checkpoint_stores_ == 0 && state_entries_[kDisk] > 0);
+        }
         // Whether some prefix-closed group indexes a block of this hash on any
         // tier.
         bool HasClosedEntries() const noexcept {
@@ -147,6 +162,7 @@ public:
         // The blocks of this hash an eviction write-back has recorded and not
         // settled yet.
         std::int32_t PendingHostStores() const noexcept { return pending_stores_; }
+        std::int32_t PendingCheckpointStores() const noexcept { return pending_checkpoint_stores_; }
 
         // The node's key in the tree's index, fixed for its lifetime.
         const ContentHash hash;
@@ -496,6 +512,9 @@ private:
             case Hold::Kind::kPendingStore:
                 node.pending_stores_ += delta;
                 node.pending_checkpoint_stores_ += hold.state_ ? delta : 0;
+                if (hold.state_ && config_.has_disk_tier && lower_tier_entries_observer_) {
+                    lower_tier_entries_observer_(node.hash);
+                }
                 break;
             case Hold::Kind::kPublication:
                 node.publications_ += delta;
@@ -609,11 +628,11 @@ private:
                 const bool notify = config_.num_state_groups > 0 && config_.has_disk_tier &&
                                     static_cast<bool>(lower_tier_entries_observer_);
                 for (Node* ancestor = parent; ancestor != nullptr; ancestor = ancestor->parent) {
-                    const bool was_state_disk_only = notify && ancestor->IsStateDiskOnly();
+                    const bool was_maybe_disk_only = notify && ancestor->MaybeStateDiskOnly();
                     for (const std::size_t tier : kTiers) {
                         ancestor->checkpoint_boundaries_in_subtree[tier] += node.checkpoint_boundaries_in_subtree[tier];
                     }
-                    if (notify && ancestor->IsStateDiskOnly() != was_state_disk_only) {
+                    if (notify && ancestor->MaybeStateDiskOnly() != was_maybe_disk_only) {
                         lower_tier_entries_observer_(ancestor->hash);
                     }
                 }
@@ -636,11 +655,11 @@ private:
         const bool notify = config_.num_state_groups > 0 && config_.has_disk_tier &&
                             static_cast<bool>(lower_tier_entries_observer_);
         for (Node* ancestor = &node; ancestor != nullptr; ancestor = ancestor->parent) {
-            const bool was_state_disk_only = notify && ancestor->IsStateDiskOnly();
+            const bool was_maybe_disk_only = notify && ancestor->MaybeStateDiskOnly();
             ancestor->checkpoint_boundaries_in_subtree[tier] += delta;
             FatalCheck(ancestor->checkpoint_boundaries_in_subtree[tier] >= 0,
                        "a subtree holds a negative number of checkpoint boundaries");
-            if (notify && ancestor->IsStateDiskOnly() != was_state_disk_only) {
+            if (notify && ancestor->MaybeStateDiskOnly() != was_maybe_disk_only) {
                 lower_tier_entries_observer_(ancestor->hash);
             }
         }
