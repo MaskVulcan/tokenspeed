@@ -88,6 +88,9 @@ set to the gateway only while every report is less than three seconds old.
 The gateway converts these allocator counts to capacity ratios; it must not
 interpret an LCM block as a fixed-size token page.
 
+EPD encode-mode metric ownership and units are documented in
+[encoder-metrics.md](encoder-metrics.md).
+
 ## Request identity and submission failures
 
 The wire identifies a request and its output stream by `rid` alone. A new
@@ -105,6 +108,20 @@ An id in that interval receives a 409 refusal before data-plane admission.
 The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
+
+On disaggregated engines, `bootstrap_room` carries the same one-active-request
+rule across distinct request IDs. Peer state is keyed by room, so every new
+request — including fan-out children and retries — must use a fresh room. At
+admission, before data-plane registration or scheduling, the loop refuses with
+409 any request whose room is already reserved by an unscheduled request (same
+round, grammar queue, EPD staging, or pause withholding) or tracked by
+`TransferPeer` (including draining rooms awaiting `Stopped`). Both checks read
+only replica-identical loop state, never worker-thread state such as a prefill
+peer's cancellation tombstones, so every replica member makes the same decision;
+reusing a previously failed or cancelled room after retirement still fails in
+the prefill peer under its tombstone contract. `TransferPeer::register` enforces
+the same uniqueness invariant at the peer boundary, and `abort_room` ignores
+rooms owned by another active request.
 
 Each accepted request gets a monotonically increasing admission identity
 before data-plane registration. The output processor allocates it once;
@@ -832,6 +849,12 @@ discardable under the separate `cuda_graph` tag.
 
 A resume containing NCCL uses the same-round operation gate: it waits until
 every attention-DP engine holds its resume before entering device collectives.
+For engines with DP projections, the NCCL release drops captured graphs before
+closing the projection workspaces they reference. Each workspace owns its
+symmetric storage so it can release it at sleep. Full reclamation on CUDA
+requires a PyTorch build that frees symmetric-memory rendezvous pointer tables.
+The head gate waits for all memory regions on all ranks to resume, then rebuilds
+those workspaces and recaptures graphs before it permits a forward.
 Other regions still resume locally. A pending collective resume refuses a
 second memory resume until it finishes.
 
@@ -981,7 +1004,13 @@ is needed only in rounds with a terminal status.
 **PD output completion.** A prefill's computed finish is not its client's
 final output: the output waits for the transfer's result. A transfer failure
 must publish an abort even after computation finished, unless the client
-already cancelled its stream or a final output was sent. A pause abort still
+already cancelled its stream or a final output was sent. A numerical error
+detected by the NaN guard in the prefill role ends the request when the
+prompt's final chunk commits instead of waiting for the transfer; an error
+detected in an earlier prompt chunk is remembered until that final chunk
+commits. When the final chunk commits, the request's `Abort` event cancels the
+transfer to stop the remote decode, and the output processor emits the
+terminal abort output unless the client already cancelled. A pause abort still
 notifies the client; repeated transfer events do not repeat the final output.
 This output fence does not retire source pages.
 
@@ -1153,10 +1182,9 @@ order "prefill pages first": the prefill node states the policy in its route,
 and a decode rank that reads it sends `["Announce", room, cache]` to the
 room's prefill ranks once connected, again with every heartbeat until each
 answered (at most 256 per endpoint and beat; a beat resumes in room order at
-the first room the previous one left out, whichever endpoint's). The prefill
-peer admits a registered request (`Bootstrapped`) once its decode ranks
-announced it: every attention-TP rank of the decode replica that holds it. The
-pages-held marks and the clocks that start at them are local to a rank and
+the first room the previous one left out, whichever endpoint's). Prefill
+requests are schedulable on submission, without waiting for an announcement.
+The pages-held marks and the clocks that start at them are local to a rank and
 time-based; the members of a replica would have to agree on them, and
 `deferred` requires single-member replicas. When the plan carrying a
 request's last chunk goes to the device (`ExecutionPlan::completed_prompts`,
@@ -1172,9 +1200,9 @@ request does not hold its pages yet, fails the room, so a decode rank that
 does not follow the order fails at once. The decode scheduler sees every
 noticed request and may allocate them in any order. Timeouts: on the prefill
 side the bootstrap timeout bounds what a request waits for from its decode
-node. Not announced, it runs from registration. Admitted, it runs from the
-pages-held mark to the manifests, with none while the prompt is queued or
-computes: the decode node's waiting timeout bounds that wait. On the decode
+node. It runs from the pages-held mark to the manifests, whether or not the
+request was announced; queueing and computation before that mark consume no budget.
+A late announcement receives the pages-held notice immediately. On the decode
 side the waiting timeout runs from registration to the notice, restarted at
 the notice. A request that fails on the prefill side tells its announcing
 ranks as well as those that pre-allocated.

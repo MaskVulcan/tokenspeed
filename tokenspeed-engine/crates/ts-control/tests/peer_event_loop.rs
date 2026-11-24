@@ -471,6 +471,15 @@ impl DataPlane for HookedDevice {
         Ok(())
     }
 
+    fn finish_memory_resume(&mut self) -> Result<(), DataPlaneError> {
+        self.hooks
+            .device_ops
+            .lock()
+            .unwrap()
+            .push("finish_memory_resume".to_owned());
+        Ok(())
+    }
+
     fn attach_grammars(&mut self, _grammars: &[(String, u64, Vec<i32>)]) -> Result<(), DataPlaneError> {
         Ok(())
     }
