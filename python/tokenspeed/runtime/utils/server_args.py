@@ -2785,6 +2785,10 @@ class ServerArgs:
                     "--query-context-parallel-size > 1",
                     self.query_context_parallel_size > 1,
                 ),
+                (
+                    "--enable-memory-saver (Peer Mooncake MRs do not yet re-register across TorchMemorySaver HBM unmap/remap)",
+                    bool(getattr(self, "enable_memory_saver", False)),
+                ),
             )
             if refused
         ]

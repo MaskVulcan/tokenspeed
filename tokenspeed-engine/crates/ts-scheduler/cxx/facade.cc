@@ -286,13 +286,18 @@ void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::S
     scheduler.Advance(execution_event);
 }
 
-PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup) {
-    return ToView(scheduler.AnswerPeerLookup(LookupFromView(lookup)));
+PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup,
+                                  std::size_t pending_new_leases) {
+    return ToView(scheduler.AnswerPeerLookup(LookupFromView(lookup), pending_new_leases));
 }
 
 bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup, std::int32_t num_tokens,
                       rust::Slice<const PeerPageView> pages) {
     return scheduler.PeerPagesMatch(LookupFromView(lookup), num_tokens, FromView(pages));
+}
+
+bool peer_lease_can_pin(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease) {
+    return scheduler.PeerLeaseCanPin(FromView(lease));
 }
 
 bool peer_lease_held(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease) {

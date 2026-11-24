@@ -394,6 +394,18 @@ def test_raw_block_device_paths_are_opened_directly_and_reject_local_sharing(tmp
     assert disk_file_path(multi_node, global_rank=2) == "/dev/nvme0n1"
     assert disk_file_path(multi_node, global_rank=3) == "/dev/nvme1n1"
 
+    # Non-dividing `len(paths) = 3` where Node 1 (`global_rank` 2 and 3) aliases
+    # `2 % 3 == 2` and `3 % 3 == 0` onto the same raw `/dev/nvme0n1` MUST fail validation!
+    non_dividing_alias = _disk_args(
+        disk_tier_paths=["/dev/nvme0n1", str(tmp_path), "/dev/nvme0n1"],
+        nnodes=2,
+        mapping=Mapping(rank=2, world_size=4, attn_tp_size=2, attn_dp_size=2),
+    )
+    with pytest.raises(ValueError, match="cannot be shared by multiple local ranks"):
+        non_dividing_alias.validate_disk_tier_options()
+    with pytest.raises(ValueError, match="cannot be shared by multiple local ranks"):
+        disk_file_path(non_dividing_alias, global_rank=2)
+
     # Mixed raw block device + real directory: directory still gets per-port/per-rank filename.
     mixed = _disk_args(disk_tier_paths=["/dev/nvme0n1", str(tmp_path)])
     mixed.validate_disk_tier_options()

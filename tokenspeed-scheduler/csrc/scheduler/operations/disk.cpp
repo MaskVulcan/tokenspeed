@@ -105,6 +105,7 @@ void Scheduler::prepareDisk(Request& request) {
         return;
     }
 
+    if (request.Is<fsm::PeerLooking>()) return;
     auto* admission = request.AdmissionResourcesPtr();
     if (admission == nullptr || admission->storage_prepared || !storage_allowed_) return;
     if (admission->peer_hit.has_value()) {
@@ -120,10 +121,6 @@ void Scheduler::prepareDisk(Request& request) {
         admission->storage_prepared = true;
         return;
     }
-    // If Disk operation or Host-block credits are temporarily exhausted, leave
-    // `storage_prepared` unset so a still-queued request can retry on a later
-    // tick instead of permanently falling back to recomputation.
-    if (!disk_transfers_->HasReadCredits()) return;
     const auto grain = config_.prefix_granularity;
     const auto max_tokens = cacheablePrefixTokens(request);
     const auto cached_hashes = request.PromptPrefixHashes(max_tokens / grain);
@@ -147,7 +144,7 @@ void Scheduler::prepareDisk(Request& request) {
         return;
     }
     prompt.prepared_keys = probe.group_keys;
-    DiskTransferManager::ReadStartResult started = disk_transfers_->TryStartRead(prompt);
+    DiskTransferManager::ReadStartResult started = disk_transfers_->TryStartRead(prompt, local);
     if (!started.lease) {
         if (!started.retryable) admission->storage_prepared = true;
         return;

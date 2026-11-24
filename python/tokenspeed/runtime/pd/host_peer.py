@@ -154,18 +154,39 @@ class DecodeSettings:
     heartbeat_max_failures: int
 
 
+def _normalize_positive_int_timeout_env(name: str, default: str) -> None:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        os.environ[name] = default
+        return
+    digits = raw[1:] if raw.startswith("+") else raw
+    if digits.isdigit():
+        value = int(digits)
+        if value > 0:
+            os.environ[name] = str(value)
+        return
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return
+    import math
+
+    if math.isfinite(parsed) and parsed > 0.0:
+        os.environ[name] = str(max(1, math.ceil(parsed)))
+
+
 def ensure_mooncake_transfer_timeouts() -> None:
     """Install bounded transfer timeouts before Mooncake / CANN ADXL initializes.
 
-    Respects any explicit non-empty operator/launcher setting while preventing
+    Respects any explicit non-empty operator/launcher setting (normalizing valid
+    positive numeric strings such as ``"25.0"`` or ``" 25 "`` to exact integer
+    strings required by Mooncake C++ ``std::from_chars``) while preventing
     Mooncake's ``60s`` unbound default when unset or empty. ``25s`` exceeds two
     ``10s`` ADXL retry attempts plus reconnect margin so ``ts_mooncake_write``
     never returns early while an ADXL retry DMA is still reading ``push_ring``.
     """
-    if not (os.environ.get("MC_TRANSFER_TIMEOUT") or "").strip():
-        os.environ["MC_TRANSFER_TIMEOUT"] = "25"
-    if not (os.environ.get("ASCEND_TRANSFER_TIMEOUT") or "").strip():
-        os.environ["ASCEND_TRANSFER_TIMEOUT"] = "10000"
+    _normalize_positive_int_timeout_env("MC_TRANSFER_TIMEOUT", "25")
+    _normalize_positive_int_timeout_env("ASCEND_TRANSFER_TIMEOUT", "10000")
 
 
 def enable_mooncake_ipv6_for_host(hostname: str) -> None:

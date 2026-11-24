@@ -1157,6 +1157,7 @@ fn pause_wait_and_release_memory_wait_for_peer_looking_and_peer_landing_to_drain
         name: holder_name.clone(),
         incarnation: 99,
         identity: "deployment/v1".into(),
+        quarantine_us: 0,
     };
 
     let mesh_listener = Listener::bind("127.0.0.1").unwrap();
@@ -1591,6 +1592,248 @@ fn pause_wait_and_release_memory_wait_for_peer_looking_and_peer_landing_to_drain
         *hooks.device_ops.lock().unwrap(),
         vec!["release:kv_cache".to_owned()]
     );
+
+    stop.store(true, Ordering::Relaxed);
+    loop_thread.join().unwrap();
+}
+
+#[test]
+fn expired_soft_pin_followed_by_flush_cache_never_vouches_corrupted_kv() {
+    interpreter();
+    let arena = Arena::new(200_000);
+
+    let mesh_listener = Listener::bind("127.0.0.1").unwrap();
+    let mesh_addr = vec![format!("127.0.0.1:{}", mesh_listener.port().unwrap())];
+
+    let peer_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let holder_name = format!("127.0.0.1:{}", peer_listener.port());
+    // Short 40 ms `soft_pin_us` so we deterministically cross soft-pin expiry in real time!
+    let sched_val = Python::attach(|py| {
+        let code = format!(
+            r#"
+import tokenspeed_scheduler as ts
+cfg = ts.SchedulerConfig()
+cfg.role = ts.SchedulerConfig.Role.Fused
+cfg.prefix_granularity = {PAGE}
+cfg.max_scheduled_tokens = 256
+cfg.max_batch_size = 8
+cfg.max_resident_requests = 8
+cfg.num_device_pages = {PAGES}
+cfg.num_snapshot_pages = 1
+cfg.disable_l2_cache = True
+cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity={PAGE},
+                                        total_pages={PAGES}, attn_kind=ts.AttnKind.Full,
+                                        transfer_policy=ts.CacheTransferPolicy.FullSuffix)]
+cfg.peer_config = ts.PeerConfig(name="{holder_name}", incarnation=7, max_leases=16,
+                                soft_pin_us=40_000, hard_pin_us=5_000_000,
+                                lookup_timeout_us=500_000, min_fetch_tokens={PAGE},
+                                landing_tier=ts.PeerLandingTier.Device,
+                                max_host_landing_blocks=0, host_ready_timeout_us=0)
+result = ts.Scheduler(cfg)
+"#
+        );
+        let globals = PyDict::new(py);
+        py.run(&CString::new(code).unwrap(), Some(&globals), None)
+            .unwrap();
+        Scheduler::from_python(&globals.get_item("result").unwrap().unwrap()).unwrap()
+    });
+    let sched = Arc::new(Mutex::new(sched_val));
+
+    let mut settings = peer_settings(&holder_name);
+    settings.incarnation = 7;
+    let peer = Peer::start(
+        settings,
+        0,
+        vec![rank_geometry(0)],
+        Some(peer_listener),
+        sched.clone(),
+        Arc::new(arena),
+        Arc::new(NoPushes),
+    )
+    .unwrap();
+    let peer_fence = peer.fence();
+    let fe = Arc::new(ChannelFrontendState::default());
+    let hooks = Arc::new(DeviceHooks::default());
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let loop_thread = {
+        let sched = sched.clone();
+        let fe = fe.clone();
+        let hooks = hooks.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mesh = Mesh::connect(0, mesh_listener, &mesh_addr, Duration::from_secs(5)).unwrap();
+            let replica = Group::new(1, vec![0], 0).unwrap();
+            let outputs = OutputProcessor::new(
+                None,
+                1,
+                None,
+                Role::Plain,
+                FinishLog {
+                    enabled: false,
+                    request_stats: false,
+                    ttft_percentage: 0,
+                },
+                false,
+                None,
+            );
+            let mut ev = EventLoop::new(
+                sched,
+                HookedDevice::with_peer_fence(hooks, peer_fence),
+                Some(ChannelFrontend { state: fe }),
+                outputs,
+                loop_config(0),
+                Ranks {
+                    mesh,
+                    replica,
+                    pp: None,
+                    dp: None,
+                    ep: None,
+                },
+                Subsystems {
+                    transfer: None,
+                    embeddings: None,
+                    metrics: None,
+                    kv_events: None,
+                    eplb: None,
+                    grammars: None,
+                    l3_metrics: None,
+                    l3: None,
+                    disk: None,
+                    disk_metrics: None,
+                    peer: Some(peer),
+                },
+            );
+            ev.run(&stop).unwrap();
+        })
+    };
+
+    // 1. Warm a 3-page prefix on `holder`'s `EventLoop`.
+    let tokens: Vec<i32> = (1..=4 * PAGE).collect();
+    let mut warm_req = TokenizedGenerateReqInput::new(
+        "warm-trace-a",
+        SamplingParams {
+            max_new_tokens: Some(1),
+            ..Default::default()
+        },
+    );
+    warm_req.input_ids = Some(tokens.clone());
+    warm_req.stream = true;
+    fe.push(EngineRequest::Add(Box::new(warm_req)));
+    fe.wait_finished("warm-trace-a", Duration::from_secs(5));
+
+    // 2. External reader opens a `Lookup` on `holder`.
+    let (reader_tx, reader_rx) = mpsc::channel();
+    let reader_net = PeerNet::start("127.0.0.1", 0, reader_tx).unwrap();
+    let reader_name = format!("127.0.0.1:{}", reader_net.port());
+    let lease = PeerLeaseView {
+        reader: reader_name,
+        id: (99 << 32) | 1,
+    };
+    let hashes = {
+        let mut helper = peer_scheduler("hash-helper");
+        helper
+            .submit_requests(&[ts_scheduler::RequestSpec {
+                admission_id: 0,
+                request_id: "hash-q".into(),
+                session_id: String::new(),
+                cache_group_id: String::new(),
+                shared_prefix_tokens: Vec::new(),
+                peer_holder: holder_name.clone(),
+                tokens: tokens.clone(),
+                max_new_tokens: 1,
+                max_cached_prefix_tokens: 3 * PAGE,
+            }])
+            .unwrap();
+        let _ = helper.next_execution_plan(true, false);
+        helper.take_peer_lookups().pop().unwrap().prefix_hashes
+    };
+    reader_net
+        .request(
+            &holder_name,
+            &Request::Lookup {
+                lease: lease.clone(),
+                prompt: ts_control::peer::wire::Prompt {
+                    prefix_hashes: hashes,
+                    tokens: tokens[..(3 * PAGE) as usize].to_vec(),
+                    max_tokens: 3 * PAGE,
+                },
+            },
+        )
+        .unwrap();
+    let lookup_reply = Inbound::decode(&reader_rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+    let Inbound::Reply(Reply::Answer { answer: lookup_ans, .. }) = lookup_reply else {
+        panic!("expected Lookup reply");
+    };
+    assert_eq!(lookup_ans.num_tokens, 3 * PAGE);
+
+    // 3. First nudge a round so `EventLoop` syncs `PeerEventKind::Lookup` into `PeerExports`,
+    //    then sleep > 40ms (`soft_pin_us`) and nudge a second round so `PeerExports::Expire`
+    //    erases the soft lease!
+    let mut sync_req = TokenizedGenerateReqInput::new(
+        "sync-lookup",
+        SamplingParams {
+            max_new_tokens: Some(1),
+            ..Default::default()
+        },
+    );
+    sync_req.input_ids = Some((8000..8000 + PAGE).collect());
+    sync_req.stream = true;
+    fe.push(EngineRequest::Add(Box::new(sync_req)));
+    fe.wait_finished("sync-lookup", Duration::from_secs(5));
+    assert!(sched.lock().peer_lease_can_pin(&lease));
+
+    thread::sleep(Duration::from_millis(60));
+    let mut dummy = TokenizedGenerateReqInput::new(
+        "tick-expire",
+        SamplingParams {
+            max_new_tokens: Some(1),
+            ..Default::default()
+        },
+    );
+    dummy.input_ids = Some((9000..9000 + PAGE).collect());
+    dummy.stream = true;
+    fe.push(EngineRequest::Add(Box::new(dummy)));
+    fe.wait_finished("tick-expire", Duration::from_secs(5));
+    assert!(!sched.lock().peer_lease_can_pin(&lease));
+
+    // 4. Reader sends late `Request::Pin` AFTER soft-pin expiry, then `holder` runs `FlushCache`:
+    //    `Pin` MUST reply `held == false`, `FlushCache` MUST succeed & bump `plan_calls()`,
+    //    and `Release` MUST reply `held == false`!
+    reader_net
+        .request(&holder_name, &Request::Pin { lease: lease.clone() })
+        .unwrap();
+    let pin_reply = Inbound::decode(&reader_rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+    let Inbound::Reply(Reply::Answer { answer: pin_ans, .. }) = pin_reply else {
+        panic!("expected Pin reply");
+    };
+    assert!(!pin_ans.held, "Trace A: late Pin after soft-pin expiry must return held=false");
+
+    let plans_before_flush = sched.lock().plan_calls();
+    fe.push(EngineRequest::Control(Box::new(ControlRequest::FlushCache(
+        ts_wire::control::FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        },
+    ))));
+    let replies = fe.wait_reply_count(1, Duration::from_secs(5));
+    assert!(matches!(&replies[0], ControlOutput::FlushCache(out) if out.success));
+    assert!(sched.lock().plan_calls() > plans_before_flush);
+
+    reader_net
+        .request(
+            &holder_name,
+            &Request::Release {
+                lease,
+                demote: true,
+            },
+        )
+        .unwrap();
+    let rel_reply = Inbound::decode(&reader_rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+    let Inbound::Reply(Reply::Answer { answer: rel_ans, .. }) = rel_reply else {
+        panic!("expected Release reply");
+    };
+    assert!(!rel_ans.held, "Trace A: Release after FlushCache must never vouch held=true");
 
     stop.store(true, Ordering::Relaxed);
     loop_thread.join().unwrap();

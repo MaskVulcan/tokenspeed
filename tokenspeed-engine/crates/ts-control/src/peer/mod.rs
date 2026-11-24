@@ -60,7 +60,9 @@ use crate::{
     codec::{Reader, Writer},
     peer::{
         geometry::{push_items, read_batches, RankGeometry},
-        landing::{Action, HealthOutcome, Landing, ReadOutcome, Timeouts},
+        landing::{
+            Action, HealthOutcome, Landing, ReadOutcome, Timeouts, MAX_REMOTE_QUARANTINE_US,
+        },
         net::{Inbound, PeerNet},
         push::PagePusher,
         read::{PageReader, PushJob, ReadJob, Reads},
@@ -78,6 +80,8 @@ const DEFAULT_HOLDER_COOLDOWN_S: f64 = 30.0;
 const COOLDOWN_WARN_INTERVAL_US: i64 = 5_000_000;
 /// Additional margin beyond `push_us` (`1s` RTT + `5s` `CANCEL_WAIT`) for half-open Disk probes.
 const PROBE_PUSH_MARGIN_US: i64 = 6_000_000;
+/// Maximum holder RPCs drained per single `scheduler.lock()` acquisition in `ts-peer-servicer`.
+const MAX_SERVICER_BATCH: usize = 64;
 
 /// Parse `(holder_fail_threshold, holder_cooldown_us)` from environment strings.
 pub fn parse_holder_circuit_breaker_values(
@@ -179,12 +183,24 @@ fn namespace(deployment_id: &str, weight_version: &str) -> String {
     format!("{deployment_id}/{weight_version}")
 }
 
-/// Canonicalize DP0's non-canonical `"<host>:<port>/0"` alias to `"<host>:<port>"`.
+/// Canonicalize DP0's non-canonical `"<host>:<port>/0"`, `"/00"`, `"/+0"`, etc.
+/// aliases to `"<host>:<port>"`, matching `PeerNet::send` `u32::parse` routing.
 pub fn normalize_peer_holder(endpoint: &str) -> &str {
-    match endpoint.strip_suffix("/0") {
-        Some(base) if !base.is_empty() => base,
+    match endpoint.split_once('/') {
+        Some((base, rank)) if !base.is_empty() && rank.parse::<u32>() == Ok(0) => base,
         _ => endpoint,
     }
+}
+
+fn endpoint_host(endpoint: &str) -> Option<&str> {
+    let addr = endpoint.split_once('/').map_or(endpoint, |(base, _)| base);
+    crate::peer::net::split_endpoint(addr)
+        .ok()
+        .map(|(host, _)| host)
+}
+
+fn same_peer_host(a: &str, b: &str) -> bool {
+    matches!((endpoint_host(a), endpoint_host(b)), (Some(ha), Some(hb)) if ha == hb)
 }
 
 /// A round's agreement could not be reached.
@@ -295,6 +311,7 @@ pub struct PeerRound {
 #[derive(Debug, Clone)]
 struct Layout {
     incarnation: u64,
+    quarantine_us: i64,
     ranks: Vec<RankGeometry>,
 }
 
@@ -736,7 +753,8 @@ impl Peer {
             }
         }
         for (request, landing) in &mut self.landings {
-            if self.layouts.contains_key(&landing.fetch().holder) {
+            if let Some(layout) = self.layouts.get(&landing.fetch().holder) {
+                landing.raise_quarantine_us(layout.quarantine_us);
                 if let Some(action) = landing.layout_known(now_us) {
                     actions.push((request.clone(), action));
                 }
@@ -823,7 +841,12 @@ impl Peer {
         let mut actions = Vec::new();
         for mut fetch in fetches {
             fetch.holder = normalize_peer_holder(&fetch.holder).to_owned();
-            let known = self.layouts.contains_key(&fetch.holder);
+            let layout = self.layouts.get(&fetch.holder);
+            let known = layout.is_some();
+            let mut timeouts = self.settings.timeouts;
+            if let Some(layout) = layout {
+                timeouts.quarantine_us = timeouts.quarantine_us.max(layout.quarantine_us);
+            }
             let request = fetch.request_id.clone();
             tracing::debug!(
                 request,
@@ -833,8 +856,7 @@ impl Peer {
                 layout_known = known,
                 "peer landing started"
             );
-            let (mut landing, action) =
-                Landing::new(fetch, self.members, known, now_us, self.settings.timeouts);
+            let (mut landing, action) = Landing::new(fetch, self.members, known, now_us, timeouts);
             if self.member == 0 {
                 landing.observe_with(self.metrics.clone());
             }
@@ -924,8 +946,9 @@ impl Peer {
     }
 
     fn is_self_stamp(&self, stamp: &Stamp) -> bool {
-        stamp.incarnation == self.settings.incarnation
-            || normalize_peer_holder(&stamp.name) == self.settings.name
+        normalize_peer_holder(&stamp.name) == self.settings.name
+            || (stamp.incarnation == self.settings.incarnation
+                && same_peer_host(&stamp.name, &self.settings.name))
     }
 
     fn take_reply(
@@ -951,6 +974,7 @@ impl Peer {
                         holder_name,
                         Layout {
                             incarnation: stamp.incarnation,
+                            quarantine_us: stamp.quarantine_us.clamp(0, MAX_REMOTE_QUARANTINE_US),
                             ranks: ranks.clone(),
                         },
                     );
@@ -1014,6 +1038,9 @@ impl Peer {
                                 num_tokens = answer.num_tokens,
                                 "peer pin answered"
                             );
+                            if trusted {
+                                landing.raise_quarantine_us(stamp.quarantine_us);
+                            }
                             if let Some(action) = landing.pinned(answer.clone(), trusted, now_us) {
                                 actions.push((request.clone(), action));
                             }
@@ -1286,6 +1313,7 @@ fn start_endpoint(
             name: settings.name.clone(),
             incarnation: settings.incarnation,
             identity: settings.identity(),
+            quarantine_us: settings.timeouts.quarantine_us,
         },
         replica,
         settings.record_lifetime,
@@ -1338,7 +1366,10 @@ fn start_endpoint(
                         let scheduler = scheduler.lock();
                         let mut holder = holder.lock();
                         batch.push(holder.handle(&*scheduler, first, Instant::now()));
-                        while let Ok(next) = holder_rx.try_recv() {
+                        while batch.len() < MAX_SERVICER_BATCH {
+                            let Ok(next) = holder_rx.try_recv() else {
+                                break;
+                            };
                             batch.push(holder.handle(&*scheduler, next, Instant::now()));
                         }
                     }

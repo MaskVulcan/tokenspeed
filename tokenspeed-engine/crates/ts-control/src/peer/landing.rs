@@ -31,6 +31,9 @@ use ts_scheduler::{
     PeerAnswerView, PeerFetchView, PeerLeaseView,
 };
 
+/// Cap remote-advertised quarantine windows to 1 hour (`MAX_PUSH_BUDGET`).
+pub const MAX_REMOTE_QUARANTINE_US: i64 = 3_600_000_000;
+
 /// How long each wait may last, in the agreed peer clock's microseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
@@ -281,6 +284,17 @@ impl Landing {
     /// The lease.
     pub fn lease(&self) -> &PeerLeaseView {
         &self.fetch.lease
+    }
+
+    /// Effective destination quarantine duration in microseconds.
+    pub fn quarantine_us(&self) -> i64 {
+        self.timeouts.quarantine_us
+    }
+
+    /// Ensure destination quarantine covers at least the holder's advertised bound.
+    pub fn raise_quarantine_us(&mut self, holder_quarantine_us: i64) {
+        let bounded = holder_quarantine_us.clamp(0, MAX_REMOTE_QUARANTINE_US);
+        self.timeouts.quarantine_us = self.timeouts.quarantine_us.max(bounded);
     }
 
     /// The holder's layout arrived.

@@ -226,7 +226,25 @@ def _local_world_size(server_args) -> int:
     return max(1, (tp_size * dp_size) // nnodes)
 
 
-def validate_disk_tier_paths(server_args) -> None:
+def _node_global_ranks(
+    server_args, *, global_rank: int | None = None
+) -> range:
+    local_ranks = _local_world_size(server_args)
+    if global_rank is not None:
+        base = (int(global_rank) // local_ranks) * local_ranks
+    else:
+        mapping = getattr(server_args, "mapping", None)
+        if mapping is not None and getattr(mapping, "rank", None) is not None:
+            base = (max(0, int(mapping.rank)) // local_ranks) * local_ranks
+        else:
+            node_rank = max(0, int(getattr(server_args, "node_rank", 0) or 0))
+            base = node_rank * local_ranks
+    return range(base, base + local_ranks)
+
+
+def validate_disk_tier_paths(
+    server_args, *, global_rank: int | None = None
+) -> None:
     """Validate ``--disk-tier-paths``: directories may be shared across local
     ranks (each rank opens its own per-port/per-rank file), while raw block
     devices (``/dev/...``) must map exclusively to one local rank so two ranks
@@ -234,10 +252,9 @@ def validate_disk_tier_paths(server_args) -> None:
     paths = server_args.disk_tier_paths
     if not paths:
         raise ValueError("--disk-tier-paths needs at least one directory")
-    local_ranks = _local_world_size(server_args)
     seen_raw: dict[str, int] = {}
-    for local_rank in range(local_ranks):
-        target = paths[local_rank % len(paths)]
+    for rank in _node_global_ranks(server_args, global_rank=global_rank):
+        target = paths[rank % len(paths)]
         if not is_raw_block_device_path(target):
             continue
         canonical = os.path.realpath(target)
@@ -245,17 +262,17 @@ def validate_disk_tier_paths(server_args) -> None:
             raise ValueError(
                 f"raw block device {target!r} in --disk-tier-paths cannot be "
                 f"shared by multiple local ranks (ranks {seen_raw[canonical]} "
-                f"and {local_rank}); supply one distinct block device or "
+                f"and {rank}); supply one distinct block device or "
                 f"partition per local rank, or use mounted directories"
             )
-        seen_raw[canonical] = local_rank
+        seen_raw[canonical] = rank
 
 
 def disk_file_path(server_args, *, global_rank: int) -> str:
     """This rank's file or raw block device: one directory or block device per
     drive, ranks spread over them; for directories the port and rank keep
     engines apart, while raw block devices (``/dev/...``) are opened directly."""
-    validate_disk_tier_paths(server_args)
+    validate_disk_tier_paths(server_args, global_rank=global_rank)
     target = server_args.disk_tier_paths[
         global_rank % len(server_args.disk_tier_paths)
     ]

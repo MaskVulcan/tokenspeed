@@ -74,7 +74,7 @@ pub enum Request {
     },
 }
 
-/// Who answered: the holder's name, incarnation and namespace identity.
+/// Who answered: the holder's name, incarnation, namespace identity and write quarantine bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stamp {
     /// The holder's name (its endpoint).
@@ -83,6 +83,8 @@ pub struct Stamp {
     pub incarnation: u64,
     /// The cache namespace (deployment identity and weight version).
     pub identity: String,
+    /// Holder's minimum destination quarantine window in microseconds.
+    pub quarantine_us: i64,
 }
 
 /// A holder's reply.
@@ -185,6 +187,7 @@ fn write_stamp(out: &mut Writer, stamp: &Stamp) {
     write_str(out, &stamp.name);
     out.u64(stamp.incarnation);
     write_str(out, &stamp.identity);
+    out.i64(stamp.quarantine_us);
 }
 
 fn read_stamp(reader: &mut Reader<'_>) -> Option<Stamp> {
@@ -192,6 +195,7 @@ fn read_stamp(reader: &mut Reader<'_>) -> Option<Stamp> {
         name: read_str(reader)?,
         incarnation: reader.u64()?,
         identity: read_str(reader)?,
+        quarantine_us: reader.i64()?,
     })
 }
 
@@ -561,6 +565,7 @@ mod tests {
             name: "10.0.0.2:7100".into(),
             incarnation: 42,
             identity: "ns-1".into(),
+            quarantine_us: 54_000_000,
         };
         let geometry = RankGeometry {
             session: "10.0.0.2:12345".into(),

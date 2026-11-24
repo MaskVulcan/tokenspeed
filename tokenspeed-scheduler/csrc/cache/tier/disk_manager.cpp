@@ -112,20 +112,31 @@ DiskOperation DiskTransferManager::command(std::uint64_t id, const Ticket& ticke
     return op;
 }
 
-DiskTransferManager::ReadStartResult DiskTransferManager::TryStartRead(const PromptPrefix& prompt) {
+DiskTransferManager::ReadStartResult DiskTransferManager::TryStartRead(const PromptPrefix& prompt,
+                                                                       std::int32_t local_tokens) {
     if (degraded_) return {.retryable = false};
+    const std::vector<CacheKey> hits = coordinator_.Disk().PrefixHits(prompt);
+    if (hits.empty()) return {.retryable = false};
+    if (local_tokens < 0) {
+        const PrefixProbe local_probe = coordinator_.Prober().ProbePromptPrefix(prompt);
+        local_tokens = std::max(local_probe.device.num_common_tokens, local_probe.host.num_common_tokens);
+    }
+    // Only report `retryable = true` when Disk actually extends the resumable
+    // prefix beyond `local_tokens`; when the Disk keys are already covered on
+    // Device/Host or lack a required State checkpoint, no retry can gain tokens.
+    if (coordinator_.Storage().ResumableStorageTokens(prompt, hits) <= local_tokens) {
+        return {.retryable = false};
+    }
     if (!HasReadCredits()) return {.retryable = true};
     const std::size_t held = NumHeldHostBlocks();
     const auto limit = static_cast<std::size_t>(config_.max_host_blocks);
-    const std::vector<CacheKey> hits = coordinator_.Disk().PrefixHits(prompt);
-    if (hits.empty()) return {.retryable = false};
     // The Disk's keys stand in as Host hits for the Host-suffix probe; every
     // key the boundary needs and the Host lacks is then one the Disk holds.
     const std::size_t available_blocks = limit - held;
     const auto max_op_blocks = static_cast<std::size_t>(config_.max_blocks_per_operation);
     StorageReservation reservation =
         coordinator_.Storage().ReserveStoragePrefix(prompt, hits, std::min(available_blocks, max_op_blocks));
-    if (reservation.keys.empty()) {
+    if (reservation.keys.empty() || reservation.num_tokens <= local_tokens) {
         // If Host-block credits were partially consumed by other in-flight
         // operations, let the caller retry once credits return.
         return {.retryable = available_blocks < max_op_blocks && held > 0};

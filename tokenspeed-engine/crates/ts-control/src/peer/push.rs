@@ -67,6 +67,7 @@ const CANCELLED: &[u8] = b"x";
 /// in-flight transfer engine WRITE retry window, guaranteeing destination and
 /// staging blocks are never reallocated before unacknowledged writes retire.
 const CANCEL_WAIT: Duration = Duration::from_secs(5);
+const CANCEL_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One field copy of a pushed block: `length` bytes at `offset` within the
 /// holder's Disk block, to the reader's `address`.
@@ -407,6 +408,7 @@ impl Slots {
     }
 
     fn wake_all(&self) {
+        let _guard = self.state.lock();
         self.returned.notify_all();
     }
 }
@@ -551,6 +553,7 @@ impl Running {
 
 struct QueuedPush {
     guard: JobGuard,
+    arrived: Instant,
     session: String,
     budget: Duration,
     items: Vec<PushItem>,
@@ -654,9 +657,10 @@ impl Holder {
                         return;
                     };
                     let started = Instant::now();
+                    let deadline = queued.arrived + queued.budget;
                     let ok = state.run(
                         &queued.session,
-                        queued.budget,
+                        deadline,
                         &queued.items,
                         &queued.guard.running,
                     );
@@ -687,6 +691,7 @@ impl Holder {
         budget: Duration,
         items: Vec<PushItem>,
     ) {
+        let arrived = Instant::now();
         if self.state.source.executor.degraded() || self.state.source.executor.broken() {
             tracing::warn!(
                 job = key.job,
@@ -740,6 +745,7 @@ impl Holder {
         };
         let queued = QueuedPush {
             guard,
+            arrived,
             session,
             budget: budget.min(MAX_PUSH_BUDGET),
             items,
@@ -800,14 +806,17 @@ impl Holder {
 
 impl HolderState {
     /// Runs one push to its end: every block read into a slot and written to
-    /// the reader, unless the budget passes, the reader cancels or an I/O
-    /// fails. Returns whether every block actually landed via RDMA write.
-    fn run(&self, session: &str, budget: Duration, items: &[PushItem], job: &Running) -> bool {
+    /// the reader, unless the arrival-anchored `deadline` passes, the reader
+    /// cancels or an I/O fails. Returns whether every block actually landed via
+    /// RDMA write.
+    fn run(&self, session: &str, deadline: Instant, items: &[PushItem], job: &Running) -> bool {
         // On a profile timeline: the push, and each block's write inside it.
         static PUSHES: Lanes = Lanes::new("Peer push");
         let lane = PUSHES.hold();
         let begin_ns = profile::now_ns();
-        let deadline = Instant::now() + budget.min(MAX_PUSH_BUDGET);
+        if job.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return false;
+        }
         if self.source.executor.degraded() || self.source.executor.broken() {
             return false;
         }
@@ -1217,17 +1226,38 @@ impl PagePusher for PushEndpoint {
             job,
             reply_to: self.name.clone(),
         };
-        let _ = sockets.send(host, port, cancel.frames());
+        let cancel_frames = cancel.frames();
         let wait_end = Instant::now() + CANCEL_WAIT;
-        while let Some(remaining) = wait_end.checked_duration_since(Instant::now()) {
-            match answers.recv_timeout(remaining) {
-                Ok(Message::Cancelled { .. } | Message::Done { .. }) => {
-                    return Err(PushFailure::Failed(
-                        "the push did not finish in its budget".to_owned(),
-                    ))
+        loop {
+            let now = Instant::now();
+            let Some(remaining) = wait_end.checked_duration_since(now) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = sockets.send(host, port, cancel_frames.clone());
+            let step_end = now + remaining.min(CANCEL_RETRY_INTERVAL);
+            while let Some(slice) = step_end.checked_duration_since(Instant::now()) {
+                if slice.is_zero() {
+                    break;
                 }
-                Ok(_) => continue,
-                Err(_) => break,
+                match answers.recv_timeout(slice) {
+                    Ok(Message::Done { ok: true, .. }) => return Ok(()),
+                    Ok(Message::Done {
+                        ok: false,
+                        busy: true,
+                        ..
+                    }) => return Err(PushFailure::Busy),
+                    Ok(Message::Cancelled { .. } | Message::Done { .. }) => {
+                        return Err(PushFailure::Failed(
+                            "the push did not finish in its budget".to_owned(),
+                        ));
+                    }
+                    Ok(_) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
         }
         tracing::warn!(
@@ -2050,5 +2080,338 @@ mod tests {
             assert_eq!(large_handle.join().unwrap(), Ok(()));
             assert_eq!(holder_ep.push_ring_slot_counts(), Some((RING_SLOTS, RING_SLOTS)));
         });
+    }
+
+    #[test]
+    fn queued_push_past_arrival_budget_aborts_at_dequeue_without_disk_or_rdma_io() {
+        use std::{path::PathBuf, sync::atomic::AtomicUsize};
+        use ts_disk::{Backend, DiskFile, ExecutorConfig, Memory};
+        use ts_l3::{GroupLayout, HostLayout};
+
+        const BLOCK: usize = 4096;
+        struct TempDisk(PathBuf);
+        impl Drop for TempDisk {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let dir = std::env::var_os("TS_DISK_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let temp = TempDisk(dir.join(format!(
+            "ts-push-arrived-deadline-{}-{}.bin",
+            std::process::id(),
+            profile::now_ns()
+        )));
+        let disk_file = DiskFile::create(&temp.0, (4 * BLOCK) as u64).unwrap();
+        // 1 slot => 1 worker thread, so a 2nd push sits in `mpsc::sync_channel` until the 1st finishes!
+        let ring = Arc::new(Memory::map(BLOCK).unwrap());
+        let mut seed_mem = Memory::map(BLOCK).unwrap();
+        seed_mem.write_at(0, &[0x5au8; BLOCK]);
+
+        let executor = Arc::new(
+            ts_disk::Executor::start(
+                disk_file,
+                &[
+                    (ring.address(), ring.size()),
+                    (seed_mem.address(), seed_mem.size()),
+                ],
+                ExecutorConfig {
+                    backend: Backend::Psync,
+                    queue_depth: 2,
+                    write_queue_depth: 1,
+                    max_io_bytes: 1 << 20,
+                    write_bytes_per_second: 1 << 30,
+                },
+            )
+            .unwrap(),
+        );
+        for blk in 0..2 {
+            let (tx, rx) = mpsc::channel();
+            executor
+                .submit(
+                    Job {
+                        direction: Direction::Write,
+                        ios: vec![Io {
+                            file_offset: (blk * BLOCK) as u64,
+                            address: seed_mem.address(),
+                            len: BLOCK,
+                        }],
+                    },
+                    move |r| {
+                        let _ = tx.send(r.outcome);
+                    },
+                )
+                .unwrap();
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+        }
+
+        struct GateFirstWriter {
+            gate: (std::sync::Mutex<(bool, bool)>, std::sync::Condvar),
+            second_writes: AtomicUsize,
+        }
+        impl PageWriter for GateFirstWriter {
+            fn write(&self, session: &str, _spans: &Spans) -> Result<(), String> {
+                if session == "job-1" {
+                    let mut st = self.gate.0.lock().unwrap();
+                    st.1 = true;
+                    self.gate.1.notify_all();
+                    let _st = self.gate.1.wait_while(st, |s| s.0).unwrap();
+                } else {
+                    self.second_writes.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+
+        let writer = Arc::new(GateFirstWriter {
+            gate: (std::sync::Mutex::new((true, false)), std::sync::Condvar::new()),
+            second_writes: AtomicUsize::new(0),
+        });
+        let holder_ep = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 31).unwrap();
+        holder_ep
+            .serve(PushSource {
+                executor: executor.clone(),
+                disk_layout: HostLayout {
+                    groups: vec![GroupLayout {
+                        packing: 1,
+                        block_bytes: BLOCK,
+                        shard_count: 1,
+                    }],
+                    lcm_block_bytes: BLOCK,
+                    num_lcm_blocks: 4,
+                    owner_rank: 0,
+                    tp_rank: 0,
+                },
+                ring,
+                slot_bytes: BLOCK,
+                writer: writer.clone(),
+                quarantine: Duration::from_millis(50),
+            })
+            .unwrap();
+
+        // Send raw `Message::Push` frames directly (simulating a dropped `Cancel`!) so `job-2` is NOT
+        // cancelled via `Message::Cancel`, proving `arrived + budget` alone aborts `job-2` at dequeue!
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let raw_reader = Sockets::start_at("127.0.0.1", 0, reply_tx).unwrap();
+        let reply_to = format!("127.0.0.1:{}", raw_reader.port());
+        let (h_host, h_port) = split_endpoint(holder_ep.name()).unwrap();
+        let item = vec![PushItem {
+            group: 0,
+            block: 1,
+            spans: vec![PushSpan {
+                offset: 0,
+                address: 100_000,
+                length: BLOCK as u64,
+            }],
+        }];
+
+        raw_reader
+            .send(
+                h_host,
+                h_port,
+                Message::Push {
+                    job: 1,
+                    reply_to: reply_to.clone(),
+                    session: "job-1".into(),
+                    budget_us: 5_000_000,
+                    items: item.clone(),
+                }
+                .frames(),
+            )
+            .unwrap();
+        {
+            let st = writer.gate.0.lock().unwrap();
+            let (_st, res) = writer
+                .gate
+                .1
+                .wait_timeout_while(st, Duration::from_secs(5), |s| !s.1)
+                .unwrap();
+            assert!(!res.timed_out());
+        }
+        assert_eq!(executor.stats().read_jobs, 1);
+
+        // Enqueue `job-2` with `budget_us = 120_000` (120 ms), then hold `job-1` for 220 ms so
+        // `job-2` is ALREADY past `arrived + budget` when the worker dequeues it!
+        raw_reader
+            .send(
+                h_host,
+                h_port,
+                Message::Push {
+                    job: 2,
+                    reply_to,
+                    session: "job-2".into(),
+                    budget_us: 120_000,
+                    items: item,
+                }
+                .frames(),
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(220));
+        writer.gate.0.lock().unwrap().0 = false;
+        writer.gate.1.notify_all();
+
+        let mut outcomes = HashMap::new();
+        while outcomes.len() < 2 {
+            let frames = reply_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if let Some(Message::Done { job, ok, .. }) = Message::decode(&frames) {
+                outcomes.insert(job, ok);
+            }
+        }
+        assert_eq!(outcomes.get(&1), Some(&true));
+        assert_eq!(
+            outcomes.get(&2),
+            Some(&false),
+            "job-2 queued past arrival+budget must abort immediately at dequeue"
+        );
+        assert_eq!(
+            executor.stats().read_jobs,
+            1,
+            "expired queued job-2 must issue ZERO NVMe reads"
+        );
+        assert_eq!(
+            writer.second_writes.load(Ordering::SeqCst),
+            0,
+            "expired queued job-2 must issue ZERO RDMA writes"
+        );
+    }
+
+    #[test]
+    fn cancel_retries_during_cancel_wait_and_late_done_ok_succeeds() {
+        // Mock holder socket that drops the 1st `Cancel` and answers `Cancelled` on the 2nd `Cancel`,
+        // then on a 2nd push answers `Done { ok: true }` during `CANCEL_WAIT`.
+        let (holder_tx, holder_rx) = mpsc::channel();
+        let mock_holder = Arc::new(Sockets::start_at("127.0.0.1", 0, holder_tx).unwrap());
+        let holder_addr = format!("127.0.0.1:{}", mock_holder.port());
+        let reader_ep = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 41).unwrap();
+
+        let mock_for_thread = mock_holder.clone();
+        let driver = thread::spawn(move || {
+            // --- Subcase 1: Drop 1st Cancel, ACK 2nd Cancel ---
+            let push1 = Message::decode(&holder_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+                .expect("Push #1");
+            let Message::Push {
+                job: job1,
+                reply_to: r1,
+                ..
+            } = push1
+            else {
+                panic!("expected Push #1");
+            };
+            // Receive & drop 1st Cancel:
+            let cancel1 = Message::decode(&holder_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+                .expect("1st Cancel");
+            assert_eq!(
+                cancel1,
+                Message::Cancel {
+                    job: job1,
+                    reply_to: r1.clone()
+                }
+            );
+            // Receive retried 2nd Cancel ~1s later and send `Cancelled`:
+            let cancel2 = Message::decode(&holder_rx.recv_timeout(Duration::from_secs(3)).unwrap())
+                .expect("retried 2nd Cancel");
+            assert_eq!(
+                cancel2,
+                Message::Cancel {
+                    job: job1,
+                    reply_to: r1.clone()
+                }
+            );
+            send(&mock_for_thread, &r1, &Message::Cancelled { job: job1 });
+
+            // --- Subcase 2: Late `Done { ok: true }` arriving during `CANCEL_WAIT` succeeds ---
+            let push2 = Message::decode(&holder_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+                .expect("Push #2");
+            let Message::Push {
+                job: job2,
+                reply_to: r2,
+                ..
+            } = push2
+            else {
+                panic!("expected Push #2");
+            };
+            let _cancel_push2 =
+                Message::decode(&holder_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+                    .expect("Cancel for Push #2");
+            send(
+                &mock_for_thread,
+                &r2,
+                &Message::Done {
+                    job: job2,
+                    ok: true,
+                    busy: false,
+                },
+            );
+        });
+
+        let items = vec![PushItem {
+            group: 0,
+            block: 1,
+            spans: vec![PushSpan {
+                offset: 0,
+                address: 1000,
+                length: 4096,
+            }],
+        }];
+        let t0 = Instant::now();
+        let res1 = reader_ep.push_checked(
+            &holder_addr,
+            "sess",
+            Duration::from_millis(50),
+            items.clone(),
+        );
+        let elapsed1 = t0.elapsed();
+        assert_eq!(
+            res1,
+            Err(PushFailure::Failed(
+                "the push did not finish in its budget".to_owned()
+            ))
+        );
+        assert!(
+            elapsed1 < Duration::from_millis(3800),
+            "retried Cancel at +1s should resolve well before full 5s CANCEL_WAIT, got {elapsed1:?}"
+        );
+
+        let res2 = reader_ep.push_checked(&holder_addr, "sess", Duration::from_millis(50), items);
+        assert_eq!(
+            res2,
+            Ok(()),
+            "Done {{ ok: true }} arriving during CANCEL_WAIT must preserve the valid landing"
+        );
+        driver.join().unwrap();
+    }
+
+    #[test]
+    fn slots_wake_all_never_loses_condvar_wakeup_under_quarantine() {
+        for _ in 0..64 {
+            let slots = Arc::new(Slots {
+                total: 1,
+                max_per_job: 1,
+                quarantine: Duration::from_secs(30),
+                state: Mutex::new(SlotState {
+                    free: Vec::new(),
+                    quarantined: VecDeque::from([(0, Instant::now() + Duration::from_secs(30))]),
+                }),
+                returned: Condvar::new(),
+            });
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let (slots_w, cancelled_w) = (slots.clone(), cancelled.clone());
+            let waiter = thread::spawn(move || {
+                slots_w
+                    .take(Instant::now() + Duration::from_secs(30), &cancelled_w)
+                    .is_none()
+            });
+            thread::yield_now();
+            cancelled.store(true, Ordering::Release);
+            slots.wake_all();
+            let started = Instant::now();
+            assert!(waiter.join().unwrap());
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "wake_all must wake parked waiter immediately without sleeping 30s"
+            );
+        }
     }
 }

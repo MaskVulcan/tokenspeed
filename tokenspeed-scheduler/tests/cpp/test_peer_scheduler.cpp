@@ -136,25 +136,42 @@ public:
                                        .prefix_hashes = request.prefix_hashes,
                                        .tokens = request.tokens,
                                        .max_tokens = request.max_tokens};
-        const PeerAnswer answer = holder_.AnswerPeerLookup(lookup);
-        lookups_.insert_or_assign(request.lease.id, std::pair{lookup, answer});
-        pending_.With(lookup);
+        const std::size_t pending_new =
+            unsynced_new_leases_.size() - (unsynced_new_leases_.contains(request.lease) ? 1u : 0u);
+        const PeerAnswer answer = holder_.AnswerPeerLookup(lookup, pending_new);
+        if (answer.num_tokens > 0 && !holder_.PeerLeaseCanPin(request.lease) && !holder_.PeerLeaseHeld(request.lease)) {
+            unsynced_new_leases_.insert(request.lease);
+        }
+        lookups_.insert_or_assign(request.lease.id, Record{.lookup = lookup, .answer = answer, .lookup_synced = false});
+        pinned_at_.erase(request.lease.id);
+        if (answer.num_tokens > 0 || holder_.PeerLeaseCanPin(request.lease)) {
+            pending_.With(lookup);
+        }
         return answer;
     }
     PeerAnswer Pin(const PeerLeaseId& lease) {
-        const auto& [lookup, looked_up] = lookups_.at(lease.id);
-        const bool matches = holder_.PeerPagesMatch(lookup, looked_up.num_tokens, looked_up.pages);
-        if (matches) {
-            pending_.With(cache::PeerPin{.lease = lease, .num_tokens = looked_up.num_tokens, .pages = looked_up.pages});
-            pinned_at_.insert_or_assign(lease.id, holder_.PlanCalls());
+        const auto& record = lookups_.at(lease.id);
+        const bool can_pin =
+            record.answer.num_tokens > 0 &&
+            (!record.lookup_synced || holder_.PeerLeaseCanPin(lease) || holder_.PeerLeaseHeld(lease)) &&
+            holder_.PeerPagesMatch(record.lookup, record.answer.num_tokens, record.answer.pages);
+        if (can_pin && pinned_at_.try_emplace(lease.id, holder_.PlanCalls()).second) {
+            pending_.With(cache::PeerPin{
+                .lease = lease, .num_tokens = record.answer.num_tokens, .pages = record.answer.pages});
         }
-        return PeerAnswer{.lease = lease, .kind = PeerAnswerKind::kPin, .held = matches};
+        return PeerAnswer{.lease = lease,
+                          .kind = PeerAnswerKind::kPin,
+                          .num_tokens = record.answer.num_tokens,
+                          .pages = record.answer.pages,
+                          .held = can_pin};
     }
     PeerAnswer Release(const PeerLeaseId& lease, bool demote) {
-        // Untouched from the pin: no plan ran since it, or its pin held.
+        // Untouched from the pin: no plan or cache clear ran since it, or its pin held.
         const auto pinned = pinned_at_.find(lease.id);
         const bool held =
             pinned != pinned_at_.end() && (holder_.PlanCalls() == pinned->second || holder_.PeerLeaseHeld(lease));
+        lookups_.erase(lease.id);
+        pinned_at_.erase(lease.id);
         pending_.With(cache::PeerRelease{.lease = lease, .demote = demote && held});
         return PeerAnswer{.lease = lease, .kind = PeerAnswerKind::kRelease, .held = held};
     }
@@ -166,15 +183,25 @@ public:
             std::visit([&](auto& inner) { event.With(std::move(inner)); }, queued);
         }
         pending_ = ExecutionEvent{};
+        for (auto& [id, record] : lookups_) {
+            record.lookup_synced = true;
+        }
+        unsynced_new_leases_.clear();
         holder_.Advance(std::move(event));
     }
-    const PeerAnswer& Answer(const PeerLeaseId& lease) const { return lookups_.at(lease.id).second; }
+    const PeerAnswer& Answer(const PeerLeaseId& lease) const { return lookups_.at(lease.id).answer; }
 
 private:
+    struct Record {
+        cache::PeerLookup lookup;
+        PeerAnswer answer;
+        bool lookup_synced{false};
+    };
     Scheduler& holder_;
     ExecutionEvent pending_;
-    std::map<std::uint64_t, std::pair<cache::PeerLookup, PeerAnswer>> lookups_;
+    std::map<std::uint64_t, Record> lookups_;
     std::map<std::uint64_t, std::int64_t> pinned_at_;
+    std::unordered_set<PeerLeaseId, PeerLeaseIdHash> unsynced_new_leases_;
 };
 
 // Two replicas of one deployment: a holder that holds a prefix and a reader
@@ -1038,6 +1065,380 @@ TEST(PeerDiskInterleavingTest, TransientDiskCreditExhaustionNeverHijacksPeerHitO
     for (const auto wb : CacheOpIds<WriteBackBatch>(plan_f)) Send(reader, cache::WriteBackDone{.op_id = wb});
     EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 0u);
     EXPECT_EQ(reader.GetPeerStats().landing_requests, 0u);
+}
+
+TEST(PeerSchedulerRound7Test, ExpiredSoftPinAndMaxLeasesOverflowNeverVouchOrPhantomPin) {
+    // Configure holder with `max_leases = 2` and `soft_pin_us = 10`.
+    SchedulerConfig holder_cfg = PeerConfigFor("holder");
+    holder_cfg.peer_config->incarnation = 1;
+    holder_cfg.peer_config->max_leases = 2;
+    holder_cfg.peer_config->soft_pin_us = 10;
+    holder_cfg.peer_config->hard_pin_us = 100;
+    Scheduler holder{holder_cfg};
+    HolderServicer servicer{holder};
+
+    const std::vector<std::int32_t> prefix = MakeAlignedTokens(4, kP, /*start=*/100);
+    std::vector<std::int32_t> warm = prefix;
+    warm.push_back(999);
+    holder.SubmitRequests({RequestSpec{.request_id = "warm", .tokens = warm, .max_new_tokens = 1}});
+    const ExecutionPlan p_warm = Plan(holder);
+    Send(holder, forward::ExtendResult{.request_id = "warm", .tokens = {7}});
+    Send(holder, forward::Finish{.request_id = "warm"});
+    const ExecutionPlan p_done = Plan(holder);
+    for (const auto wb : CacheOpIds<WriteBackBatch>(p_warm)) Send(holder, cache::WriteBackDone{.op_id = wb});
+    for (const auto wb : CacheOpIds<WriteBackBatch>(p_done)) Send(holder, cache::WriteBackDone{.op_id = wb});
+
+    const auto hashes = holder.PrefixHashesForTokens(warm);
+    const auto make_lookup = [&](std::uint64_t id) {
+        return PeerLookupRequest{.request_id = "r-" + std::to_string(id),
+                                 .deadline_us = 1000,
+                                 .lease = PeerLeaseId{.reader = "reader", .id = id},
+                                 .holder = "holder",
+                                 .prefix_hashes = hashes,
+                                 .tokens = prefix,
+                                 .max_tokens = static_cast<std::int32_t>(prefix.size())};
+    };
+
+    // Trace B (unsynced + synced `max_leases = 2` overflow):
+    const PeerAnswer a1 = servicer.Lookup(make_lookup(1));
+    const PeerAnswer a2 = servicer.Lookup(make_lookup(2));
+    const PeerAnswer a3_unsynced = servicer.Lookup(make_lookup(3));
+    EXPECT_EQ(a1.num_tokens, 8);
+    EXPECT_EQ(a2.num_tokens, 8);
+    EXPECT_EQ(a3_unsynced.num_tokens, 0) << "3rd unsynced lookup past max_leases=2 must answer 0 tokens";
+
+    servicer.Head(/*now_us=*/5);
+    EXPECT_EQ(holder.GetPeerStats().leases, 2u);
+    EXPECT_TRUE(holder.PeerLeaseCanPin(a1.lease));
+    EXPECT_TRUE(holder.PeerLeaseCanPin(a2.lease));
+    EXPECT_EQ(servicer.Lookup(make_lookup(4)).num_tokens, 0)
+        << "lookup while max_leases=2 are occupied must answer 0 tokens";
+
+    // Trace A: Soft-pin expires at `now_us = 20` (`> 5 + 10 = 15`).
+    servicer.Head(/*now_us=*/20);
+    EXPECT_EQ(holder.GetPeerStats().leases, 0u);
+    EXPECT_FALSE(holder.PeerLeaseCanPin(a1.lease));
+
+    // Late `Pin` after soft-pin expiry MUST return `held = false` instead of phantom `held = true`!
+    const PeerAnswer pin1 = servicer.Pin(a1.lease);
+    EXPECT_FALSE(pin1.held) << "expired soft pin must never answer Pin { held: true }";
+    servicer.Head(/*now_us=*/21);
+    EXPECT_EQ(holder.GetPeerStats().pinned_blocks, 0u);
+
+    // Also verify `ClearL1Cache()` and `ClearCache()` increment `PlanCalls()` so an unsynced pin
+    // whose soft pin raced expiry can NEVER vouch `Release { held: true }` across any cache clear!
+    const PeerAnswer a5 = servicer.Lookup(make_lookup(5));
+    ASSERT_EQ(a5.num_tokens, 8);
+    const PeerAnswer pin5 = servicer.Pin(a5.lease);
+    ASSERT_TRUE(pin5.held);
+    const std::int64_t before_l1_clear = holder.PlanCalls();
+    ASSERT_TRUE(holder.ClearL1Cache());
+    EXPECT_GT(holder.PlanCalls(), before_l1_clear) << "ClearL1Cache must advance PlanCalls()";
+    // Before Head syncs `pin5` into hard pins, ClearCache clears Host too and bumps PlanCalls() again:
+    const std::int64_t before_full_clear = holder.PlanCalls();
+    ASSERT_TRUE(holder.ClearCache());
+    EXPECT_GT(holder.PlanCalls(), before_full_clear) << "ClearCache must advance PlanCalls()";
+    const PeerAnswer rel5 = servicer.Release(a5.lease, /*demote=*/true);
+    EXPECT_FALSE(rel5.held) << "Release must NEVER vouch held=true after ClearL1Cache / ClearCache!";
+}
+
+TEST(PeerSchedulerRound7Test, SystemPromptOnDeviceAndDiskWithHeldCleaningStillQueriesPeerAndManagesLookingHold) {
+    Scheduler holder{PeerConfigFor("holder")};
+    const std::vector<std::int32_t> full_conv = MakeAlignedTokens(8, kP, /*start=*/100);   // 16 tokens
+    const std::vector<std::int32_t> sys_prompt(full_conv.begin(), full_conv.begin() + 4);  // 4 tokens
+    const std::vector<std::int32_t> unrelated = MakeAlignedTokens(4, kP, /*start=*/500);   // 8 tokens
+
+    {
+        std::vector<std::int32_t> warm = full_conv;
+        warm.insert(warm.end(), {901, 902});
+        holder.SubmitRequests({RequestSpec{.request_id = "h-warm", .tokens = warm, .max_new_tokens = 1}});
+        const ExecutionPlan p1 = Plan(holder);
+        Send(holder, forward::ExtendResult{.request_id = "h-warm", .tokens = {7}});
+        Send(holder, forward::Finish{.request_id = "h-warm"});
+        const ExecutionPlan p2 = Plan(holder);
+        for (const auto wb : CacheOpIds<WriteBackBatch>(p1)) Send(holder, cache::WriteBackDone{.op_id = wb});
+        for (const auto wb : CacheOpIds<WriteBackBatch>(p2)) Send(holder, cache::WriteBackDone{.op_id = wb});
+    }
+
+    SchedulerConfig reader_cfg = HostLandingConfigFor("reader", /*hybrid=*/false);
+    reader_cfg.device_allocator.total_pages = 17;
+    reader_cfg.cache_groups.front().total_pages = 17;
+    reader_cfg.host_allocator.total_pages = 33;
+    reader_cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+    reader_cfg.disk_allocator.total_pages = 33;
+    reader_cfg.disk_config = DiskConfig{.max_operations = 4,
+                                        .max_blocks_per_operation = 4096,
+                                        .max_host_blocks = 8,
+                                        .max_write_host_blocks = 4,
+                                        .max_queued_cleanings = 32,
+                                        .min_prefetch_tokens = 4,
+                                        .wait_timeout_us = 1000,
+                                        .ready_timeout_us = 50};
+    reader_cfg.max_batch_size = 4;
+    reader_cfg.max_resident_requests = 4;
+    SetTestSnapshotPool(reader_cfg);
+    Scheduler reader{reader_cfg};
+
+    const auto tick_disk = [&](std::int64_t now_us) {
+        Send(reader, cache::StorageTick{.now_us = now_us, .allow_forward = true, .allow_storage = true});
+    };
+    const auto disk_ops = [](const ExecutionPlan& plan) {
+        std::vector<DiskOperation> ops;
+        for (const Operation& op : plan.Operations()) {
+            if (const auto* cache = std::get_if<CacheOperation>(&op)) {
+                if (const auto* disk_op = std::get_if<DiskOperation>(cache)) {
+                    ops.push_back(*disk_op);
+                }
+            }
+        }
+        return ops;
+    };
+    tick_disk(1);
+
+    // Seed `sys_prompt` (2 pages) + `unrelated` (4 pages) onto Host & queue both for Disk cleaning
+    // via write-back eviction from the 16-usable-page Device pool.
+    for (const auto& [id, toks] :
+         {std::pair{"seed-sys", sys_prompt}, std::pair{"seed-unrel", unrelated}}) {
+        std::vector<std::int32_t> p = toks;
+        p.insert(p.end(), {881, 882});
+        reader.SubmitRequests({RequestSpec{.request_id = id, .tokens = p, .max_new_tokens = 1}});
+        const ExecutionPlan ps1 = Plan(reader);
+        ASSERT_EQ(PrefillRows(ps1).size(), 1u);
+        Send(reader, forward::ExtendResult{.request_id = id, .tokens = {7}});
+        Send(reader, forward::Finish{.request_id = id});
+        const ExecutionPlan ps2 = Plan(reader);
+        for (const auto wb : CacheOpIds<WriteBackBatch>(ps1)) Send(reader, cache::WriteBackDone{.op_id = wb});
+        for (const auto wb : CacheOpIds<WriteBackBatch>(ps2)) Send(reader, cache::WriteBackDone{.op_id = wb});
+    }
+    for (int p_idx = 0; p_idx < 3; ++p_idx) {
+        const std::vector<std::int32_t> pressure_toks = MakeAlignedTokens(7, kP, /*start=*/2000 + p_idx * 100);
+        const std::string pid = "press-" + std::to_string(p_idx);
+        reader.SubmitRequests({RequestSpec{.request_id = pid, .tokens = pressure_toks, .max_new_tokens = 1}});
+        const ExecutionPlan p_evict = Plan(reader);
+        for (const auto& w : disk_ops(p_evict)) Send(reader, cache::DiskDone{.op_id = w.op_id, .success = true});
+        Send(reader, forward::ExtendResult{.request_id = pid, .tokens = {7}});
+        Send(reader, forward::Finish{.request_id = pid});
+        const ExecutionPlan p_fin = Plan(reader);
+        for (const auto wb : CacheOpIds<WriteBackBatch>(p_evict)) Send(reader, cache::WriteBackDone{.op_id = wb});
+        for (const auto wb : CacheOpIds<WriteBackBatch>(p_fin)) Send(reader, cache::WriteBackDone{.op_id = wb});
+        for (const auto& w : disk_ops(p_fin)) Send(reader, cache::DiskDone{.op_id = w.op_id, .success = true});
+    }
+    const auto drain_plan = [&](const ExecutionPlan& p, bool finish_disk = true) {
+        for (const auto lb : CacheOpIds<LoadBackBatch>(p)) Send(reader, cache::LoadBackDone{.op_id = lb});
+        for (const auto wb : CacheOpIds<WriteBackBatch>(p)) Send(reader, cache::WriteBackDone{.op_id = wb});
+        if (finish_disk) {
+            for (const auto& d : disk_ops(p)) Send(reader, cache::DiskDone{.op_id = d.op_id, .success = true});
+        }
+    };
+    // Complete cleaning of `sys_prompt` (first cleaning batch), then warm `sys_prompt` back onto Device,
+    // while leaving the second cleaning batch (`unrelated`) IN FLIGHT so `held_host_blocks > 0` (`< 4096`)!
+    const ExecutionPlan p_clean1 = Plan(reader);
+    const auto w_first = disk_ops(p_clean1);
+    ASSERT_FALSE(w_first.empty());
+    drain_plan(p_clean1, /*finish_disk=*/true);
+    ASSERT_GE(reader.GetDiskStats().disk_blocks, 2u);
+
+    std::vector<DiskOperation> pending_disk;
+    {
+        std::vector<std::int32_t> warm_sys = sys_prompt;
+        warm_sys.insert(warm_sys.end(), {801, 802});
+        reader.SubmitRequests({RequestSpec{.request_id = "r-sys", .tokens = warm_sys, .max_new_tokens = 1}});
+        const ExecutionPlan p1 = Plan(reader);
+        drain_plan(p1, /*finish_disk=*/false);
+        for (const auto& d : disk_ops(p1)) pending_disk.push_back(d);
+        Send(reader, forward::ExtendResult{.request_id = "r-sys", .tokens = {7}});
+        Send(reader, forward::Finish{.request_id = "r-sys"});
+        const ExecutionPlan p2 = Plan(reader);
+        drain_plan(p2, /*finish_disk=*/false);
+        for (const auto& d : disk_ops(p2)) pending_disk.push_back(d);
+    }
+    if (reader.GetDiskStats().held_host_blocks == 0 && reader.GetDiskStats().queued_cleanings > 0) {
+        const ExecutionPlan p_clean2 = Plan(reader);
+        drain_plan(p_clean2, /*finish_disk=*/false);
+        const auto w_inflight = disk_ops(p_clean2);
+        ASSERT_FALSE(w_inflight.empty());
+        for (const auto& d : w_inflight) pending_disk.push_back(d);
+    }
+    ASSERT_GT(reader.GetDiskStats().held_host_blocks, 0u) << "background Disk cleaning must hold Host blocks";
+
+    // Opus `TS-R7-P1-1` exact trace: `sys_prompt` is on Device + Disk (`local == 4`), `held_host_blocks > 0`,
+    // `available_blocks < 4096`, and `AvailableSlots() == 4 > 0`. Submit multi-turn `"chat"` (`full_conv + tail`)
+    // with `peer_holder = "holder"`: MUST set `storage_prepared = true` and issue `PeerLookup`!
+    std::vector<std::int32_t> chat = full_conv;
+    chat.insert(chat.end(), {777, 778});
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "chat", .peer_holder = "holder", .tokens = chat, .max_new_tokens = 1}});
+    const ExecutionPlan plan1 = Plan(reader);
+    drain_plan(plan1, /*finish_disk=*/false);
+    for (const auto& d : disk_ops(plan1)) pending_disk.push_back(d);
+    EXPECT_TRUE(PrefillRows(plan1).empty())
+        << "chat MUST enter PeerLooking instead of being admitted locally behind a false-retryable Disk probe!";
+    const auto lookups = reader.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 1u);
+    EXPECT_EQ(lookups[0].request_id, "chat");
+
+    // Complete landing from `holder` and verify full 16-token prefix reuse!
+    HolderServicer servicer{holder};
+    const PeerAnswer ans = servicer.Lookup(lookups[0]);
+    ASSERT_EQ(ans.num_tokens, 16);
+    Send(reader, cache::PeerLookupAnswered{.lease = ans.lease, .num_tokens = ans.num_tokens});
+    const ExecutionPlan plan2 = Plan(reader);
+    drain_plan(plan2, /*finish_disk=*/false);
+    for (const auto& d : disk_ops(plan2)) pending_disk.push_back(d);
+    ASSERT_EQ(plan2.peer_fetches.size(), 1u);
+    EXPECT_EQ(plan2.peer_fetches[0].begin_tokens, 4);
+    EXPECT_EQ(plan2.peer_fetches[0].end_tokens, 16);
+    Send(reader, cache::PeerFetchDone{.request_id = "chat", .num_tokens = 16});
+    const ExecutionPlan plan3 = Plan(reader);
+    EXPECT_EQ(PrefillRows(plan3), (std::vector<std::pair<std::string, std::int32_t>>{{"chat", 16}}));
+    Send(reader, forward::ExtendResult{.request_id = "chat", .tokens = {9}});
+    Send(reader, forward::Finish{.request_id = "chat"});
+    drain_plan(plan3, /*finish_disk=*/false);
+    for (const auto& d : disk_ops(plan3)) pending_disk.push_back(d);
+    const ExecutionPlan plan4 = Plan(reader);
+    drain_plan(plan4, /*finish_disk=*/false);
+    for (const auto& d : disk_ops(plan4)) pending_disk.push_back(d);
+    for (const auto& d : pending_disk) {
+        Send(reader, cache::DiskDone{.op_id = d.op_id, .success = true});
+    }
+    reader.CancelStorageForClear();
+
+    // `TS-R7-P2-2`: Evict Device + Host while retaining Disk (`sys_prompt` remains on Disk!), submit
+    // `"hold-in-looking"` (`full_conv + new_tail`, `peer_holder = "holder"`): Disk prefetches `[0, 4)`,
+    // then request enters `PeerLooking` carrying the Disk Ready `storage_hold`!
+    CacheCoordinator& coord = SchedulerTestAccess::Coordinator(reader);
+    ASSERT_TRUE(coord.ClearDeviceCache());
+    {
+        std::vector<std::span<const std::int32_t>> pages;
+        for (std::size_t off = 0; off < full_conv.size(); off += kP) {
+            pages.emplace_back(full_conv.data() + off, kP);
+        }
+        for (const CacheKey& key : coord.Store().KeysForGroup(ComputePrefixHashes(pages, ""), 0)) {
+            if (const auto loc = coord.Store().LocationOf(*coord.Store().HostPool(), 0, key)) {
+                ASSERT_TRUE(coord.Evictor().EvictHostCachedBlock(0, *loc, &CacheEvictor::HostEvictionStats::lru));
+            }
+        }
+    }
+    ASSERT_GE(reader.GetDiskStats().disk_blocks, 2u);
+    std::vector<std::int32_t> hold_req = full_conv;
+    hold_req.insert(hold_req.end(), {666, 667});
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "hold-in-looking", .peer_holder = "holder", .tokens = hold_req, .max_new_tokens = 1}});
+    const ExecutionPlan p_disk = Plan(reader);
+    const auto reads = disk_ops(p_disk);
+    ASSERT_EQ(reads.size(), 1u);
+    Send(reader, cache::DiskDone{.op_id = reads[0].op_id, .success = true});
+    Plan(reader);
+    ASSERT_EQ(reader.TakePeerLookups().size(), 1u);
+    EXPECT_EQ(reader.GetPeerStats().looking_requests, 1u);
+    EXPECT_EQ(reader.GetDiskStats().ready_requests, 1u)
+        << "Ready storage_hold carried into PeerLooking must be visible to GetDiskStats().ready_requests";
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 2u);
+    EXPECT_EQ(reader.PendingPrefillTokens(), static_cast<std::int64_t>(hold_req.size()))
+        << "PeerLooking must be counted exactly once in PendingPrefillTokens()";
+
+    // Advance `StorageTick` past `ready_timeout_us = 50`: Ready hold inside `PeerLooking` MUST expire cleanly!
+    tick_disk(200);
+    EXPECT_EQ(reader.GetDiskStats().ready_requests, 0u);
+    EXPECT_EQ(reader.GetDiskStats().held_host_blocks, 0u);
+    EXPECT_EQ(reader.GetDiskStats().ready_expirations, 1u);
+}
+
+TEST(PeerSchedulerRound7Test, CanPrepareStorageClearSucceedsWithPeerHostLandingsReadyHold) {
+    Scheduler holder{HostLandingConfigFor("holder", /*hybrid=*/false)};
+    Scheduler reader{HostLandingConfigFor("reader", /*hybrid=*/false)};
+    HolderServicer servicer{holder};
+
+    const std::vector<std::int32_t> prefix = MakeAlignedTokens(4, kP, /*start=*/300);
+    std::vector<std::int32_t> warm = prefix;
+    warm.push_back(901);
+    holder.SubmitRequests({RequestSpec{.request_id = "warm", .tokens = warm, .max_new_tokens = 1}});
+    const ExecutionPlan pw1 = Plan(holder);
+    Send(holder, forward::ExtendResult{.request_id = "warm", .tokens = {7}});
+    Send(holder, forward::Finish{.request_id = "warm"});
+    const ExecutionPlan pw2 = Plan(holder);
+    for (const auto wb : CacheOpIds<WriteBackBatch>(pw1)) Send(holder, cache::WriteBackDone{.op_id = wb});
+    for (const auto wb : CacheOpIds<WriteBackBatch>(pw2)) Send(holder, cache::WriteBackDone{.op_id = wb});
+
+    std::vector<std::int32_t> prompt = prefix;
+    prompt.push_back(902);
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "r-ready", .peer_holder = "holder", .tokens = prompt, .max_new_tokens = 1}});
+    Plan(reader);
+    const auto lookups = reader.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 1u);
+    const PeerAnswer ans = servicer.Lookup(lookups[0]);
+    ASSERT_EQ(ans.num_tokens, 8);
+    Send(reader, cache::PeerLookupAnswered{.lease = ans.lease, .num_tokens = ans.num_tokens});
+    const ExecutionPlan p_fetch = Plan(reader);
+    ASSERT_EQ(p_fetch.peer_fetches.size(), 1u);
+    Send(reader, cache::PeerFetchDone{.request_id = "r-ready", .num_tokens = 8});
+
+    // `PeerFetchDone` published the landed Host blocks (`use_count == 2` across index + `PeerHostLandings`
+    // Ready hold, `StoragePending() == true`). `CanPrepareStorageClear()` MUST return `true`!
+    ASSERT_TRUE(reader.StoragePending());
+    EXPECT_TRUE(reader.CanPrepareStorageClear())
+        << "CanPrepareStorageClear must account for PeerHostLandings::HeldHostBlockRefs()";
+    reader.CancelStorageForClear();
+    EXPECT_FALSE(reader.StoragePending());
+    EXPECT_TRUE(reader.ClearCache());
+}
+
+TEST(PeerSchedulerRound7Test, FusedAbortedPeerLandingTracksPdTransferInFlightAndDp0LeadingZeroAliasesNormalize) {
+    // 1. Verify DP0 leading-zero / `+0` normalization in `CanonicalPeerEndpoint` & `Request::PeerHolder()`.
+    EXPECT_EQ(CanonicalPeerEndpoint("10.0.0.1:7100/0"), "10.0.0.1:7100");
+    EXPECT_EQ(CanonicalPeerEndpoint("10.0.0.1:7100/00"), "10.0.0.1:7100");
+    EXPECT_EQ(CanonicalPeerEndpoint("10.0.0.1:7100/+0"), "10.0.0.1:7100");
+    EXPECT_EQ(CanonicalPeerEndpoint("10.0.0.1:7100/+000"), "10.0.0.1:7100");
+    EXPECT_EQ(CanonicalPeerEndpoint("[::1]:7100/00"), "[::1]:7100");
+    EXPECT_EQ(CanonicalPeerEndpoint("10.0.0.1:7100/1"), "10.0.0.1:7100/1");
+    EXPECT_EQ(CanonicalPeerEndpoint("10.0.0.1:7100/10"), "10.0.0.1:7100/10");
+    EXPECT_EQ(CanonicalPeerEndpoint("/0"), "/0");
+
+    // 2. Verify `PdTransferInFlight(Role::kFused, request)` covers `fsm::PdTransferring` after aborting `PeerLanding`.
+    Scheduler holder{PeerConfigFor("holder")};
+    SchedulerConfig reader_cfg = PeerConfigFor("reader");
+    reader_cfg.peer_config->incarnation = 2;
+    Scheduler reader{reader_cfg};
+    HolderServicer servicer{holder};
+
+    const std::vector<std::int32_t> prefix = MakeAlignedTokens(4, kP, /*start=*/400);
+    std::vector<std::int32_t> warm = prefix;
+    warm.push_back(501);
+    holder.SubmitRequests({RequestSpec{.request_id = "warm", .tokens = warm, .max_new_tokens = 1}});
+    const ExecutionPlan pw1 = Plan(holder);
+    Send(holder, forward::ExtendResult{.request_id = "warm", .tokens = {7}});
+    Send(holder, forward::Finish{.request_id = "warm"});
+    const ExecutionPlan pw2 = Plan(holder);
+    for (const auto wb : CacheOpIds<WriteBackBatch>(pw1)) Send(holder, cache::WriteBackDone{.op_id = wb});
+    for (const auto wb : CacheOpIds<WriteBackBatch>(pw2)) Send(holder, cache::WriteBackDone{.op_id = wb});
+
+    // Submit with `"holder/00"` to exercise non-canonical DP0 normalization end-to-end as well!
+    std::vector<std::int32_t> prompt = prefix;
+    prompt.push_back(502);
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "r-abort", .peer_holder = "holder/00", .tokens = prompt, .max_new_tokens = 1}});
+    Plan(reader);
+    const auto lookups = reader.TakePeerLookups();
+    ASSERT_EQ(lookups.size(), 1u);
+    EXPECT_EQ(lookups[0].holder, "holder");
+    const PeerAnswer ans = servicer.Lookup(lookups[0]);
+    Send(reader, cache::PeerLookupAnswered{.lease = ans.lease, .num_tokens = ans.num_tokens});
+    const ExecutionPlan p_land = Plan(reader);
+    ASSERT_EQ(p_land.peer_fetches.size(), 1u);
+    ASSERT_EQ(reader.PdTransferSize(), 1u);
+
+    // Abort while in `fsm::PeerLanding` -> moves to `fsm::PdTransferring` on `Role::kFused`.
+    Send(reader, forward::Abort{.request_id = "r-abort"});
+    EXPECT_EQ(reader.PdTransferSize(), 1u) << "PdTransferring on Role::kFused must stay visible in PdTransferSize()";
+    EXPECT_TRUE(reader.PdTransferPinned("r-abort"));
+    EXPECT_FALSE(reader.ClearL1Cache()) << "ClearL1Cache must be refused while PdTransferring DMA is retiring";
+
+    // Once `PeerFetchDone` reports that RDMA/Push retired, `PdTransferring` finishes and `ClearL1Cache` succeeds!
+    Send(reader, cache::PeerFetchDone{.request_id = "r-abort", .num_tokens = 0});
+    EXPECT_EQ(reader.PdTransferSize(), 0u);
+    EXPECT_FALSE(reader.PdTransferPinned("r-abort"));
+    EXPECT_TRUE(reader.ClearL1Cache());
 }
 
 }  // namespace

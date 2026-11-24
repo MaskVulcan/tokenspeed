@@ -57,15 +57,10 @@ bool Scheduler::PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num
 }
 namespace {
 
+constexpr std::int32_t kMaxPeerDiskWaitPlans = 4;
+
 std::int64_t Deadline(std::int64_t now_us, std::int64_t lifetime_us) {
     return now_us + std::min(lifetime_us, std::numeric_limits<std::int64_t>::max() - now_us);
-}
-
-std::string_view CanonicalPeerEndpoint(std::string_view endpoint) {
-    if (endpoint.size() > 2 && endpoint.ends_with("/0")) {
-        endpoint.remove_suffix(2);
-    }
-    return endpoint;
 }
 
 }  // namespace
@@ -289,22 +284,29 @@ void Scheduler::preparePeer(Request& request) {
     if (submitted->admission.peer_prepared) {
         return;
     }
-    // When local Disk is enabled, healthy, and holds cached blocks, wait for
-    // `prepareDisk` to settle (in case read credits were transiently exhausted)
-    // before issuing a network PeerLookup.
-    if (disk_transfers_ && !disk_transfers_->Degraded() && storage_allowed_ &&
-        coordinator_.Disk().NumDiskCachedBlocks() > 0 && !submitted->admission.storage_prepared) {
-        return;
-    }
-    submitted->admission.peer_prepared = true;
     const PeerConfig& limits = *config_.peer_config;
     const std::string& holder = request.PeerHolder();
     // The D role computes no prompt: what it lacks comes from its PD peer,
     // so it never reads from a holder, whatever the request names.
     if (holder.empty() || CanonicalPeerEndpoint(holder) == CanonicalPeerEndpoint(limits.name) ||
         config_.role == Role::kD) {
+        submitted->admission.peer_prepared = true;
         return;
     }
+    // When a request is still queued behind resident capacity and local Disk
+    // genuinely has resumable blocks beyond `local` waiting on transient in-flight
+    // Disk I/O credits, wait briefly for `prepareDisk` before querying the peer
+    // holder; never defer when forward admission has free slots right now (which
+    // would admit the request locally without querying the peer) or indefinitely.
+    if (disk_transfers_ && !disk_transfers_->Degraded() && storage_allowed_ &&
+        coordinator_.Disk().NumDiskCachedBlocks() > 0 && !submitted->admission.storage_prepared &&
+        disk_transfers_->HasProgressPending() &&
+        (!forward_allowed_ || req_pool_allocator_.AvailableSlots() == 0) &&
+        submitted->admission.disk_wait_plans < kMaxPeerDiskWaitPlans) {
+        ++submitted->admission.disk_wait_plans;
+        return;
+    }
+    submitted->admission.peer_prepared = true;
     const std::int32_t grain = config_.prefix_granularity;
     const std::int32_t max_tokens = cacheablePrefixTokens(request);
     const std::span<const std::string> hashes = request.PromptPrefixHashes(max_tokens / grain);

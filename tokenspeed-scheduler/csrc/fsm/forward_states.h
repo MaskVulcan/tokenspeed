@@ -139,6 +139,7 @@ struct AdmissionResources {
     // The request has asked its peer holder once (or has none to ask), and
     // what the holder answered.
     bool peer_prepared{false};
+    std::int32_t disk_wait_plans{0};
     std::optional<PeerHit> peer_hit;
     // Fixed prompt identities for admission retries, never residency. Leaving
     // the pre-admission states releases them together with the storage hold.

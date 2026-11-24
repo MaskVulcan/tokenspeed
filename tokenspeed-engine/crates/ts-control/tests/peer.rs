@@ -2204,6 +2204,7 @@ fn trailing_slash_zero_normalized_and_self_incarnation_reply_rejected() {
                                 name: alias_name.clone(),
                                 incarnation: reader_incarnation,
                                 identity: "deployment/v1".into(),
+                                quarantine_us: 0,
                             },
                             answer: PeerAnswerView {
                                 lease,
@@ -2229,4 +2230,243 @@ fn trailing_slash_zero_normalized_and_self_incarnation_reply_rejected() {
         .decisions
         .contains(&("self-inc-alias".into(), "incompatible")));
     assert_eq!(reader.peer.holder_cooldown_state(&alias_name), (0, None));
+}
+
+#[test]
+fn expired_soft_pin_is_benign_miss_and_reader_honors_holder_quarantine_and_dp0_aliases() {
+    use ts_control::peer::{geometry::Spans, normalize_peer_holder, read::PageReader};
+
+    // 1. DP0 normalization parity (`"/0"`, `"/00"`, `"/+0"` -> `""`, while `"/1"` and `"/10"` stay).
+    assert_eq!(normalize_peer_holder("10.0.0.1:7100/0"), "10.0.0.1:7100");
+    assert_eq!(normalize_peer_holder("10.0.0.1:7100/00"), "10.0.0.1:7100");
+    assert_eq!(normalize_peer_holder("10.0.0.1:7100/+0"), "10.0.0.1:7100");
+    assert_eq!(normalize_peer_holder("[::1]:7100/00"), "[::1]:7100");
+    assert_eq!(normalize_peer_holder("10.0.0.1:7100/1"), "10.0.0.1:7100/1");
+    assert_eq!(normalize_peer_holder("10.0.0.1:7100/10"), "10.0.0.1:7100/10");
+    assert_eq!(normalize_peer_holder("/0"), "/0");
+
+    // 2. Expired soft pin on holder (`soft_pin_us = 30ms`) replies `Pin { held: false }`
+    //    (`BenignMiss`), never tripping the 3-fault holder circuit breaker!
+    interpreter();
+    let arena = Arena::new(200_000);
+    let holder_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let holder_name = format!("127.0.0.1:{}", holder_listener.port());
+    let holder_settings = settings(&holder_name, "v1");
+    let holder_sched = Python::attach(|py| {
+        let code = format!(
+            r#"
+import tokenspeed_scheduler as ts
+cfg = ts.SchedulerConfig()
+cfg.role = ts.SchedulerConfig.Role.Fused
+cfg.prefix_granularity = {PAGE}
+cfg.max_scheduled_tokens = 512
+cfg.max_batch_size = 8
+cfg.max_resident_requests = 8
+cfg.num_device_pages = {PAGES}
+cfg.num_snapshot_pages = 1
+cfg.disable_l2_cache = True
+cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity={PAGE},
+                                        total_pages={PAGES}, attn_kind=ts.AttnKind.Full,
+                                        transfer_policy=ts.CacheTransferPolicy.FullSuffix)]
+cfg.peer_config = ts.PeerConfig(name="{holder_name}", incarnation={}, max_leases=8,
+                                soft_pin_us=30_000, hard_pin_us=1_000_000,
+                                lookup_timeout_us=1_000_000, min_fetch_tokens={PAGE},
+                                landing_tier=ts.PeerLandingTier.Device,
+                                max_host_landing_blocks=0, host_ready_timeout_us=0)
+result = ts.Scheduler(cfg)
+"#,
+            holder_settings.incarnation
+        );
+        let globals = PyDict::new(py);
+        py.run(&CString::new(code).unwrap(), Some(&globals), None)
+            .unwrap();
+        Scheduler::from_python(&globals.get_item("result").unwrap().unwrap()).unwrap()
+    });
+    let holder_sched = Arc::new(Mutex::new(holder_sched));
+    let holder_peer = Peer::start(
+        holder_settings,
+        0,
+        vec![geometry(HOLDER_BASE)],
+        Some(holder_listener),
+        holder_sched.clone(),
+        Arc::new(arena.clone()),
+        Arc::new(NoPushes),
+    )
+    .unwrap();
+    let mut holder = Replica {
+        name: holder_name,
+        scheduler: holder_sched,
+        peer: holder_peer,
+        decisions: Vec::new(),
+        landed: Vec::new(),
+    };
+    let prefixes: Vec<Vec<i32>> = (0..4)
+        .map(|idx| {
+            let base = (idx as i32 + 1) * 10_000;
+            (base..base + 3 * PAGE).collect()
+        })
+        .collect();
+    for (idx, pfx) in prefixes.iter().enumerate() {
+        let mut warm = pfx.clone();
+        let tail_base = (idx as i32 + 1) * 10_000 + 500;
+        warm.extend(tail_base..tail_base + PAGE);
+        holder_computes(&mut holder, &warm, &arena);
+    }
+    holder.round();
+
+    let mut reader = Replica::start("v1", READER_BASE, &arena);
+    reader
+        .peer
+        .set_holder_circuit_breaker(3, Duration::from_secs(30));
+
+    for (idx, pfx) in prefixes.iter().enumerate() {
+        let rid = format!("exp-soft-{idx}");
+        let mut p = pfx.clone();
+        let tail_base = 80_000 + (idx as i32) * PAGE;
+        p.extend(tail_base..tail_base + PAGE);
+        reader
+            .scheduler
+            .lock()
+            .submit_requests(&[spec(&rid, p, &holder.name)])
+            .unwrap();
+
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            holder.round();
+            let report = reader.peer.report();
+            let round = reader.peer.agree(&[report]).unwrap();
+            let got_lookup_ans = round
+                .events
+                .iter()
+                .any(|ev| ev.kind == ts_scheduler::PeerEventKind::LookupAnswered);
+            let mut rs = reader.scheduler.lock();
+            rs.advance_peer(round.now_us, &round.events).unwrap();
+            if got_lookup_ans {
+                drop(rs);
+                // First `holder.round()` syncs `PeerEventKind::Lookup` into `PeerExports::leases_`;
+                // then sleeping > 30 ms (`soft_pin_us`) + second `holder.round()` runs
+                // `PeerExports::Expire` to erase the soft lease BEFORE `Pin` is sent!
+                holder.round();
+                std::thread::sleep(Duration::from_millis(45));
+                holder.round();
+
+                let mut rs = reader.scheduler.lock();
+                let plan = rs.next_execution_plan(true, false);
+                let fetches = plan.peer_fetches();
+                let lookups = rs.take_peer_lookups();
+                let needs_device = plan.needs_device();
+                drop(rs);
+                assert_eq!(fetches.len(), 1);
+                reader.peer.dispatch(fetches, lookups, round.now_us);
+                if needs_device {
+                    reader.peer.fence().ready();
+                }
+                break;
+            }
+            let plan = rs.next_execution_plan(true, false);
+            let fetches = plan.peer_fetches();
+            let lookups = rs.take_peer_lookups();
+            drop(rs);
+            reader.peer.dispatch(fetches, lookups, round.now_us);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // Complete `reader` round: `holder` replies `Pin { held: false }`, `reader` falls back cleanly
+        // to local hit `0` with `HealthOutcome::BenignMiss` (0 consecutive failures!).
+        let (hit, _) = rounds_until_prefill(&mut reader, Some(&mut holder), &rid);
+        assert_eq!(
+            hit, 0,
+            "expired soft pin must fall back to local hit without unpinned RDMA"
+        );
+        assert_eq!(
+            reader.peer.holder_cooldown_state(&holder.name),
+            (0, None),
+            "expired soft pin must emit BenignMiss and NEVER trip the 3-fault circuit breaker!"
+        );
+        reader.advance(&[
+            event(ForwardEventKind::ExtendResult, &rid, vec![7]),
+            event(ForwardEventKind::Finish, &rid, Vec::new()),
+        ]);
+        reader.round();
+    }
+
+    // 3. Heterogeneous `quarantine_us`: reader has short `quarantine_us = 10_000` (10 ms), while
+    //    holder advertises `quarantine_us = 180_000` (180 ms) in `Stamp` -> failed read MUST
+    //    quarantine reader destination blocks for at least `180_000` us!
+    let long_holder_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let long_holder_name = format!("127.0.0.1:{}", long_holder_listener.port());
+    let mut long_holder_settings = settings(&long_holder_name, "v1");
+    long_holder_settings.timeouts.quarantine_us = 180_000;
+    let mut long_holder = Replica::with_listener(
+        long_holder_settings,
+        long_holder_listener,
+        HOLDER_BASE,
+        &arena,
+        "Fused",
+    );
+    let mut warm_prompt = prefixes[0].clone();
+    warm_prompt.extend(9_000..9_000 + PAGE);
+    holder_computes(&mut long_holder, &warm_prompt, &arena);
+    long_holder.round();
+
+    struct AlwaysFailReader;
+    impl PageReader for AlwaysFailReader {
+        fn read(&self, _session: &str, _spans: &Spans) -> Result<(), String> {
+            Err("simulated RDMA read failure".to_owned())
+        }
+    }
+
+    let short_listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    let short_name = format!("127.0.0.1:{}", short_listener.port());
+    let mut short_settings = settings(&short_name, "v1");
+    short_settings.timeouts.quarantine_us = 10_000;
+    let short_sched = Arc::new(Mutex::new(scheduler(
+        &short_settings.name,
+        short_settings.incarnation,
+        "Fused",
+        Landing::Device,
+    )));
+    let short_peer = Peer::start(
+        short_settings,
+        0,
+        vec![geometry(READER_BASE)],
+        Some(short_listener),
+        short_sched.clone(),
+        Arc::new(AlwaysFailReader),
+        Arc::new(NoPushes),
+    )
+    .unwrap();
+    let mut short_reader = Replica {
+        name: short_name,
+        scheduler: short_sched,
+        peer: short_peer,
+        decisions: Vec::new(),
+        landed: Vec::new(),
+    };
+
+    let mut qp = prefixes[0].clone();
+    qp.extend(90_000..90_000 + PAGE);
+    short_reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("het-q", qp, &long_holder.name)])
+        .unwrap();
+
+    let q_started = Instant::now();
+    let fallback_hit: i32 = loop {
+        assert!(q_started.elapsed() < Duration::from_secs(5));
+        long_holder.round();
+        let (rows, _fetches) = short_reader.round();
+        if let Some((_, h)) = rows.into_iter().find(|(id, _)| id == "het-q") {
+            break h;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let q_elapsed = q_started.elapsed();
+    assert_eq!(fallback_hit, 0);
+    assert!(
+        q_elapsed >= Duration::from_millis(150),
+        "reader must honor holder's advertised 180ms quarantine_us instead of its own 10ms, elapsed={q_elapsed:?}"
+    );
 }

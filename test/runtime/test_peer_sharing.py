@@ -262,6 +262,7 @@ def _peer_args(**overrides) -> ServerArgs:
     args.kvstore_storage_backend = None
     args.pipeline_parallel_size = 1
     args.query_context_parallel_size = 1
+    args.enable_memory_saver = False
     args.mapping = Mapping(rank=0, world_size=2, attn_tp_size=1, attn_dp_size=2)
     for name, value in overrides.items():
         setattr(args, name, value)
@@ -396,6 +397,17 @@ def test_ensure_mooncake_transfer_timeouts_preserves_operator_overrides(monkeypa
     assert os.environ["ASCEND_TRANSFER_TIMEOUT"] == "31000"
     assert resolve_quarantine_s(10.0) == 66.0
 
+    # Float / padded / `+`-prefixed overrides normalize to exact integer strings for Mooncake C++ `from_chars`.
+    monkeypatch.setenv("MC_TRANSFER_TIMEOUT", " 25.0 ")
+    monkeypatch.setenv("ASCEND_TRANSFER_TIMEOUT", "+31000.0")
+    ensure_mooncake_transfer_timeouts()
+    assert os.environ["MC_TRANSFER_TIMEOUT"] == "25"
+    assert os.environ["ASCEND_TRANSFER_TIMEOUT"] == "31000"
+
+    monkeypatch.setenv("MC_TRANSFER_TIMEOUT", "25.5")
+    ensure_mooncake_transfer_timeouts()
+    assert os.environ["MC_TRANSFER_TIMEOUT"] == "26"
+
 
 def test_resolve_holder_circuit_breaker_parses_env_cleanly(monkeypatch):
     monkeypatch.delenv("TOKENSPEED_PEER_HOLDER_FAIL_THRESHOLD", raising=False)
@@ -415,6 +427,7 @@ def test_resolve_holder_circuit_breaker_parses_env_cleanly(monkeypatch):
         ({"kvstore_storage_backend": "mooncake"}, "--kvstore-storage-backend"),
         ({"pipeline_parallel_size": 2}, "--pipeline-parallel-size"),
         ({"query_context_parallel_size": 2}, "--query-context-parallel-size"),
+        ({"enable_memory_saver": True}, "--enable-memory-saver.*Mooncake MRs"),
     ],
 )
 def test_peer_sharing_refuses_what_it_does_not_run_with(overrides, refused):

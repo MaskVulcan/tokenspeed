@@ -32,11 +32,8 @@ namespace tokenspeed {
 
 namespace {
 
-std::string NormalizePeerHolderEndpoint(std::string holder) {
-    if (holder.size() > 2 && holder.ends_with("/0")) {
-        holder.resize(holder.size() - 2);
-    }
-    return holder;
+std::string NormalizePeerHolderEndpoint(std::string_view holder) {
+    return std::string{CanonicalPeerEndpoint(holder)};
 }
 
 }  // namespace
