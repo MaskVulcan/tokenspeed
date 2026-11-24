@@ -40,8 +40,7 @@ use ts_control::{
         parse_holder_circuit_breaker_env,
         push::{EngineWriter, PushEndpoint, PushSource},
         read::EngineReader,
-        resolve_disable_same_node_env, Peer, PeerFence, PeerListener, PeerSettings,
-        ReplicaSettings,
+        Peer, PeerFence, PeerListener, PeerSettings, ReplicaSettings,
     },
 };
 use ts_scheduler::Scheduler;
@@ -184,10 +183,6 @@ impl Settings {
             .and_then(|attr| attr.extract::<f64>())
             .map(micros)
             .unwrap_or(env_cooldown_us);
-        let disable_same_node: bool = settings
-            .getattr("disable_same_node")
-            .and_then(|attr| attr.extract())
-            .unwrap_or_else(|_| resolve_disable_same_node_env(&protocol));
         Ok(Some(Self {
             peer: PeerSettings {
                 name: settings.getattr("name")?.extract()?,
@@ -207,7 +202,6 @@ impl Settings {
                 ),
                 holder_fail_threshold,
                 holder_cooldown_us,
-                disable_same_node,
             },
             node_leaders: settings.getattr("node_leaders")?.extract()?,
             bind_host: settings.getattr("bind_host")?.extract()?,
@@ -301,7 +295,6 @@ pub fn start(
             quarantine_us: settings.peer.timeouts.quarantine_us,
             holder_fail_threshold: settings.peer.holder_fail_threshold,
             holder_cooldown_us: settings.peer.holder_cooldown_us,
-            disable_same_node: settings.peer.disable_same_node,
         };
         let payload = if replica.index() == 0 {
             local_replica_settings.encode()
@@ -316,7 +309,6 @@ pub fn start(
         settings.peer.timeouts.quarantine_us = agreed.quarantine_us;
         settings.peer.holder_fail_threshold = agreed.holder_fail_threshold;
         settings.peer.holder_cooldown_us = agreed.holder_cooldown_us;
-        settings.peer.disable_same_node = agreed.disable_same_node;
     }
     tracing::debug!(
         regions = ?settings

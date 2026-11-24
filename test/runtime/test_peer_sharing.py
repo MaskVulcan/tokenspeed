@@ -43,7 +43,6 @@ from tokenspeed.runtime.cache.peer import (  # noqa: E402
     peer_host_regions,
     peer_incarnation,
     peer_scheduler_config,
-    resolve_disable_same_node,
     resolve_holder_circuit_breaker,
     resolve_quarantine_s,
 )
@@ -389,23 +388,6 @@ def test_ensure_mooncake_transfer_timeouts_preserves_operator_overrides(monkeypa
     ensure_mooncake_transfer_timeouts()
     assert os.environ["ASCEND_TRANSFER_TIMEOUT"] == "31000"
     assert resolve_quarantine_s(10.0) == 66.0
-
-
-def test_resolve_disable_same_node_defaults_on_for_ascend_direct_and_honors_zero(
-    monkeypatch,
-):
-    monkeypatch.delenv("TOKENSPEED_PEER_DISABLE_SAME_NODE", raising=False)
-    assert resolve_disable_same_node("ascend_direct") is True
-    assert resolve_disable_same_node("rdma") is False
-    assert resolve_disable_same_node("tcp") is False
-
-    monkeypatch.setenv("TOKENSPEED_PEER_DISABLE_SAME_NODE", "0")
-    assert resolve_disable_same_node("ascend_direct") is False
-    monkeypatch.setenv("TOKENSPEED_PEER_DISABLE_SAME_NODE", "false")
-    assert resolve_disable_same_node("ascend_direct") is False
-
-    monkeypatch.setenv("TOKENSPEED_PEER_DISABLE_SAME_NODE", "1")
-    assert resolve_disable_same_node("rdma") is True
 
 
 def test_resolve_holder_circuit_breaker_parses_env_cleanly(monkeypatch):

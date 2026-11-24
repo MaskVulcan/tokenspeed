@@ -111,25 +111,6 @@ def resolve_quarantine_s(push_timeout_s: float = PUSH_TIMEOUT_S) -> float:
     return max(QUARANTINE_S, needed_s)
 
 
-def resolve_disable_same_node(protocol: str) -> bool:
-    """Resolve worker-side same-node peer lookup guard.
-
-    Defaults to ``True`` under ``ascend_direct`` (CANN 9.2 HIXL pinned-Host
-    same-node ``207000`` guard), while honoring explicit
-    ``TOKENSPEED_PEER_DISABLE_SAME_NODE=0`` opt-out and ``=1`` opt-in.
-    """
-    default_on = str(protocol).strip().lower() == "ascend_direct"
-    raw = os.environ.get("TOKENSPEED_PEER_DISABLE_SAME_NODE")
-    if raw is None or not raw.strip():
-        return default_on
-    lowered = raw.strip().lower()
-    if lowered in ("1", "true", "yes", "on"):
-        return True
-    if lowered in ("0", "false", "no", "off"):
-        return False
-    return default_on
-
-
 def resolve_holder_circuit_breaker() -> tuple[int, float]:
     """Resolve ``(holder_fail_threshold, holder_cooldown_s)`` from environment."""
     raw_threshold = os.environ.get("TOKENSPEED_PEER_HOLDER_FAIL_THRESHOLD")
@@ -427,4 +408,3 @@ class PeerSharingSettings:
     geometry: PeerGeometry
     holder_fail_threshold: int = DEFAULT_HOLDER_FAIL_THRESHOLD
     holder_cooldown_s: float = DEFAULT_HOLDER_COOLDOWN_S
-    disable_same_node: bool = False

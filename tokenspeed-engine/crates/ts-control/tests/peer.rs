@@ -196,7 +196,6 @@ fn settings(name: &str, weight_version: &str) -> PeerSettings {
         record_lifetime: Duration::from_secs(5),
         holder_fail_threshold: 3,
         holder_cooldown_us: 30_000_000,
-        disable_same_node: false,
     }
 }
 
@@ -1236,30 +1235,6 @@ fn unvouched_release_does_not_clear_holder_failures_and_trips_cooldown() {
 }
 
 #[test]
-fn disable_same_node_guard_short_circuits_same_host_lookups_cleanly() {
-    let arena = Arena::new(200_000);
-    let mut holder = Replica::start("v1", HOLDER_BASE, &arena);
-    let mut reader = Replica::start("v1", READER_BASE, &arena);
-    reader.peer.set_disable_same_node(true);
-    reader.enable_logical_metrics();
-
-    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
-    holder_computes(&mut holder, &tokens, &arena);
-    let mut longer = tokens;
-    longer.extend(1000..1000 + PAGE);
-    reader
-        .scheduler
-        .lock()
-        .submit_requests(&[spec("r-same-host", longer, &holder.name)])
-        .unwrap();
-    // Do NOT step `holder` at all: `same_node_disabled` short-circuits locally!
-    let (prefix, landings) = rounds_until_prefill(&mut reader, None, "r-same-host");
-    assert_eq!((prefix, landings.len()), (0, 0));
-    assert_eq!(reader.decisions, vec![("r-same-host".into(), "same_node_disabled")]);
-    assert_eq!(reader.peer.holder_cooldown_state(&holder.name), (0, None));
-}
-
-#[test]
 fn normal_pin_lru_evictions_under_30s_quarantine_never_trip_holder_cooldown() {
     let arena = Arena::new(200_000);
     let (incoming, received) = mpsc::channel();
@@ -1754,16 +1729,10 @@ fn half_open_probe_guard_spans_disk_push_window() {
 }
 
 #[test]
-fn push_busy_backpressure_is_benign_miss_and_ascend_direct_defaults_same_node_off() {
+fn push_busy_backpressure_is_benign_miss() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use ts_control::peer::{push::PushFailure, resolve_disable_same_node, wire::Stamp};
+    use ts_control::peer::{push::PushFailure, wire::Stamp};
     use ts_scheduler::{PeerAnswerKind, PeerAnswerView, PeerPageView};
-
-    // Verify `resolve_disable_same_node` defaults ON for `ascend_direct` and honors `=0`.
-    assert!(resolve_disable_same_node("ascend_direct", None));
-    assert!(!resolve_disable_same_node("ascend_direct", Some("0")));
-    assert!(!resolve_disable_same_node("rdma", None));
-    assert!(resolve_disable_same_node("rdma", Some("1")));
 
     struct BusyPusher {
         calls: Arc<AtomicUsize>,

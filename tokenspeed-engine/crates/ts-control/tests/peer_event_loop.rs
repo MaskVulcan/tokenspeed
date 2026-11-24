@@ -177,7 +177,6 @@ fn peer_settings(name: &str) -> PeerSettings {
         record_lifetime: Duration::from_secs(10),
         holder_fail_threshold: 3,
         holder_cooldown_us: 30_000_000,
-        disable_same_node: false,
     }
 }
 

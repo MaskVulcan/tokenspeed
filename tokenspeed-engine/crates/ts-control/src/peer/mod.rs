@@ -61,7 +61,7 @@ use crate::{
     peer::{
         geometry::{push_items, read_batches, RankGeometry},
         landing::{Action, HealthOutcome, Landing, ReadOutcome, Timeouts},
-        net::{split_endpoint, Inbound, PeerNet},
+        net::{Inbound, PeerNet},
         push::PagePusher,
         read::{PageReader, PushJob, ReadJob, Reads},
         servicer::{empty_event, Holder},
@@ -78,57 +78,6 @@ const DEFAULT_HOLDER_COOLDOWN_S: f64 = 30.0;
 const COOLDOWN_WARN_INTERVAL_US: i64 = 5_000_000;
 /// Additional margin beyond `push_us` (`1s` RTT + `5s` `CANCEL_WAIT`) for half-open Disk probes.
 const PROBE_PUSH_MARGIN_US: i64 = 6_000_000;
-
-/// Resolve whether same-node peer lookups are disabled for `protocol` and
-/// optional `TOKENSPEED_PEER_DISABLE_SAME_NODE` value:
-/// - Defaults to `true` when `protocol == "ascend_direct"` (CANN 9.2 HIXL
-///   same-node pinned-Host `207000` defense-in-depth), else `false`.
-/// - Explicit `"0" | "false" | "no" | "off"` overrides to `false`.
-/// - Explicit `"1" | "true" | "yes" | "on"` overrides to `true`.
-pub fn resolve_disable_same_node(protocol: &str, value: Option<&str>) -> bool {
-    let default_on = protocol.trim().eq_ignore_ascii_case("ascend_direct");
-    let Some(raw) = value else {
-        return default_on;
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => true,
-        "0" | "false" | "no" | "off" => false,
-        _ => default_on,
-    }
-}
-
-/// Read `TOKENSPEED_PEER_DISABLE_SAME_NODE` with protocol-aware default.
-pub fn resolve_disable_same_node_env(protocol: &str) -> bool {
-    let raw = std::env::var("TOKENSPEED_PEER_DISABLE_SAME_NODE").ok();
-    resolve_disable_same_node(protocol, raw.as_deref())
-}
-
-fn endpoint_host(endpoint: &str) -> Option<&str> {
-    let address = endpoint
-        .split_once('/')
-        .map_or(endpoint, |(address, _)| address);
-    let (host, _port) = split_endpoint(address).ok()?;
-    Some(host)
-}
-
-fn same_peer_host(a: &str, b: &str) -> bool {
-    let (Some(ha), Some(hb)) = (endpoint_host(a), endpoint_host(b)) else {
-        return false;
-    };
-    let canon_ip = |host: &str| -> Option<std::net::IpAddr> {
-        match host.parse::<std::net::IpAddr>().ok()? {
-            std::net::IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .map(std::net::IpAddr::V4)
-                .or(Some(std::net::IpAddr::V6(v6))),
-            ip => Some(ip),
-        }
-    };
-    match (canon_ip(ha), canon_ip(hb)) {
-        (Some(ia), Some(ib)) => ia == ib,
-        _ => ha.eq_ignore_ascii_case(hb),
-    }
-}
 
 /// Parse `(holder_fail_threshold, holder_cooldown_us)` from environment strings.
 pub fn parse_holder_circuit_breaker_values(
@@ -163,8 +112,8 @@ struct HolderHealth {
 }
 
 /// Replica-agreed policy parameters exchanged at startup (`ReplicaSettings`)
-/// so every TP/PP member enforces identical quarantine, circuit-breaker, and
-/// same-node rules.
+/// so every TP/PP member enforces identical quarantine and circuit-breaker
+/// rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicaSettings {
     /// Failed-read destination block quarantine window in microseconds.
@@ -173,8 +122,6 @@ pub struct ReplicaSettings {
     pub holder_fail_threshold: u32,
     /// Holder lookup cooldown duration in microseconds.
     pub holder_cooldown_us: i64,
-    /// Whether same-host peer lookups are short-circuited on the reader.
-    pub disable_same_node: bool,
 }
 
 impl ReplicaSettings {
@@ -184,7 +131,6 @@ impl ReplicaSettings {
         out.i64(self.quarantine_us);
         out.u32(self.holder_fail_threshold);
         out.i64(self.holder_cooldown_us);
-        out.flag(self.disable_same_node);
         out.finish()
     }
 
@@ -195,7 +141,6 @@ impl ReplicaSettings {
             quarantine_us: reader.i64()?,
             holder_fail_threshold: reader.u32()?,
             holder_cooldown_us: reader.i64()?,
-            disable_same_node: reader.flag()?,
         };
         reader.finish(settings)
     }
@@ -221,8 +166,6 @@ pub struct PeerSettings {
     pub holder_fail_threshold: u32,
     /// Holder cooldown window in microseconds.
     pub holder_cooldown_us: i64,
-    /// Worker-side guard short-circuiting same-host peer lookups.
-    pub disable_same_node: bool,
 }
 
 impl PeerSettings {
@@ -542,9 +485,7 @@ pub struct Peer {
     holder_fail_threshold: u32,
     /// Holder cooldown window in microseconds.
     holder_cooldown_us: i64,
-    /// Worker-side guard short-circuiting same-host peer lookups (`TOKENSPEED_PEER_DISABLE_SAME_NODE`).
-    disable_same_node: bool,
-    /// Synthetic miss answers for lookups short-circuited by holder cooldown or same-node guard.
+    /// Synthetic miss answers for lookups short-circuited by holder cooldown.
     cooldown_answers: Vec<PeerEventView>,
 }
 
@@ -574,7 +515,6 @@ impl Peer {
             .transpose()?;
         let holder_fail_threshold = settings.holder_fail_threshold;
         let holder_cooldown_us = settings.holder_cooldown_us;
-        let disable_same_node = settings.disable_same_node;
         Ok(Self {
             identity: settings.identity(),
             settings,
@@ -603,7 +543,6 @@ impl Peer {
             holder_health: HashMap::new(),
             holder_fail_threshold,
             holder_cooldown_us,
-            disable_same_node,
             cooldown_answers: Vec::new(),
         })
     }
@@ -613,16 +552,6 @@ impl Peer {
     pub fn set_holder_circuit_breaker(&mut self, fail_threshold: u32, cooldown: Duration) {
         self.holder_fail_threshold = fail_threshold;
         self.holder_cooldown_us = i64::try_from(cooldown.as_micros()).unwrap_or(i64::MAX);
-    }
-
-    /// Override the worker-side same-node peer lookup guard.
-    pub fn set_disable_same_node(&mut self, disable: bool) {
-        self.disable_same_node = disable;
-    }
-
-    /// Whether the worker-side same-node lookup guard is active.
-    pub fn disable_same_node(&self) -> bool {
-        self.disable_same_node
     }
 
     /// Half-open probe guard duration in microseconds (`max(3 * answer_us, push_us + 6s)`).
@@ -903,21 +832,6 @@ impl Peer {
         }
         self.send(actions, now_us);
         for lookup in lookups {
-            if self.disable_same_node && same_peer_host(&lookup.holder, &self.settings.name) {
-                self.cooldown_answers.push(PeerEventView {
-                    kind: PeerEventKind::LookupAnswered,
-                    lease: lookup.lease,
-                    num_tokens: 0,
-                    ..empty_event()
-                });
-                if self.member == 0 {
-                    self.decisions.push((lookup.request_id, "same_node_disabled"));
-                    if let Some(metrics) = &self.metrics {
-                        metrics.stage("lookup", "same_node_disabled", 0.0);
-                    }
-                }
-                continue;
-            }
             if self.is_holder_in_cooldown(&lookup.holder, now_us) {
                 self.cooldown_answers.push(PeerEventView {
                     kind: PeerEventKind::LookupAnswered,
@@ -1410,36 +1324,12 @@ mod tests {
     }
 
     #[test]
-    fn disable_same_node_env_parser_and_host_comparison() {
-        // Default ON for `ascend_direct`, default OFF for `rdma`, and explicit `=0` / `=1` overrides!
-        assert!(resolve_disable_same_node("ascend_direct", None));
-        assert!(resolve_disable_same_node("ASCEND_DIRECT", Some("")));
-        assert!(!resolve_disable_same_node("ascend_direct", Some("0")));
-        assert!(!resolve_disable_same_node("ascend_direct", Some("false")));
-        assert!(!resolve_disable_same_node("ascend_direct", Some("off")));
-        assert!(!resolve_disable_same_node("ascend_direct", Some("no")));
-
-        assert!(!resolve_disable_same_node("rdma", None));
-        assert!(!resolve_disable_same_node("rdma", Some("0")));
-        assert!(resolve_disable_same_node("rdma", Some("1")));
-        assert!(resolve_disable_same_node("rdma", Some(" true ")));
-        assert!(resolve_disable_same_node("rdma", Some("YES")));
-        assert!(resolve_disable_same_node("rdma", Some("On")));
-
+    fn replica_settings_encode_decode_roundtrip() {
         let rep = ReplicaSettings {
             quarantine_us: 66_000_000,
             holder_fail_threshold: 4,
             holder_cooldown_us: 15_000_000,
-            disable_same_node: true,
         };
         assert_eq!(ReplicaSettings::decode(&rep.encode()), Some(rep));
-
-        assert!(same_peer_host("10.255.6.58:7100", "10.255.6.58:7100/15"));
-        assert!(same_peer_host("10.255.6.58:7100/3", "10.255.6.58:7200/0"));
-        assert!(!same_peer_host("10.255.6.58:7100/0", "10.255.110.178:7100/0"));
-        assert!(same_peer_host("[FD00:0::1]:7100/1", "[fd00::1]:7200/2"));
-        assert!(same_peer_host("[::ffff:10.0.0.5]:7100", "10.0.0.5:7100/7"));
-        assert!(!same_peer_host("bad-endpoint", "bad-endpoint"));
-        assert!(!same_peer_host("", "10.0.0.1:7100"));
     }
 }

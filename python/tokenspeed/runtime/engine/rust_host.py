@@ -82,7 +82,6 @@ from tokenspeed.runtime.cache.peer import (
     peer_endpoint_name,
     peer_incarnation,
     peer_scheduler_config,
-    resolve_disable_same_node,
     resolve_holder_circuit_breaker,
     resolve_quarantine_s,
 )
@@ -1253,13 +1252,11 @@ def _peer_sharing_settings(
     protocol = mooncake_protocol()
     quarantine_s = resolve_quarantine_s(PUSH_TIMEOUT_S)
     holder_fail_threshold, holder_cooldown_s = resolve_holder_circuit_breaker()
-    disable_same_node = resolve_disable_same_node(protocol)
     agreed = [
         peer_incarnation(),
         quarantine_s,
         holder_fail_threshold,
         holder_cooldown_s,
-        disable_same_node,
     ]
     if mapping.attn.tp_size > 1:
         dist.broadcast_object_list(
@@ -1272,7 +1269,6 @@ def _peer_sharing_settings(
         quarantine_s,
         holder_fail_threshold,
         holder_cooldown_s,
-        disable_same_node,
     ) = agreed
     local_ip = get_local_ip_by_remote()
     enable_mooncake_ipv6_for_host(local_ip)
@@ -1308,7 +1304,6 @@ def _peer_sharing_settings(
         geometry=geometry,
         holder_fail_threshold=holder_fail_threshold,
         holder_cooldown_s=holder_cooldown_s,
-        disable_same_node=disable_same_node,
     )
 
 
