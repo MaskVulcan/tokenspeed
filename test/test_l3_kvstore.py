@@ -354,39 +354,71 @@ class TestStorageKeyTest:
             assert (first_id) != (second_id)
             assert (first_id) != (f"{commit}:auto")
 
-    def test_checkpoint_id_fingerprints_local_weight_bytes(self):
-        with (
-            tempfile.TemporaryDirectory() as first,
-            tempfile.TemporaryDirectory() as second,
-        ):
-            for directory, payload in ((first, b"aaa"), (second, b"bbb")):
-                with open(os.path.join(directory, "config.json"), "w") as handle:
-                    handle.write('{"model_type":"x"}')
-                with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
-                    handle.write(payload)
-            assert (os.path.getsize(os.path.join(first, "model.safetensors"))) == (3)
-            assert (os.path.getsize(os.path.join(second, "model.safetensors"))) == (3)
-            assert (
-                self._checkpoint_id(
-                    first,
-                    load_format="auto",
-                    hf_config=SimpleNamespace(),
-                    revision="",
-                )
-            ) != (
-                self._checkpoint_id(
-                    second,
-                    load_format="auto",
-                    hf_config=SimpleNamespace(),
-                    revision="",
-                )
+    def test_checkpoint_id_strided_shard_digest_and_mtime_invariance(self):
+        from tokenspeed.runtime.cache.l3 import identity as l3_identity
+
+        def cid(directory, load_format="auto"):
+            return self._checkpoint_id(
+                directory, load_format=load_format, hf_config=SimpleNamespace(), revision=""
             )
-            assert self._checkpoint_id(
-                first,
-                load_format="auto",
-                hf_config=SimpleNamespace(),
-                revision="",
-            ).startswith("local-")
+
+        with tempfile.TemporaryDirectory() as root:
+            dirs = {
+                name: os.path.join(root, name)
+                for name in ("a", "a_mtime", "same_size", "diff_size", "base", "mid", "tail", "broken")
+            }
+            for d in dirs.values():
+                os.makedirs(d)
+                with open(os.path.join(d, "config.json"), "w") as f:
+                    f.write('{"model_type":"x"}')
+            for name, payload in (("a", b"aaa"), ("a_mtime", b"aaa"), ("same_size", b"ccc"), ("diff_size", b"bbbb")):
+                with open(os.path.join(dirs[name], "model.safetensors"), "wb") as f:
+                    f.write(payload)
+            os.utime(os.path.join(dirs["a"], "model.safetensors"), (1_700_000_000, 1_700_000_000))
+            os.utime(os.path.join(dirs["a_mtime"], "model.safetensors"), (1_700_009_999, 1_700_009_999))
+            with mock.patch.object(
+                l3_identity, "_update_file_digest", wraps=l3_identity._update_file_digest
+            ) as digest:
+                id_a, id_mt, id_ss, id_ds = (cid(dirs[k]) for k in ("a", "a_mtime", "same_size", "diff_size"))
+            assert [c.args[1] for c in digest.call_args_list] == [
+                os.path.join(dirs[k], "config.json") for k in ("a", "a_mtime", "same_size", "diff_size")
+            ]
+            assert id_a.startswith("local-") and id_a == id_mt
+            assert len({id_a, id_ss, id_ds}) == 3
+
+            # 2 GiB sparse shard: exact 4 * 64 KiB strided pread, catches interior & tail 1-byte edits.
+            size_2gib, sample = 2 * 1024 * 1024 * 1024, 64 * 1024
+            span = size_2gib - sample
+            for name in ("base", "mid", "tail"):
+                with open(os.path.join(dirs[name], "model-00001-of-00001.safetensors"), "wb") as f:
+                    f.truncate(size_2gib)
+                    f.seek(0)
+                    f.write(b'\x10\x00\x00\x00\x00\x00\x00\x00{"w":{"shape":[]}}')
+            with open(os.path.join(dirs["mid"], "model-00001-of-00001.safetensors"), "r+b") as f:
+                f.seek(span // 3 + 1234)
+                f.write(b"\x7f")
+            with open(os.path.join(dirs["tail"], "model-00001-of-00001.safetensors"), "r+b") as f:
+                f.seek(size_2gib - 17)
+                f.write(b"\x9a")
+
+            bytes_read, orig_pread = 0, os.pread
+
+            def counting_pread(fd, n, off):
+                nonlocal bytes_read
+                chunk = orig_pread(fd, n, off)
+                bytes_read += len(chunk)
+                return chunk
+
+            with mock.patch.object(os, "pread", side_effect=counting_pread):
+                id_base = cid(dirs["base"], "safetensors")
+            assert bytes_read == 4 * sample
+            assert len({id_base, cid(dirs["mid"], "safetensors"), cid(dirs["tail"], "safetensors")}) == 3
+
+            # Dangling weight symlink must fail closed rather than hashing empty.
+            os.symlink(os.path.join(dirs["broken"], "missing.safetensors"), os.path.join(dirs["broken"], "model.safetensors"))
+            l3_identity._local_checkpoint_fingerprint.cache_clear()
+            with pytest.raises(FileNotFoundError):
+                cid(dirs["broken"])
 
     def test_checkpoint_id_does_not_trust_hex_basename_outside_hf_snapshots(self):
         commit = "d" * 40
@@ -602,6 +634,8 @@ class TestStorageKeyTest:
             os.makedirs(cycle)
             with open(os.path.join(cycle, "config.json"), "w") as handle:
                 handle.write("{}")
+            with open(os.path.join(cycle, "model.safetensors"), "wb") as handle:
+                handle.write(b"weights")
             os.symlink(cycle, os.path.join(cycle, "loop"))
             assert self._checkpoint_id(
                 cycle,
@@ -609,6 +643,59 @@ class TestStorageKeyTest:
                 hf_config=SimpleNamespace(),
                 revision="",
             ).startswith("local-")
+
+    def test_checkpoint_id_full_safetensors_header_empty_weights_and_loader_extra_config(self):
+        import struct
+
+        from tokenspeed.runtime.cache.l3 import identity as l3_identity
+        from tokenspeed.runtime.cache.l3.factory import _resolved_model_loader_extra_config
+
+        with tempfile.TemporaryDirectory() as root:
+            dirs = {k: os.path.join(root, k) for k in ("hdr_a", "hdr_b", "empty", "sh_a", "sh_b")}
+            for d in dirs.values():
+                os.makedirs(d)
+                with open(os.path.join(d, "config.json"), "w") as f:
+                    f.write('{"model_type":"x"}')
+
+            # 1. Full `.safetensors` JSON header (> 64 KiB) is hashed: 1-byte edit at 150 KiB changes ID.
+            header_len, size_2gib = 200 * 1024, 2 * 1024 * 1024 * 1024
+            base_hdr = bytearray(b'{"weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}')
+            base_hdr.extend(b" " * (header_len - len(base_hdr)))
+            edit_hdr = bytearray(base_hdr)
+            edit_hdr[150 * 1024] = ord("\n")
+            for k, hdr in (("hdr_a", base_hdr), ("hdr_b", edit_hdr)):
+                with open(os.path.join(dirs[k], "model.safetensors"), "wb") as f:
+                    f.write(struct.pack("<Q", header_len))
+                    f.write(hdr)
+                    f.truncate(size_2gib)
+            assert self._checkpoint_id(dirs["hdr_a"], load_format="safetensors", hf_config=SimpleNamespace(), revision="") != (
+                self._checkpoint_id(dirs["hdr_b"], load_format="safetensors", hf_config=SimpleNamespace(), revision="")
+            )
+
+            # 2. Zero matched weights fails closed unless load_format == "dummy".
+            l3_identity._local_checkpoint_fingerprint.cache_clear()
+            for fmt in ("auto", "safetensors"):
+                with pytest.raises(FileNotFoundError, match="no weight files matching"):
+                    self._checkpoint_id(dirs["empty"], load_format=fmt, hf_config=SimpleNamespace(), revision="")
+            assert self._checkpoint_id(
+                dirs["empty"], load_format="dummy", hf_config=SimpleNamespace(), revision=""
+            ).endswith(":dummy")
+
+            # 3. `factory._resolved_model_loader_extra_config` wires custom `sharded_state` pattern.
+            parsed = _resolved_model_loader_extra_config(
+                SimpleNamespace(model_loader_extra_config='{"pattern":"custom-rank-{rank}-part-{part}.bin"}')
+            )
+            assert parsed == {"pattern": "custom-rank-{rank}-part-{part}.bin"}
+            for k, payload in (("sh_a", b"rank0-v1"), ("sh_b", b"rank0-v2")):
+                with open(os.path.join(dirs[k], "custom-rank-0-part-0.bin"), "wb") as f:
+                    f.write(payload)
+            assert l3_checkpoint_id(
+                dirs["sh_a"], hf_config=SimpleNamespace(), revision="", load_format="sharded_state",
+                model_loader_extra_config=parsed, ext_yaml="",
+            ) != l3_checkpoint_id(
+                dirs["sh_b"], hf_config=SimpleNamespace(), revision="", load_format="sharded_state",
+                model_loader_extra_config=parsed, ext_yaml="",
+            )
 
     def test_checkpoint_id_uses_selected_load_format_weight_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1262,7 +1349,8 @@ class TestStorageKeyTest:
                     revision="",
                 )
             assert (first) == (second)
-            assert (digest.call_count) == (2)
+            # Only config.json uses _update_file_digest; model.safetensors uses strided shard digest.
+            assert (digest.call_count) == (1)
 
     def test_share_l3_checkpoint_ids_combines_rank_local_digests(self):
         seen = []

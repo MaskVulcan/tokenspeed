@@ -413,3 +413,29 @@ def test_settings_resolve_draft_eagle_layers_and_explicit_override(
     changed = l3_settings(args, model, draft, **factory_kwargs)
     assert automatic.deployment_id == explicit.deployment_id
     assert changed.deployment_id != automatic.deployment_id
+
+
+def test_settings_wire_model_loader_extra_config_into_checkpoint_identity(
+    construction, tmp_path
+):
+    args, model, _, factory_kwargs = construction
+    first_dir = tmp_path / "sharded-a"
+    second_dir = tmp_path / "sharded-b"
+    for directory, payload in ((first_dir, b"shard-a"), (second_dir, b"shard-b")):
+        checkpoint(directory, payload=b"unused")
+        (directory / "model.safetensors").unlink()
+        (directory / "custom-rank-0-part-0.bin").write_bytes(payload)
+    args.load_format = "sharded_state"
+    args.model_loader_extra_config = json.dumps(
+        {"pattern": "custom-rank-{rank}-part-{part}.bin"}
+    )
+    first_model = ModelConfig(
+        str(first_dir), server_args=args, model_override_args="{}", dtype="bfloat16"
+    )
+    second_model = ModelConfig(
+        str(second_dir), server_args=args, model_override_args="{}", dtype="bfloat16"
+    )
+    assert (
+        l3_settings(args, first_model, None, **factory_kwargs).deployment_id
+        != l3_settings(args, second_model, None, **factory_kwargs).deployment_id
+    )
