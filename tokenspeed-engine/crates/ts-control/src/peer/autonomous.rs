@@ -66,7 +66,7 @@ enum Driver {
 /// The protocol owner and its control-loop handoff.
 pub struct Peer {
     driver: Driver,
-    holder: Option<Arc<Mutex<Holder>>>,
+    device_pin_gate: Option<Arc<servicer::DevicePinGate>>,
     port: Option<u16>,
     fence: PeerFence,
     origin: Instant,
@@ -101,11 +101,11 @@ impl Peer {
             scheduler.clone(),
             transfers,
         )?;
-        let holder = protocol
+        let (port, fence, origin) = (protocol.port(), protocol.fence(), protocol.origin);
+        let device_pin_gate = protocol
             .endpoint
             .as_ref()
-            .map(|endpoint| endpoint.holder.clone());
-        let (port, fence, origin) = (protocol.port(), protocol.fence(), protocol.origin);
+            .map(|e| e.holder.lock().device_pin_gate.clone());
         let driver = if background {
             let wake = protocol.endpoint.as_ref().unwrap().driver.clone();
             let (commands, rx) = mpsc::channel();
@@ -133,7 +133,7 @@ impl Peer {
         };
         Ok(Self {
             driver,
-            holder,
+            device_pin_gate,
             port,
             fence,
             origin,
@@ -146,14 +146,6 @@ impl Peer {
 
     pub(crate) fn autonomous(&self) -> bool {
         matches!(&self.driver, Driver::Background(_))
-    }
-
-    /// Gate new Device pins on the replica's holder while its host drains a
-    /// replay fence.
-    pub fn block_device_pins(&self, blocked: bool) {
-        if let Some(holder) = &self.holder {
-            holder.lock().block_device_pins(blocked);
-        }
     }
 
     /// Drain queued holder changes on the endpoint owner (empty on other
@@ -275,6 +267,12 @@ impl Peer {
     /// The port of this replica member.
     pub fn port(&self) -> Option<u16> {
         self.port
+    }
+    /// Gate new Device pins immediately, including when the protocol runs in the background.
+    pub fn block_device_pins(&self, blocked: bool) {
+        if let Some(gate) = &self.device_pin_gate {
+            gate.block(blocked);
+        }
     }
     /// The data-plane fence endpoint.
     pub fn fence(&self) -> PeerFence {
@@ -485,11 +483,7 @@ impl Exports {
                 let mut answer = holder.answer(lease, PeerAnswerKind::Pin);
                 if p.progress == PeerProgress::Device
                     && holder.matches_stamp(&stamp)
-                    && (!holder.device_pins_blocked()
-                        || checkpoint
-                            .pages
-                            .iter()
-                            .all(|page| page.tier != PeerTier::Device))
+                    && holder.device_pin_gate.allows(&checkpoint.pages)
                     && cache
                         .apply_peer_export(&checkpoint, micros)
                         .map_err(|e| PeerError::Worker(e.to_string()))?

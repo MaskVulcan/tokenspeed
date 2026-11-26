@@ -25,6 +25,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -109,9 +113,25 @@ struct Record {
     expires: Instant,
 }
 
+/// Shared with the control thread, which closes this gate while holding the
+/// scheduler lock, before its new Device publications become visible.
+#[derive(Default)]
+pub(super) struct DevicePinGate(AtomicBool);
+
+impl DevicePinGate {
+    pub(super) fn block(&self, blocked: bool) {
+        self.0.store(blocked, Ordering::Release);
+    }
+
+    pub(super) fn allows(&self, pages: &[PeerPageView]) -> bool {
+        !self.0.load(Ordering::Acquire) || pages.iter().all(|page| page.tier != PeerTier::Device)
+    }
+}
+
 /// The holder's half: answers, the leases' records and the queued changes.
 pub struct Holder {
     pub(super) metrics: Option<std::sync::Arc<ts_metrics::PeerMetrics>>,
+    pub(super) device_pin_gate: Arc<DevicePinGate>,
     stamp: Stamp,
     ranks: Vec<RankGeometry>,
     records: HashMap<PeerLeaseView, Record>,
@@ -121,8 +141,6 @@ pub struct Holder {
     /// scheduler holds, so a release always finds its pin's record.
     record_lifetime: Duration,
     changes: Vec<PeerEventView>,
-    /// The source execution stream still has replay to apply before remote Device reads.
-    device_pins_blocked: bool,
 }
 
 impl Holder {
@@ -130,23 +148,19 @@ impl Holder {
     pub fn new(stamp: Stamp, ranks: Vec<RankGeometry>, record_lifetime: Duration) -> Self {
         Self {
             metrics: None,
+            device_pin_gate: Arc::default(),
             stamp,
             ranks,
             records: HashMap::new(),
             unsynced_new_leases: HashSet::new(),
             record_lifetime,
             changes: Vec::new(),
-            device_pins_blocked: false,
         }
     }
 
     /// Gate new Device pins without affecting existing leases or other tiers.
     pub fn block_device_pins(&mut self, blocked: bool) {
-        self.device_pins_blocked = blocked;
-    }
-
-    pub(super) fn device_pins_blocked(&self) -> bool {
-        self.device_pins_blocked
+        self.device_pin_gate.block(blocked);
     }
 
     pub(super) fn matches_stamp(&self, stamp: &Stamp) -> bool {
@@ -219,11 +233,7 @@ impl Holder {
                         && (!record.lookup_synced
                             || cache.lease_can_pin(&lease)
                             || cache.lease_held(&lease))
-                        && (!self.device_pins_blocked
-                            || looked_up
-                                .pages
-                                .iter()
-                                .all(|page| page.tier != PeerTier::Device))
+                        && self.device_pin_gate.allows(&looked_up.pages)
                         && cache.pages_match(
                             &record.lookup,
                             looked_up.num_tokens,
